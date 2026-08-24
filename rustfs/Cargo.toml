@@ -40,7 +40,7 @@ name = "rustfs-cli"
 path = "src/bin/rustfs-cli.rs"
 
 [features]
-default = ["ftps", "webdav"]
+default = ["ftps", "webdav", "mimalloc"]
 metrics-gpu = ["rustfs-obs/gpu"]
 ftps = ["rustfs-protocols/ftps"]
 swift = ["rustfs-protocols/swift"]
