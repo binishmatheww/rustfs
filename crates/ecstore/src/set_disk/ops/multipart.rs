@@ -1280,7 +1280,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 mod_time: Some(OffsetDateTime::now_utc()),
                 actual_size,
                 index: index_op,
-                checksums: if checksums.is_empty() { None } else { Some(checksums) },
+                checksums: if checksums.is_empty() { None } else { Some(checksums.iter().map(|(k, v)| (k.clone(), v.clone())).collect()) },
                 ..Default::default()
             };
 
@@ -1468,7 +1468,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             max_parts,
             part_number_marker,
             user_defined: {
-                let mut metadata = fi.metadata.clone();
+                let mut metadata: HashMap<String, String> = fi.metadata.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                 strip_internal_multipart_metadata(&mut metadata);
                 metadata
             },
@@ -1727,7 +1727,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let mod_time = opts.mod_time.unwrap_or_else(OffsetDateTime::now_utc);
 
         for f in parts_metadatas.iter_mut() {
-            f.metadata = user_defined.clone();
+            f.metadata = user_defined.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             f.mod_time = Some(mod_time);
             f.fresh = true;
         }
@@ -1816,7 +1816,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             upload_id: upload_id.to_owned(),
             user_defined: {
                 strip_internal_multipart_metadata(&mut fi.metadata);
-                fi.metadata.clone()
+                fi.metadata.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
             },
             ..Default::default()
         })

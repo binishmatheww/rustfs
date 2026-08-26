@@ -19,6 +19,7 @@
 //! bounds are unchanged, and the impls reach shared primitives through the
 //! SetDisks core (io_primitives) via inherent calls.
 
+use ahash::AHashMap;
 use super::super::*;
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
 use crate::bucket::utils::is_meta_bucketname;
@@ -2697,7 +2698,7 @@ impl SetDisks {
                 )));
             }
 
-            fi.metadata = user_defined.into();
+            fi.metadata = user_defined.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             fi.mod_time = mod_time;
             fi.size = w_size as i64;
             fi.versioned = opts.versioned || opts.version_suspended;
@@ -5882,7 +5883,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         } else {
             None
         };
-        let mut replacement_metadata: AHashMap<String, String> = (*src_info.user_defined).clone().into();
+        let mut replacement_metadata: AHashMap<String, String> = (*src_info.user_defined).iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         if let Some(part_checksums) = preserved_part_checksums {
             rustfs_utils::http::insert_str(&mut replacement_metadata, rustfs_utils::http::SUFFIX_PART_CHECKSUMS, part_checksums);
         }
