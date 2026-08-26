@@ -22,6 +22,7 @@ use rustfs_utils::http::{
     contains_key_str, get_consistent_str, get_str, has_internal_suffix, insert_str, is_encryption_metadata_key,
     starts_with_ignore_ascii_case,
 };
+use ahash::AHashMap;
 use s3s::dto::{RestoreStatus, Timestamp};
 use s3s::header::X_AMZ_RESTORE;
 use serde::de::{self, MapAccess, SeqAccess, Visitor, value::MapAccessDeserializer};
@@ -67,7 +68,7 @@ pub struct ObjectPartInfo {
     // Index holds the index of the part in the erasure coding
     pub index: Option<Bytes>,
     // Checksums holds checksums of the part
-    pub checksums: Option<HashMap<String, String>>,
+    pub checksums: Option<AHashMap<String, String>>,
     pub error: Option<String>,
 }
 
@@ -268,7 +269,7 @@ pub struct FileInfo {
     pub mode: Option<u32>,
     // WrittenByVersion is the unix time stamp of the version that created this version of the object
     pub written_by_version: Option<u64>,
-    pub metadata: HashMap<String, String>,
+    pub metadata: AHashMap<String, String>,
     pub parts: Vec<ObjectPartInfo>,
     pub erasure: ErasureInfo,
     // MarkDeleted marks this version as deleted
@@ -301,7 +302,7 @@ fn is_sensitive_metadata_key(key: &str) -> bool {
             .any(|prefix| starts_with_ignore_ascii_case(key, prefix))
 }
 
-struct RedactedMetadata<'a>(&'a HashMap<String, String>);
+struct RedactedMetadata<'a>(&'a AHashMap<String, String>);
 
 impl std::fmt::Debug for RedactedMetadata<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -425,7 +426,7 @@ struct FileInfoMapDef {
     size: i64,
     mode: Option<u32>,
     written_by_version: Option<u64>,
-    metadata: HashMap<String, String>,
+    metadata: AHashMap<String, String>,
     parts: Vec<ObjectPartInfo>,
     erasure: ErasureInfo,
     mark_deleted: bool,
@@ -1079,7 +1080,7 @@ impl FileInfo {
         mod_time: Option<OffsetDateTime>,
         actual_size: i64,
         index: Option<Bytes>,
-        checksums: Option<HashMap<String, String>>,
+        checksums: Option<AHashMap<String, String>>,
     ) {
         let part = ObjectPartInfo {
             etag,
@@ -1457,7 +1458,7 @@ pub fn parse_restore_obj_status(restore_hdr: &str) -> Result<RestoreStatus> {
     Err(Error::other(ERR_RESTORE_HDR_MALFORMED))
 }
 
-pub fn is_restored_object_on_disk(meta: &HashMap<String, String>) -> bool {
+pub fn is_restored_object_on_disk<S: std::hash::BuildHasher>(meta: &HashMap<String, String, S>) -> bool {
     if let Some(restore_hdr) = meta.get(X_AMZ_RESTORE.as_str())
         && let Ok(restore_status) = parse_restore_obj_status(restore_hdr)
     {

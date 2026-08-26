@@ -91,6 +91,7 @@ dependencies = [
  "const-random",
  "getrandom 0.3.4",
  "once_cell",
+ "serde",
  "version_check",
  "zerocopy",
 ]
@@ -9716,6 +9717,7 @@ dependencies = [
 name = "rustfs-filemeta"
 version = "1.0.0-rc.3"
 dependencies = [
+ "ahash",
  "arc-swap",
  "byteorder",
  "bytes",
@@ -10751,6 +10753,7 @@ dependencies = [
 name = "rustfs-utils"
 version = "1.0.0-rc.3"
 dependencies = [
+ "ahash",
  "base64-simd",
  "blake2",
  "brotli",
