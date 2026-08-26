@@ -5500,10 +5500,10 @@ mod tests {
     /// entirely, silently dropping the whole legacy body on re-marshal.
     #[test]
     fn legacy_version_body_round_trips_through_encode() {
-        let mut meta = HashMap::new();
+        let mut meta = AHashMap::new();
         meta.insert("content-type".to_string(), "application/octet-stream".to_string());
 
-        let mut crc = HashMap::new();
+        let mut crc = AHashMap::new();
         crc.insert("crc32c".to_string(), "deadbeef".to_string());
 
         let legacy = MetaObjectV1 {
