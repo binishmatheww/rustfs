@@ -310,7 +310,7 @@ fn fence_commit_on_lock_loss(guard: Option<&ObjectLockDiagGuard>, mode: &'static
     Ok(())
 }
 
-fn multipart_bucket_incarnation_id(metadata: &HashMap<String, String>) -> Result<Option<Uuid>> {
+fn multipart_bucket_incarnation_id<S: std::hash::BuildHasher>(metadata: &HashMap<String, String, S>) -> Result<Option<Uuid>> {
     let Some(value) = rustfs_utils::http::metadata_compat::get_consistent_str(metadata, SUFFIX_BUCKET_INCARNATION_ID) else {
         if rustfs_utils::http::metadata_compat::contains_key_str(metadata, SUFFIX_BUCKET_INCARNATION_ID) {
             return Err(Error::other("invalid multipart bucket incarnation metadata"));
@@ -324,12 +324,12 @@ fn multipart_bucket_incarnation_id(metadata: &HashMap<String, String>) -> Result
     Ok(Some(incarnation))
 }
 
-fn multipart_bucket_incarnation_matches(metadata: &HashMap<String, String>, expected: Uuid) -> bool {
+fn multipart_bucket_incarnation_matches<S: std::hash::BuildHasher>(metadata: &HashMap<String, String, S>, expected: Uuid) -> bool {
     matches!(multipart_bucket_incarnation_id(metadata), Ok(Some(actual)) if actual == expected)
 }
 
-fn validate_multipart_bucket_incarnation(
-    metadata: &HashMap<String, String>,
+fn validate_multipart_bucket_incarnation<S: std::hash::BuildHasher>(
+    metadata: &HashMap<String, String, S>,
     bucket: &str,
     object: &str,
     upload_id: &str,
