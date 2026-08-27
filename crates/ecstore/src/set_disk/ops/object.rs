@@ -20,11 +20,74 @@
 //! SetDisks core (io_primitives) via inherent calls.
 
 use ahash::AHashMap;
-use super::super::*;
+#[cfg(test)]
+use super::super::MetadataCacheInvalidationProbe;
+use super::super::{
+    AMZ_OBJECT_TAGGING, AMZ_STORAGE_CLASS, Arc, AsyncWrite, AtomicU64, BufReader, Bytes, CACHE_CONTROL, CONTENT_DISPOSITION,
+    CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, CompletePart, Cursor, DeleteAccounting, DeleteOptions, DeletedObject,
+    DiskError, DiskStore, EVENT_SET_DISK_COMMIT_TAIL_SLOW, EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY, EVENT_SET_DISK_WRITE,
+    EXPIRES, Error, EventArgs, EventName, FastLockGuard, FileInfo, FileInfoVersions,
+    GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART, GET_OBJECT_PATH_BODY_CACHE, GET_OBJECT_PATH_CODEC_STREAMING,
+    GET_OBJECT_PATH_DIRECT_MEMORY, GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_INLINE_DIRECT, GET_OBJECT_PATH_INTERNAL_META,
+    GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_REMOTE_TRANSITION, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE, GET_STAGE_EMIT,
+    GET_STAGE_INLINE_PREPARE, GET_STAGE_LOCK_ACQUIRE, GET_STAGE_METADATA, GET_STAGE_OBJECT_INFO, GET_STAGE_PATH_DECISION,
+    GET_STAGE_READER_SETUP, GenericError, GetCodecStreamingDecision, GetDirectMemoryDecision, GetObjectReader, HTTPRangeSpec,
+    HashAlgorithm, HashMap, HashReader, HashSet, HeaderMap, HealChannelPriority, InstanceContext, Instant, LOG_COMPONENT_ECSTORE,
+    LOG_SUBSYSTEM_SET_DISK, OBJECT_OP_IGNORED_ERRS, ObjectApiError, ObjectInfo, ObjectKey, ObjectLockConfigSnapshot,
+    ObjectLockConfigState, ObjectOptions, ObjectReader, ObjectToDelete, OffsetDateTime, Ordering, Pin, PutObjReader,
+    RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, ReaderImpl, ReplicateDecision, ReplicationObjectBridge, Result,
+    SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS, SLASH_SEPARATOR, SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE,
+    SUFFIX_RESTORE_OPERATION_ID, SetDisks, SmallWritePath, StorageError, TRANSITION_COMPLETE, UpdateMetadataOpts, Uuid,
+    WriteLayout, X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_RESTORE,
+    adaptive_duplex_buffer_size, build_get_object_info, build_inline_bitrot_readers, build_inline_bitrot_readers_from_refs,
+    can_try_inline_data_shards_direct, check_object_lock_delete, check_object_lock_for_deletion_with_state,
+    check_object_lock_retention_update, classify_get_codec_streaming_object_class, classify_put_write_path,
+    classify_storage_error, collect_inline_data_shard_fileinfos_by_index, contains_key_str, create_bitrot_writer, debug,
+    delete_file_info_version_id, disk, ensure_delete_commit_locks_held, error, finish_set_disk_read_lock,
+    get_codec_streaming_reader_gate, get_object_body_cache_hook, get_raw_etag, get_small_object_direct_memory_decision,
+    get_stage_timer_if_enabled, get_str, get_transitioned_object_reader_with_tier_manager, inline_erasure_shard_file_offset,
+    inline_erasure_shard_size, insert_str, is_deadlock_detection_enabled, is_err_object_not_found, is_err_version_not_found,
+    is_explicit_null_version, is_lock_optimization_enabled, issue3031_diag_enabled, join_all, known_put_object_storage_size,
+    path_join_buf, put_restore_opts, record_compression_total_memory, record_get_codec_streaming_gate_decision,
+    record_get_direct_memory_decision, record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path,
+    record_get_object_reader_path_observation, record_get_stage_duration_if_enabled, record_lock_acquire,
+    reduce_write_quorum_errs, release_materialized_read_lock, replication_write_may_pass_worm_gate, require_restore_operation_id,
+    resolve_delete_version_state, resolve_tiered_decommission_write_quorum_result, resolve_write_layout,
+    restore_commit_operation_id_from_metadata, restore_operation_id_from_metadata, send_event,
+    set_disk_delete_creates_delete_marker, should_force_delete_marker_for_missing_version,
+    should_persist_encryption_original_size, should_preserve_delete_replication_state, should_use_inline_fast_path,
+    take_prepared_get_object_metadata, to_object_err, try_read_inline_data_shards_direct, warn,
+};
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
+use crate::api::config::storageclass;
+use crate::bucket::lifecycle::bucket_lifecycle_ops::LifecycleOps;
 use crate::bucket::utils::is_meta_bucketname;
+use crate::bucket::versioning::VersioningApi;
+use crate::disk::DiskAPI;
+use crate::set_disk::coding;
+use crate::set_disk::core::io_primitives::GetCodecStreamingReaderBuildOutcome;
+use crate::set_disk::mem;
+use crate::set_disk::metadata_sys;
 use crate::set_disk::read::GetObjectDownstreamWriter;
+use crate::set_disk::runtime_sources;
+use crate::storage_api_contracts::multipart::MultipartOperations;
+use crate::storage_api_contracts::object::ObjectIO;
+use crate::storage_api_contracts::object::ObjectOperations;
+use rustfs_lock::LockManager;
+use rustfs_rio::EtagResolvable;
+use rustfs_rio::HashReaderMut;
+use rustfs_rio::TryGetIndex;
+use rustfs_utils::http::HeaderExt;
+use tokio::io::AsyncWriteExt;
 
+#[cfg(all(test, feature = "test-util"))]
+use super::super::GetObjectMetadataCacheEntry;
+#[cfg(test)]
+use super::super::GetObjectMetadataCacheKey;
+#[cfg(test)]
+use super::super::capacity_scope_from_disks;
+#[cfg(all(test, feature = "test-util"))]
+use super::super::get_lock_acquire_timeout;
 use crate::bucket::lifecycle::{
     tier_delete_journal::{
         enqueue_committed_tier_delete_journal_entry, persist_tier_delete_journal_entry,
@@ -48,6 +111,20 @@ use crate::bucket::replication::{
 };
 use crate::data_usage::quota_object_size;
 use crate::diagnostics::get::GetObjectFailureReason;
+#[cfg(test)]
+use crate::disk::DiskOption;
+#[cfg(all(test, feature = "test-util"))]
+use crate::disk::RUSTFS_META_MULTIPART_BUCKET;
+#[cfg(test)]
+use crate::disk::ReadOptions;
+#[cfg(test)]
+use crate::disk::STORAGE_FORMAT_FILE;
+#[cfg(test)]
+use crate::disk::endpoint::Endpoint;
+#[cfg(test)]
+use crate::disk::format::FormatV3;
+#[cfg(test)]
+use crate::disk::new_disk;
 use crate::disk::{DataDirDeleteStatus, OldCurrentSize};
 use crate::error::is_err_invalid_upload_id;
 use crate::object_api::{GetObjectBodySource, get_object_body_cache_hook_suppressed};
@@ -55,13 +132,30 @@ use crate::object_api::{NamespaceLockFence, SCANNER_PUBLICATION_LEASE_FENCE_META
 use crate::services::notification_sys::RemoteVersionStateFleetProofToken;
 use crate::services::tier::tier::{TierConfigMgr, TierOperationLease};
 use crate::set_disk::core::io_primitives::{RenameTailCleanup, finish_rename_tail_heal};
+#[cfg(test)]
+use crate::storage_api_contracts::namespace::NamespaceLocking;
+#[cfg(test)]
+use crate::storage_api_contracts::object::HTTPPreconditions;
 use crate::store::ECStore;
 use crate::store::utils::clean_metadata;
 use futures::FutureExt as _;
 use http::HeaderValue;
+#[cfg(test)]
+use rustfs_filemeta::FileMeta;
+#[cfg(all(test, feature = "test-util"))]
+use rustfs_filemeta::ObjectPartInfo;
 use rustfs_utils::path::decode_dir_object;
+#[cfg(test)]
+use rustfs_utils::path::encode_dir_object;
 use std::future::Future;
-use std::sync::OnceLock;
+use std::task::{Context, Poll};
+#[cfg(any(test, feature = "test-util"))]
+use std::time::Duration;
+#[cfg(test)]
+use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, ReadBuf};
+#[cfg(all(test, feature = "test-util"))]
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 const OLD_DATA_CLEANUP_RECEIPT_FILE: &str = ".rustfs-old-data-cleanup-receipt.json";
@@ -353,7 +447,7 @@ mod lifecycle_delete_all_plan_tests {
         crate::object_api::LifecycleDeleteAllRequest {
             version_id: Some(version_id),
             delete_marker: true,
-            action: rustfs_common::metrics::IlmAction::DelMarkerDeleteAllVersionsAction,
+            action: rustfs_scanner_contracts::metrics::IlmAction::DelMarkerDeleteAllVersionsAction,
             rule_id: "rule".to_string(),
             phase: crate::object_api::LifecycleDeleteAllPhase::Preflight,
         }
@@ -546,7 +640,7 @@ mod lifecycle_delete_all_plan_tests {
         let request = crate::object_api::LifecycleDeleteAllRequest {
             version_id: None,
             delete_marker: false,
-            action: rustfs_common::metrics::IlmAction::DeleteAllVersionsAction,
+            action: rustfs_scanner_contracts::metrics::IlmAction::DeleteAllVersionsAction,
             rule_id: "rule".to_string(),
             phase: crate::object_api::LifecycleDeleteAllPhase::Preflight,
         };
@@ -1065,11 +1159,6 @@ mod restore_metadata_update_tests {
     }
 }
 
-#[cfg(test)]
-mod delete_replication_transport_tests {
-    use super::*;
-}
-
 fn erasure_from_file_info(fi: &FileInfo, uses_legacy: bool) -> Result<coding::Erasure> {
     coding::Erasure::try_new_with_options(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size, uses_legacy)
         .map_err(Error::from)
@@ -1119,6 +1208,37 @@ where
         reader.stream = Box::new(LegacyDuplexProducerReader::new(reader.stream, terminal));
     }
     Ok((reader, offset, length))
+}
+
+/// Cancels a detached legacy GET producer when its consumer is dropped.
+///
+/// The producer owns the shard readers and the object read lock, while the
+/// consumer owns only the duplex read half. Closing that half eventually
+/// unblocks a writer, but can leave a producer stuck in reader setup or remote
+/// recovery until a lower-level timeout fires. This small boundary wrapper
+/// provides an explicit cancellation signal without changing the public
+/// `GetObjectReader` shape.
+struct ProducerCancellationReader<R> {
+    inner: R,
+    cancellation: CancellationToken,
+}
+
+impl<R> ProducerCancellationReader<R> {
+    fn new(inner: R, cancellation: CancellationToken) -> Self {
+        Self { inner, cancellation }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for ProducerCancellationReader<R> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<R> Drop for ProducerCancellationReader<R> {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
 }
 
 fn data_read_metadata_early_stop_request_shape_allowed(range: &Option<HTTPRangeSpec>, opts: &ObjectOptions) -> bool {
@@ -1861,7 +1981,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 )
                 .await?
                 {
-                    core::io_primitives::GetCodecStreamingReaderBuildOutcome::Reader(stream) => {
+                    GetCodecStreamingReaderBuildOutcome::Reader(stream) => {
                         record_get_codec_streaming_gate_decision(
                             codec_streaming_gate.object_class,
                             GetCodecStreamingDecision::Use,
@@ -1875,7 +1995,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                         reader.body_source = body_source;
                         return Ok(finish_set_disk_read_lock(reader, read_lock_guard.take(), bucket, object));
                     }
-                    core::io_primitives::GetCodecStreamingReaderBuildOutcome::Fallback(reason) => {
+                    GetCodecStreamingReaderBuildOutcome::Fallback(reason) => {
                         record_get_codec_streaming_gate_decision(
                             codec_streaming_gate.object_class,
                             GetCodecStreamingDecision::Fallback(reason),
@@ -1908,12 +2028,25 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // lookup on the streaming miss path (ODC-16).
         reader.body_source = body_source;
 
+        // The producer is otherwise detached from the returned reader. Tie its
+        // lifetime to the source stream so a cancelled copy (or an abandoned
+        // GET) releases in-flight shard opens, response bodies, and the read
+        // lock immediately instead of waiting for a disk timeout.
+        let producer_cancellation = crate::set_disk::get_object_read_cancellation();
+        if let Some(cancellation) = producer_cancellation.as_ref() {
+            reader.stream = Box::new(ProducerCancellationReader::new(reader.stream, cancellation.clone()));
+        }
+
         // let disks = disks.clone();
         let bucket = bucket.to_owned();
         let object = object.to_owned();
         let set_index = self.set_index;
         let pool_index = self.pool_index;
         let skip_verify = opts.skip_verify_bitrot;
+        // The producer runs in a separate Tokio task, so carry the caller's
+        // read policy across the task boundary explicitly. Tokio task-local
+        // values are not inherited by spawned tasks.
+        let read_policy = crate::set_disk::get_object_read_policy();
         let erasure_cache = Arc::clone(&self.erasure_cache);
         let (fi, files, disks) = snapshot.into_owned();
         tokio::spawn(async move {
@@ -1923,26 +2056,40 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             // `get_object_with_fileinfo` also waits on `writer`, so an outer timeout
             // would incorrectly treat downstream backpressure as disk-read latency.
             // Disk read timeouts must be enforced at the actual disk I/O operations.
-            let producer_result = Self::get_object_with_fileinfo(
-                &bucket,
-                &object,
-                erasure_cache,
-                offset,
-                length,
-                &mut writer,
-                fi,
-                files,
-                &disks,
-                set_index,
-                pool_index,
-                skip_verify,
-                false,
-                GET_OBJECT_PATH_LEGACY_DUPLEX,
-                object_class.as_str(),
-                size_bucket,
-            )
-            .await;
-            if let Err(e) = &producer_result {
+            let producer_result = tokio::select! {
+                biased;
+                result = crate::set_disk::with_get_object_read_policy(
+                    read_policy,
+                    Self::get_object_with_fileinfo(
+                        &bucket,
+                        &object,
+                        erasure_cache,
+                        offset,
+                        length,
+                        &mut writer,
+                        fi,
+                        files,
+                        &disks,
+                        set_index,
+                        pool_index,
+                        skip_verify,
+                        false,
+                        GET_OBJECT_PATH_LEGACY_DUPLEX,
+                        object_class.as_str(),
+                        size_bucket,
+                    ),
+                ) => result,
+                _ = async {
+                    if let Some(cancellation) = producer_cancellation.as_ref() {
+                        cancellation.cancelled().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => Err(Error::OperationCanceled),
+            };
+            if let Err(e) = &producer_result
+                && !matches!(e, Error::OperationCanceled)
+            {
                 let reason = classify_storage_error(e);
                 if reason == GetObjectFailureReason::DownstreamClosed {
                     debug!(
@@ -3243,7 +3390,7 @@ impl SetDisks {
                     needs_immediate_heal = rename_commit.needs_immediate_heal();
                     if let Some(rename_tail_drain) = rename_commit.tail_drain.take() {
                         tail_owns_tmp_cleanup = true;
-                        let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
+                        let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
                             commit_bucket.clone(),
                             Some(commit_object.clone()),
                             false,
@@ -3351,7 +3498,7 @@ impl SetDisks {
                 let mut fi = rename_commit.committed_file_info;
 
                 if needs_immediate_heal {
-                    let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
+                    let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
                         commit_bucket.clone(),
                         Some(commit_object.clone()),
                         false,
@@ -3363,7 +3510,7 @@ impl SetDisks {
                         .or_else(|| commit_version_suspended.then(Uuid::nil))
                         .map(|version_id| version_id.to_string());
                     tokio::spawn(async move {
-                        let _ = rustfs_common::heal_channel::send_heal_request(request).await;
+                        let _ = rustfs_heal_contracts::heal_channel::send_heal_request(request).await;
                     });
                 }
 
@@ -3793,6 +3940,28 @@ mod legacy_duplex_producer_reader_tests {
             .expect("clean producer completion should surface clean EOF");
 
         assert_eq!(out, b"complete");
+    }
+
+    #[tokio::test]
+    async fn producer_cancellation_reader_cancels_pending_producer_on_drop() {
+        let cancellation = CancellationToken::new();
+        let producer_cancellation = cancellation.clone();
+        let producer = tokio::spawn(async move {
+            tokio::select! {
+                _ = producer_cancellation.cancelled() => true,
+                _ = std::future::pending::<()>() => false,
+            }
+        });
+
+        let reader = ProducerCancellationReader::new(tokio::io::empty(), cancellation);
+        drop(reader);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), producer)
+                .await
+                .expect("dropping the consumer should cancel the producer promptly")
+                .expect("producer task should not panic")
+        );
     }
 
     #[tokio::test]
@@ -4985,7 +5154,7 @@ pub(in crate::set_disk::ops) fn object_transaction_fencing_requested() -> bool {
 
 #[cfg(not(test))]
 fn object_transaction_fencing_requested_cached() -> bool {
-    static REQUESTED: OnceLock<bool> = OnceLock::new();
+    static REQUESTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *REQUESTED.get_or_init(load_object_transaction_fencing_requested)
 }
 
@@ -7077,7 +7246,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 Some(scope),
             );
         }
-        let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
+        let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
             bucket.to_string(),
             Some(object.to_string()),
             false,
@@ -7086,7 +7255,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             Some(self.set_index),
         );
         request.object_version_id = (!version_id.is_empty()).then(|| version_id.to_string());
-        if let Err(e) = rustfs_common::heal_channel::send_heal_request(request).await {
+        if let Err(e) = rustfs_heal_contracts::heal_channel::send_heal_request(request).await {
             warn!(
                 bucket,
                 object,
@@ -8503,7 +8672,6 @@ mod replication_lww_tests {
 
     use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
     use super::*;
-    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
     use rustfs_utils::http::headers::{
         AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, AMZ_OBJECT_TAGGING,
     };
@@ -9131,8 +9299,7 @@ mod inline_put_commit_path_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
     use super::*;
     use crate::config::storageclass::lookup_config_for_pools_without_env;
-    use crate::disk::{DiskAPI as _, ReadOptions};
-    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+    use crate::disk::ReadOptions;
     use rustfs_config::server_config::KVS;
     use serial_test::serial;
     use tokio::io::AsyncReadExt;
@@ -9525,7 +9692,6 @@ mod get_object_downstream_close_accounting_tests {
     };
     use crate::disk::RUSTFS_META_BUCKET;
     use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
-    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
     use crate::test_metrics::CapturingRecorder;
     use std::time::Duration;
 
@@ -9811,8 +9977,7 @@ mod get_object_downstream_close_accounting_tests {
 mod metadata_mutation_generation_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
     use super::*;
-    use crate::disk::{DiskAPI as _, ReadOptions};
-    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+    use crate::disk::ReadOptions;
 
     async fn put_and_prime(
         set_disks: &Arc<SetDisks>,
@@ -10072,15 +10237,12 @@ mod transition_commit_failure_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks;
     use super::*;
     use crate::bucket::lifecycle::lifecycle::{TRANSITION_COMPLETE, TRANSITION_PENDING, TransitionOptions};
-    use crate::disk::DiskAPI as _;
     use crate::services::tier::test_util::{MockWarmBackend, register_mock_tier};
     use crate::services::tier::tier::TierConfigMgr;
-    use crate::storage_api_contracts::multipart::MultipartOperations as _;
-    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
     use http::HeaderMap;
     use rustfs_filemeta::{RestoreStatusOps as _, parse_restore_obj_status};
     use s3s::dto::RestoreRequest;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncReadExt;
 
     pub(super) fn restore_operation_id_metadata(operation_id: Uuid) -> HashMap<String, String> {
         let mut metadata = HashMap::new();
@@ -11826,11 +11988,9 @@ mod transition_upload_integrity_tests {
     use super::transition_commit_failure_tests::{restore_metadata, restore_operation_id_metadata};
     use super::*;
     use crate::bucket::lifecycle::lifecycle::{TRANSITION_PENDING, TransitionOptions};
-    use crate::disk::DiskAPI as _;
     use crate::layout::endpoints::SetupType;
     use crate::services::tier::test_util::register_mock_tier;
     use crate::set_disk::replication::RestoreFinalizeBarrier;
-    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
     use http::HeaderMap;
     use rustfs_filemeta::RestoreStatusOps as _;
     use rustfs_lock::client::local::LocalClient;
@@ -13584,9 +13744,7 @@ mod transition_source_identity_matrix_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks;
     use super::*;
     use crate::bucket::lifecycle::lifecycle::{TRANSITION_PENDING, TransitionOptions};
-    use crate::disk::DiskAPI as _;
     use crate::services::tier::test_util::register_mock_tier;
-    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
 
     #[test]
     fn transition_source_identity_treats_nil_version_as_null_source() {
@@ -13832,7 +13990,7 @@ mod heterogeneous_pool_put_tests {
     };
     use super::*;
     use crate::config::storageclass::lookup_config_for_pools_without_env;
-    use crate::disk::{DiskAPI as _, ReadOptions};
+    use crate::disk::ReadOptions;
     use crate::services::notification_sys::install_remote_version_state_fleet_proof_for_test;
     use rustfs_config::server_config::KVS;
     use serial_test::serial;
@@ -14256,7 +14414,6 @@ mod put_object_tmp_cleanup_tests {
 
     use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
     use super::*;
-    use crate::disk::DiskAPI as _;
     use crate::set_disk::core::io_primitives::{
         ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, rename_fanout_barrier, rename_fault_injection,
     };
@@ -15873,7 +16030,7 @@ mod put_object_tags_early_stop_regression_tests {
 
     use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
     use super::*;
-    use crate::disk::{DiskAPI as _, ReadOptions};
+    use crate::disk::ReadOptions;
 
     #[tokio::test]
     async fn put_object_tags_writes_all_online_disks_under_early_stop() {
@@ -15960,9 +16117,7 @@ mod put_object_tags_early_stop_regression_tests {
 mod object_tagging_namespace_lock_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
     use super::*;
-    use crate::disk::{DiskAPI as _, ReadOptions};
-    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
-    use tokio::io::AsyncReadExt as _;
+    use crate::disk::ReadOptions;
 
     #[derive(Clone, Copy, Debug)]
     enum CompetingMutation {
@@ -16234,7 +16389,6 @@ mod delete_objects_lock_gating_tests {
     use super::hermetic_set_disks_support::hermetic_set_disks_isolated as hermetic_set_disks;
     use super::hermetic_set_disks_support::hermetic_set_disks_with_lockers_and_ctx;
     use super::*;
-    use crate::disk::DiskAPI as _;
     use serial_test::serial;
 
     async fn put_plain_object(set_disks: &Arc<SetDisks>, bucket: &str, object: &str) {
@@ -16547,7 +16701,7 @@ mod delete_objects_lock_gating_tests {
             lifecycle_delete_all: Some(crate::object_api::LifecycleDeleteAllRequest {
                 version_id: Some(trigger_version_id),
                 delete_marker: false,
-                action: rustfs_common::metrics::IlmAction::DeleteAllVersionsAction,
+                action: rustfs_scanner_contracts::metrics::IlmAction::DeleteAllVersionsAction,
                 rule_id: "rule".to_string(),
                 phase: crate::object_api::LifecycleDeleteAllPhase::History,
             }),

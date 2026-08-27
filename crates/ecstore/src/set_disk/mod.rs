@@ -38,24 +38,15 @@
 //!   read primitives it drives.
 //! - `metadata.rs`, `replication.rs`, `shard_source.rs` — supporting helpers.
 
-// #730: SetDisks still hosts staged read/heal/write migration helpers.
-#![allow(unused_imports)]
-#![allow(unused_variables)]
-
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use crate::bucket::metadata_sys;
 use crate::bucket::metadata_sys::ObjectLockConfigState;
 use crate::bucket::object_lock::objectlock_sys::{
-    check_object_lock_for_deletion_with_config, check_object_lock_for_deletion_with_state, check_retention_for_modification,
-    replication_write_may_pass_worm_gate,
+    check_object_lock_for_deletion_with_state, check_retention_for_modification, replication_write_may_pass_worm_gate,
 };
-use crate::bucket::replication::{
-    ReplicateDecision, ReplicationObjectBridge, ReplicationState, ReplicationStatusType, VersionPurgeStatusType,
-    replication_state_to_filemeta,
-};
-use crate::bucket::versioning::VersioningApi;
-use crate::bucket::versioning_sys::BucketVersioningSys;
-use crate::client::{object_api_utils::get_raw_etag, transition_api::ObjectReader, transition_api::ReaderImpl};
+#[cfg(test)]
+use crate::bucket::replication::ReplicationState;
+use crate::bucket::replication::{ReplicateDecision, ReplicationObjectBridge, ReplicationStatusType, VersionPurgeStatusType};
 use crate::cluster::rpc::heal_bucket_local_on_disks;
 use crate::data_usage::record_compression_total_memory;
 use crate::diagnostics::get::{
@@ -74,9 +65,11 @@ use crate::disk::error_reduce::{
     BUCKET_OP_IGNORED_ERRS, OBJECT_OP_IGNORED_ERRS, build_write_quorum_failure_summary, count_errs, reduce_read_quorum_errs,
     reduce_write_quorum_errs,
 };
+#[cfg(test)]
+use crate::disk::has_part_err;
 use crate::disk::{
     self, CHECK_PART_DISK_NOT_FOUND, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
-    conv_part_err_to_int, has_part_err,
+    conv_part_err_to_int,
 };
 use crate::disk::{STORAGE_FORMAT_FILE, count_part_not_success};
 use crate::erasure::codec::bridge::{
@@ -88,17 +81,17 @@ use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
 use crate::io_support::bitrot::{create_bitrot_reader, create_bitrot_reader_from_bytes, create_bitrot_writer};
 use crate::object_api::ObjectOptions;
 use crate::object_api::get_object_body_cache_hook;
+use crate::object_api::object_api_utils::get_raw_etag;
 use crate::runtime::instance::{InstanceContext, bootstrap_ctx};
 use crate::runtime::sources as runtime_sources;
-use crate::services::batch_processor::AsyncBatchProcessor;
+#[cfg(test)]
+use crate::storage_api_contracts::multipart::MultipartOperations;
 use crate::storage_api_contracts::{
     bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
     list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
-    multipart::{
-        CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartOperations as _, MultipartUploadResult, PartInfo,
-    },
+    multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo},
     namespace::NamespaceLocking as _,
-    object::{DeleteAccounting, DeletedObject, HTTPPreconditions, ObjectIO as _, ObjectOperations as _, ObjectToDelete},
+    object::{DeleteAccounting, DeletedObject, HTTPPreconditions, ObjectIO as _, ObjectToDelete},
     range::HTTPRangeSpec,
 };
 use crate::store::utils::is_reserved_or_invalid_bucket;
@@ -109,7 +102,7 @@ use crate::{
     disk::{
         CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskOption, DiskStore, FileInfoVersions,
         RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-        SnapshotLeaseToken, UpdateMetadataOpts, endpoint::Endpoint, error::DiskError, format::FormatV3, new_disk,
+        SnapshotLeaseToken, UpdateMetadataOpts, endpoint::Endpoint, error::DiskError, format::FormatV3,
     },
     error::{StorageError, to_object_err},
     object_api::{GetObjectReader, NamespaceLockFence, ObjectInfo, ObjectLockConfigSnapshot, PutObjReader},
@@ -122,42 +115,40 @@ use crate::{
 };
 use bytes::Bytes;
 use bytesize::ByteSize;
-use chrono::Utc;
 use futures::future::join_all;
-use futures::task::AtomicWaker;
-use glob::Pattern;
 use http::HeaderMap;
 use md5::{Digest as Md5Digest, Md5};
-use rand::{Rng, seq::SliceRandom};
 use regex::Regex;
-use rustfs_common::heal_channel::{
-    DriveState, HealAdmissionResult, HealChannelPriority, HealItemType, HealOpts, HealRequestSource, HealScanMode,
-    send_heal_disk, send_heal_request_with_admission,
-};
 use rustfs_config::MI_B;
 use rustfs_filemeta::{
-    FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
-    RawFileInfo, file_info_from_raw, merge_file_meta_versions,
+    FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, ObjectPartInfo, RawFileInfo,
+    merge_file_meta_versions,
+};
+use rustfs_heal_contracts::heal_channel::{
+    DriveState, HealAdmissionResult, HealChannelPriority, HealItemType, HealOpts, HealRequestSource, HealScanMode,
+    send_heal_disk, send_heal_request_with_admission,
 };
 use rustfs_io_metrics::{
     record_object_lock_diag_acquire_duration, record_object_lock_diag_enabled, record_object_lock_diag_hold_duration,
     record_object_lock_diag_slow_acquire, record_object_lock_diag_slow_hold,
 };
 use rustfs_lock::LockClient;
+#[cfg(test)]
+use rustfs_lock::LockManager;
 use rustfs_lock::fast_lock::types::LockResult;
-use rustfs_lock::local_lock::LocalLock;
-use rustfs_lock::{FastLockGuard, LockManager, NamespaceLock, NamespaceLockGuard, NamespaceLockWrapper, ObjectKey};
+use rustfs_lock::{FastLockGuard, NamespaceLock, NamespaceLockGuard, NamespaceLockWrapper, ObjectKey};
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem, Infos};
 use rustfs_object_capacity::capacity_scope::{
     CapacityScope, CapacityScopeDisk, current_dirty_generation, record_capacity_scope, record_global_dirty_scope,
 };
+use rustfs_s3_client::transition_api::{ObjectReader, ReaderImpl};
 use rustfs_s3_types::EventName;
 #[cfg(test)]
 use rustfs_utils::http::SSEC_ALGORITHM_HEADER;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::headers::{
-    CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, EXPIRES, HeaderExt as _,
+    CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, EXPIRES,
 };
 use rustfs_utils::http::{
     SUFFIX_ACTUAL_OBJECT_SIZE_CAP, SUFFIX_ACTUAL_SIZE, SUFFIX_BUCKET_INCARNATION_ID, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE,
@@ -170,30 +161,29 @@ use rustfs_utils::{
     path::{SLASH_SEPARATOR, encode_dir_object, has_suffix, path_join_buf},
 };
 use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, X_AMZ_RESTORE};
-use sha2::{Digest, Sha256};
-use std::future::Future;
+use sha2::Sha256;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::mem::{self};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{
     collections::{HashMap, HashSet},
-    io::{Cursor, Write},
+    io::Cursor,
     path::Path,
     time::Duration,
 };
 use time::OffsetDateTime;
+#[cfg(test)]
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::Sender;
+#[cfg(test)]
+use tokio::time::timeout;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf},
-    sync::{RwLock, broadcast},
-};
-use tokio::{
-    select,
-    sync::mpsc::{self, Sender},
-    time::{interval, timeout},
+    io::{AsyncRead, AsyncWrite, BufReader, ReadBuf},
+    sync::RwLock,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::error;
@@ -346,7 +336,7 @@ const ENV_RUSTFS_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES: &str = "RUSTFS_MULTIP
 const DEFAULT_RUSTFS_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES: usize = 128 * 1024 * 1024;
 static CACHED_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES: OnceLock<usize> = OnceLock::new();
 
-use crate::io_support::rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
+use crate::io_support::rio::HashReader;
 
 pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
 pub const MAX_PARTS_COUNT: usize = 10000;
@@ -792,6 +782,65 @@ const ENV_RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX: &str = "RUSTFS_GET_M
 const ENV_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH: &str = "RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH";
 const DEFAULT_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH: bool = true;
 
+/// Identifies the caller's read contract for policies that are deliberately
+/// narrower than the storage API's ordinary GET contract.
+///
+/// Server-side copy consumes a source reader while a destination writer is
+/// applying backpressure.  Its source read must not speculatively open the
+/// next multipart part: those extra shard streams can share an internode H2
+/// connection with the current part and starve the lockstep decoder.  Keep
+/// this context internal so the public `ObjectOptions` and storage traits do
+/// not acquire a copy-only field.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum GetObjectReadPolicy {
+    #[default]
+    Default,
+    CopySource,
+}
+
+impl GetObjectReadPolicy {
+    pub(crate) const fn allows_multipart_setup_prefetch(self) -> bool {
+        matches!(self, Self::Default)
+    }
+}
+
+tokio::task_local! {
+    static GET_OBJECT_READ_POLICY: GetObjectReadPolicy;
+    static GET_OBJECT_READ_CANCELLATION: tokio_util::sync::CancellationToken;
+}
+
+pub(crate) fn get_object_read_policy() -> GetObjectReadPolicy {
+    GET_OBJECT_READ_POLICY.try_with(|policy| *policy).unwrap_or_default()
+}
+
+pub(crate) async fn with_get_object_read_policy<F>(policy: GetObjectReadPolicy, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    let decode_policy = match policy {
+        GetObjectReadPolicy::Default => crate::erasure::coding::decode::DecodeReadPolicy::Default,
+        GetObjectReadPolicy::CopySource => crate::erasure::coding::decode::DecodeReadPolicy::DemandBound,
+    };
+    crate::erasure::coding::decode::with_decode_read_policy(decode_policy, GET_OBJECT_READ_POLICY.scope(policy, future)).await
+}
+
+/// Return the request-owned cancellation token for a copy source, when one is
+/// installed. The token is read before the detached legacy producer is spawned;
+/// Tokio task-local values do not cross that spawn boundary on their own.
+pub(crate) fn get_object_read_cancellation() -> Option<tokio_util::sync::CancellationToken> {
+    GET_OBJECT_READ_CANCELLATION.try_with(|token| token.clone()).ok()
+}
+
+pub(crate) async fn with_get_object_read_cancellation<F>(
+    cancellation: tokio_util::sync::CancellationToken,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    GET_OBJECT_READ_CANCELLATION.scope(cancellation, future).await
+}
+
 static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 mod core;
@@ -812,7 +861,7 @@ pub(crate) use ops::object::DeleteObjectCommitBarrier;
 #[cfg(feature = "test-util")]
 pub(crate) use ops::object::TransitionCleanupStoreBarrier as SetDiskTransitionCleanupStoreBarrier;
 pub(crate) use ops::object::body_cache_plaintext_len;
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 pub(crate) use ops::object::cleanup_rejected_transition_upload_durably;
 #[cfg(any(test, feature = "test-util"))]
 pub use ops::object::{PutObjectCommitBarrier, PutObjectCommitPause};
@@ -969,8 +1018,7 @@ mod prepared_get_object_metadata_tests {
     use crate::ecstore_validation_blackbox::make_local_set_disks;
     use crate::object_api::{BLOCK_SIZE_V2, PutObjReader};
     use crate::set_disk::core::io_primitives::{bounded_metadata_fanout_order, disk_call_counters, rename_fanout_barrier};
-    use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
-    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+    use crate::storage_api_contracts::bucket::MakeBucketOptions;
     use crate::test_metrics::CapturingRecorder;
     use http::HeaderMap;
     use tokio::io::AsyncReadExt;
@@ -2296,6 +2344,7 @@ enum GetCodecStreamingFallbackReason {
     InvalidMinSize,
     ReadQuorumNotSafe,
     MultipartPartLimit,
+    CopySourceDemandBound,
 }
 
 impl GetCodecStreamingFallbackReason {
@@ -2317,6 +2366,7 @@ impl GetCodecStreamingFallbackReason {
             Self::InvalidMinSize => "invalid_min_size",
             Self::ReadQuorumNotSafe => "read_quorum_not_safe",
             Self::MultipartPartLimit => "multipart_part_limit",
+            Self::CopySourceDemandBound => "copy_source_demand_bound",
         }
     }
 }
@@ -2620,6 +2670,17 @@ fn get_codec_streaming_reader_gate(
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Disabled),
+            prefer_data_blocks_first_reader_setup: false,
+        };
+    }
+    if matches!(get_object_read_policy(), GetObjectReadPolicy::CopySource) {
+        // The codec reader has its own bounded fill worker.  It may still
+        // request an additional stripe for a plain single-part object even
+        // when multipart setup prefetch is disabled, so copy sources use the
+        // legacy demand-bound reader for every object class.
+        return GetCodecStreamingGate {
+            object_class,
+            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::CopySourceDemandBound),
             prefer_data_blocks_first_reader_setup: false,
         };
     }
@@ -3111,8 +3172,9 @@ pub struct SetDisks {
     #[cfg(test)]
     storage_class_config_override: Arc<std::sync::RwLock<Option<Arc<storageclass::Config>>>>,
     #[cfg(test)]
-    rename_tail_heal_capture:
-        Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<rustfs_common::heal_channel::HealChannelRequest>>>>,
+    rename_tail_heal_capture: Arc<
+        std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<rustfs_heal_contracts::heal_channel::HealChannelRequest>>>,
+    >,
 }
 
 // DistributedLock sends the raw ObjectKey to its clients; LockRegistry clones
@@ -3388,7 +3450,10 @@ impl DiskHealthEntry {
 }
 
 impl SetDisks {
-    pub(in crate::set_disk) async fn submit_rename_tail_heal(&self, request: rustfs_common::heal_channel::HealChannelRequest) {
+    pub(in crate::set_disk) async fn submit_rename_tail_heal(
+        &self,
+        request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
+    ) {
         #[cfg(test)]
         {
             let capture = self
@@ -3402,13 +3467,13 @@ impl SetDisks {
             }
         }
 
-        let _ = rustfs_common::heal_channel::send_heal_request(request).await;
+        let _ = rustfs_heal_contracts::heal_channel::send_heal_request(request).await;
     }
 
     #[cfg(test)]
     pub(in crate::set_disk) fn capture_test_rename_tail_heals(
         &self,
-    ) -> tokio::sync::mpsc::UnboundedReceiver<rustfs_common::heal_channel::HealChannelRequest> {
+    ) -> tokio::sync::mpsc::UnboundedReceiver<rustfs_heal_contracts::heal_channel::HealChannelRequest> {
         let (capture, requests) = tokio::sync::mpsc::unbounded_channel();
         let mut slot = self
             .rename_tail_heal_capture
@@ -4612,7 +4677,10 @@ fn check_object_lock_retention_update(bucket: &str, object: &str, obj_info: &Obj
     if let Some(retention) = &opts.object_lock_retention
         && check_retention_for_modification(
             &obj_info.user_defined,
-            retention.mode.as_deref(),
+            retention
+                .mode
+                .as_deref()
+                .and_then(crate::bucket::object_lock::types::RetentionMode::parse_exact),
             retention.retain_until,
             retention.bypass_governance,
         )
@@ -5891,7 +5959,7 @@ mod tests {
     use crate::set_disk::core::io_primitives::rename_fanout_barrier;
     use crate::storage_api_contracts::{
         heal::HealOperations as _, lifecycle::TransitionedObject, list::ListOperations as _, multipart::CompletePart,
-        namespace::NamespaceLocking as _, object::ObjectIO as _, object::ObjectOperations as _,
+        object::ObjectOperations as _,
     };
     use crate::store::init_format::save_format_file;
     use crate::store::list_objects::ListPathOptions;
@@ -5907,6 +5975,29 @@ mod tests {
     use time::OffsetDateTime;
     use tokio::fs;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn copy_source_read_policy_is_scoped_and_demand_bound() {
+        assert_eq!(get_object_read_policy(), GetObjectReadPolicy::Default);
+        assert!(GetObjectReadPolicy::Default.allows_multipart_setup_prefetch());
+        assert!(!GetObjectReadPolicy::CopySource.allows_multipart_setup_prefetch());
+
+        with_get_object_read_policy(GetObjectReadPolicy::CopySource, async {
+            assert_eq!(get_object_read_policy(), GetObjectReadPolicy::CopySource);
+            assert!(!get_object_read_policy().allows_multipart_setup_prefetch());
+            assert_eq!(
+                crate::erasure::coding::decode::decode_read_policy(),
+                crate::erasure::coding::decode::DecodeReadPolicy::DemandBound
+            );
+        })
+        .await;
+
+        assert_eq!(get_object_read_policy(), GetObjectReadPolicy::Default);
+        assert_eq!(
+            crate::erasure::coding::decode::decode_read_policy(),
+            crate::erasure::coding::decode::DecodeReadPolicy::Default
+        );
+    }
 
     #[test]
     fn complete_part_error_maps_confirmed_missing_to_invalid_part() {

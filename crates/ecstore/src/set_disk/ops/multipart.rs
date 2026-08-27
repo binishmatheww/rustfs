@@ -20,24 +20,79 @@
 //! contract stays implemented `for SetDisks`, so its associated-type bounds are
 //! unchanged; method bodies are moved verbatim and runtime behavior is the same.
 
-use super::super::*;
+#[cfg(test)]
+use super::super::GetObjectMetadataCacheKey;
+#[cfg(test)]
+use super::super::MetadataCacheInvalidationProbe;
+#[cfg(test)]
+use super::super::capacity_scope_from_disks;
+use super::super::{
+    AMZ_STORAGE_CLASS, Arc, Bytes, CompletePart, Cursor, DiskError, DiskStore, EVENT_SET_DISK_MULTIPART, Error, FileInfo,
+    GLOBAL_MIN_PART_SIZE, HashAlgorithm, HashMap, HashReader, HashSet, HealChannelPriority, Instant, LOG_COMPONENT_ECSTORE,
+    LOG_SUBSYSTEM_SET_DISK, ListMultipartsInfo, ListPartsInfo, MAX_PARTS_COUNT, MULTIPART_WRITE_QUORUM_RENAME_PART,
+    MULTIPART_WRITE_QUORUM_UPLOAD_METADATA, MULTIPART_WRITE_QUORUM_WRITER_SETUP, MultipartInfo, MultipartUploadResult,
+    MultipartWriteQuorumContext, NamespaceLockFence, OBJECT_OP_IGNORED_ERRS, ObjectInfo, ObjectLockDiagGuard, ObjectOptions,
+    ObjectPartInfo, OffsetDateTime, PartInfo, PutObjReader, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET,
+    RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, Result, SLASH_SEPARATOR, SUFFIX_ACTUAL_OBJECT_SIZE_CAP,
+    SUFFIX_ACTUAL_SIZE, SUFFIX_BUCKET_INCARNATION_ID, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
+    SUFFIX_RESTORE_OPERATION_ID, SetDisks, SmallWritePath, StorageError, Uuid, WriteLayout,
+    check_object_lock_for_deletion_with_state, classify_multipart_part_write_path, coding, complete_multipart_part_error,
+    complete_multipart_part_error_result, complete_part_checksum, completed_multipart_object_part, contains_key_str,
+    create_bitrot_writer, debug, disk, error, get_complete_multipart_md5, get_header_map, get_str, insert_str,
+    is_err_object_not_found, is_err_version_not_found, is_min_allowed_part_size, log_multipart_write_quorum_failure,
+    parts_after_marker, path_join_buf, record_compression_total_memory, reduce_read_quorum_errs, reduce_write_quorum_errs,
+    remove_header_map, resolve_write_layout, restore_commit_operation_id_from_metadata, should_persist_encryption_original_size,
+    strip_internal_multipart_metadata, to_object_err, warn,
+};
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
+#[cfg(test)]
+use super::object::old_data_cleanup_receipt_path;
 use super::object::{
     assign_object_transaction_epoch, object_transaction_fencing_fleet_proof, object_transaction_fencing_fleet_proof_matches,
-    object_transaction_fencing_requested, old_data_cleanup_receipt_path, read_object_transaction_epoch_fence,
-    verify_object_transaction_epoch_fence,
+    object_transaction_fencing_requested, read_object_transaction_epoch_fence, verify_object_transaction_epoch_fence,
 };
+use crate::api::config::storageclass;
+#[cfg(test)]
+use crate::bucket::metadata_sys::ObjectLockConfigState;
 use crate::bucket::quota::reservation;
 use crate::crash_inject::{self, CrashPoint};
+use crate::disk::DiskAPI;
+#[cfg(test)]
+use crate::disk::DiskOption;
+#[cfg(test)]
+use crate::disk::STORAGE_FORMAT_FILE;
+#[cfg(test)]
+use crate::disk::new_disk;
 use crate::multipart_listing::paginate_multipart_listing;
+#[cfg(test)]
+use crate::object_api::ObjectLockConfigSnapshot;
 use crate::set_disk::core::io_primitives::finish_rename_tail_heal;
+use crate::set_disk::mem;
+use crate::set_disk::metadata_sys;
+use crate::set_disk::runtime_sources;
+#[cfg(test)]
+use crate::storage_api_contracts::multipart::MultipartOperations;
+#[cfg(test)]
+use crate::storage_api_contracts::object::HTTPPreconditions;
+use crate::storage_api_contracts::object::ObjectOperations;
 use futures::{StreamExt, stream};
+#[cfg(test)]
+use http::HeaderMap;
+use rustfs_rio::EtagResolvable;
+use rustfs_rio::TryGetIndex;
+#[cfg(test)]
+use rustfs_utils::http::SSEC_ALGORITHM_HEADER;
+#[cfg(test)]
+use rustfs_utils::http::SUFFIX_COMPRESSION;
 use std::future::Future;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 #[cfg(any(test, feature = "test-util"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(any(test, feature = "test-util"))]
 use std::time::Duration;
+#[cfg(test)]
+use tokio::io::AsyncReadExt;
 use tokio::task::JoinSet;
 
 const MULTIPART_LIST_IO_CONCURRENCY: usize = 16;
@@ -2749,7 +2804,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 needs_immediate_heal = rename_commit.needs_immediate_heal();
                 if let Some(rename_tail_drain) = rename_commit.tail_drain.take() {
                     tail_owns_staging_cleanup = true;
-                    let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
+                    let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
                         commit_bucket.clone(),
                         Some(commit_object.clone()),
                         false,
@@ -2846,7 +2901,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             let committed_file_info = rename_commit.committed_file_info;
 
             if needs_immediate_heal {
-                let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
+                let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
                     commit_bucket.clone(),
                     Some(commit_object.clone()),
                     false,
@@ -2859,7 +2914,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     .or_else(|| commit_version_suspended.then(Uuid::nil))
                     .map(|version_id| version_id.to_string());
                 tokio::spawn(async move {
-                    let _ = rustfs_common::heal_channel::send_heal_request(request).await;
+                    let _ = rustfs_heal_contracts::heal_channel::send_heal_request(request).await;
                 });
             }
 
@@ -2998,7 +3053,7 @@ fn resolve_complete_etag(opts: &ObjectOptions, uploaded_parts: &[CompletePart]) 
 mod tests {
     use super::*;
     use crate::config::storageclass::lookup_config_for_pools_without_env;
-    use crate::disk::{DiskAPI as _, ReadOptions};
+    use crate::disk::ReadOptions;
     use crate::disk::{endpoint::Endpoint, format::FormatV3};
     use crate::layout::endpoints::SetupType;
     use crate::services::notification_sys::install_remote_version_state_fleet_proof_for_test;
@@ -3014,7 +3069,7 @@ mod tests {
     };
     use crate::set_disk::ops::object::{PutObjectCommitBarrier, PutObjectCommitPause};
     use crate::storage_api_contracts::namespace::NamespaceLocking as _;
-    use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+    use crate::storage_api_contracts::object::ObjectIO as _;
     use rustfs_config::server_config::KVS;
     use rustfs_lock::{LockClient, client::local::LocalClient};
     use serial_test::serial;
@@ -3640,11 +3695,17 @@ mod tests {
 
     async fn object_transaction_epochs(disks: &[DiskStore], bucket: &str, object: &str) -> Vec<Option<Uuid>> {
         let mut epochs = Vec::with_capacity(disks.len());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         for (disk_index, disk) in disks.iter().enumerate() {
-            let file_info = disk
-                .read_version("", bucket, object, "", &ReadOptions::default())
-                .await
-                .unwrap_or_else(|err| panic!("disk {disk_index} should persist object metadata: {err}"));
+            let file_info = loop {
+                match disk.read_version("", bucket, object, "", &ReadOptions::default()).await {
+                    Ok(file_info) => break file_info,
+                    Err(DiskError::FileNotFound) if tokio::time::Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                    Err(err) => panic!("disk {disk_index} should persist object metadata: {err}"),
+                }
+            };
             epochs.push(
                 file_info
                     .object_transaction_epoch()
@@ -3707,22 +3768,34 @@ mod tests {
         let (upload_id, parts) =
             stage_upload_with_create_opts(&set_disks, bucket, object, b"multipart fenced epoch", &ObjectOptions::default()).await;
 
-        temp_env::async_with_vars(
+        let epochs = temp_env::async_with_vars(
             [
                 (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_WRITE, Some("true")),
                 (rustfs_config::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true")),
             ],
             async {
+                let rename_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
                 set_disks
                     .clone()
                     .complete_multipart_upload(bucket, object, &upload_id, parts.clone(), &ObjectOptions::default())
                     .await
                     .expect("fenced multipart completion should commit with a live proof");
+
+                tokio::time::timeout(Duration::from_secs(30), rename_barrier.wait_until_paused())
+                    .await
+                    .expect("multipart completion should leave one rename tail in flight after quorum ACK");
+                let disks = disk_stores.clone();
+                let mut epochs = tokio::spawn(async move { object_transaction_epochs(&disks, bucket, object).await });
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), &mut epochs).await.is_err(),
+                    "epoch read-back should wait for the lagging rename tail"
+                );
+                rename_barrier.release();
+                epochs.await.expect("epoch read-back should finish after the rename tail")
             },
         )
         .await;
-
-        let epochs = object_transaction_epochs(&disk_stores, bucket, object).await;
         let first = epochs[0].expect("fenced multipart completion should persist an epoch");
         assert!(!first.is_nil());
         assert!(epochs.into_iter().all(|epoch| epoch == Some(first)));
@@ -4870,7 +4943,7 @@ mod tests {
     #[serial(metadata_cache_invalidation_probe)]
     async fn complete_multipart_generation_retires_cached_snapshot() {
         use crate::storage_api_contracts::multipart::MultipartOperations as _;
-        use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
+        use crate::storage_api_contracts::object::ObjectIO as _;
 
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "multipart-metadata-generation-bucket";
@@ -7369,9 +7442,7 @@ mod tests {
     mod crash_consistency {
         use super::*;
         use crate::crash_inject::{self, CrashPoint};
-        use crate::storage_api_contracts::object::ObjectIO as _;
         use http::HeaderMap;
-        use tokio::io::AsyncReadExt as _;
 
         /// 1 MiB keeps every object off the 128 KiB inline fast path, so the
         /// commit moves real erasure shards through `rename_data`.

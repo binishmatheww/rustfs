@@ -44,6 +44,18 @@ name = "rustfs-cli-e2e"
 path = "src/bin/rustfs-cli.rs"
 required-features = ["offline-enrollment-e2e-root"]
 
+# The Swift protocol suites are manual (#[ignore]) and need a server built with
+# the `swift` feature; gating the test binaries on the same feature keeps the
+# default `cargo test` / nextest build from linking two dead test binaries
+# (backlog#1846 cluster 4).
+[[test]]
+name = "swift_container_integration_test"
+required-features = ["swift"]
+
+[[test]]
+name = "swift_object_integration_test"
+required-features = ["swift"]
+
 [features]
 default = ["ftps", "webdav"]
 metrics-gpu = ["rustfs-obs/gpu"]
@@ -55,8 +67,9 @@ license = []
 io-scheduler-debug = []  # Enable debug information in I/O scheduler
 tracing-chunk-debug = []  # Enable per-chunk tracing in data plane (high noise, for debugging only)
 full = ["metrics-gpu", "ftps", "swift", "webdav", "sftp", "pyroscope"]
-manual-test-runners = []
 e2e-test-hooks = []
+# Shortens Connect credentials only in debug E2E builds.
+connect-e2e-short-credentials = []
 # Builds the dedicated rustfs-cli-e2e target with a build-time public enrollment root.
 offline-enrollment-e2e-root = []
 rio-v2 = ["rustfs-ecstore/rio-v2"]
@@ -213,6 +226,8 @@ hotpath.workspace = true
 rustfs-heal = { workspace = true }
 rustfs-audit = { workspace = true }
 rustfs-common = { workspace = true }
+rustfs-heal-contracts = { workspace = true }
+rustfs-scanner-contracts = { workspace = true }
 rustfs-config = { workspace = true, features = ["notify", "server-config-model"] }
 rustfs-crypto = { workspace = true }
 rustfs-credentials = { workspace = true }
@@ -230,6 +245,7 @@ rustfs-policy = { workspace = true }
 rustfs-protocols = { workspace = true }
 rustfs-protos = { workspace = true }
 rustfs-rio = { workspace = true }
+rustfs-s3-client = { workspace = true }
 rustfs-s3-types = { workspace = true }
 rustfs-s3-ops = { workspace = true }
 rustfs-security-governance = { workspace = true }
@@ -305,7 +321,6 @@ astral-tokio-tar = { workspace = true }
 atoi = { workspace = true }
 atomic_enum = { workspace = true }
 async_zip = { workspace = true, default-features = false, features = ["tokio", "deflate"] }
-base64 = { workspace = true }
 zeroize = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
@@ -347,9 +362,6 @@ rustfs-mimalloc = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
-
-[target.'cfg(not(target_os = "windows"))'.dependencies]
-rustfs-mimalloc-sys = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4", "v5", "fast-rng", "macro-diagnostics"] }

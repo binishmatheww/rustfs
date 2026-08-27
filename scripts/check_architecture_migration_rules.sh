@@ -595,8 +595,8 @@ require_source_line \
   "ECStore bucket metadata public facade explicit module"
 require_source_line \
   "crates/ecstore/src/api/mod.rs" \
-  "    pub mod admin_handler_utils {" \
-  "ECStore client admin handler public facade explicit module"
+  "pub mod object_api_utils {" \
+  "ECStore object-api utils public facade explicit module"
 require_source_line \
   "crates/ecstore/src/api/mod.rs" \
   "    pub mod com {" \
@@ -609,7 +609,7 @@ require_source_line \
   "crates/ecstore/src/api/mod.rs" \
   "    pub mod tier_config {" \
   "ECStore tier config public facade explicit module"
-for ecstore_explicit_facade in bucket client; do
+for ecstore_explicit_facade in bucket; do
   if grep -qF "pub use crate::${ecstore_explicit_facade}::{" "${ROOT_DIR}/crates/ecstore/src/api/mod.rs"; then
     report_failure "ECStore ${ecstore_explicit_facade} public facade must expose explicit submodules instead of whole owner module passthroughs"
   fi
@@ -626,7 +626,6 @@ fi
 for ecstore_private_module in \
   bucket \
   cache_value \
-  client \
   config \
   data_usage \
   diagnostics \
@@ -642,6 +641,12 @@ for ecstore_private_module in \
     "mod ${ecstore_private_module};" \
     "ECStore legacy ${ecstore_private_module} root module crate-private visibility"
 done
+ECSTORE_CLIENT_SHIM_IMPORT_HITS_FILE="${TMP_DIR}/ecstore_client_shim_import_hits.txt"
+if rg -n --no-heading --glob '*.rs' 'crate::client::|^[[:space:]]+client::' \
+  "${ROOT_DIR}/crates/ecstore/src" >"${ECSTORE_CLIENT_SHIM_IMPORT_HITS_FILE}"; then
+  report_failure "ECStore client shim imports must use rustfs_s3_client directly"
+  cat "${ECSTORE_CLIENT_SHIM_IMPORT_HITS_FILE}" >&2
+fi
 require_source_line \
   "crates/storage-api/src/lib.rs" \
   "pub use bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};" \
@@ -2166,7 +2171,7 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'crate::app::(?:bucket_usecase|multipart_usecase|object_usecase)|Default(?:Bucket|Multipart|Object)Usecase::from_global\(\)' \
+  rg -n --with-filename 'crate::app::(?:bucket_usecase|multipart_usecase|object_usecase|object\b)|Default(?:Bucket|Multipart|Object)Usecase::from_global\(\)' \
     rustfs/src/storage/ecfs.rs \
     --glob '*.rs' || true
 ) >"$RUSTFS_STORAGE_ECFS_USECASE_BYPASS_HITS_FILE"
@@ -2220,7 +2225,7 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'use crate::storage::\*;' rustfs/src/app --glob '*_usecase.rs' || true
+  rg -n --with-filename 'use crate::storage::\*;' rustfs/src/app --glob '*_usecase.rs' --glob 'object/*.rs' || true
 ) >"$RUSTFS_APP_USECASE_STORAGE_WILDCARD_HITS_FILE"
 
 if [[ -s "$RUSTFS_APP_USECASE_STORAGE_WILDCARD_HITS_FILE" ]]; then
@@ -2238,7 +2243,7 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'crate::storage::s3_api::|use crate::storage::s3_api|super::s3_api::|use super::s3_api' rustfs/src/app --glob '*_usecase.rs' || true
+  rg -n --with-filename 'crate::storage::s3_api::|use crate::storage::s3_api|super::s3_api::|use super::s3_api' rustfs/src/app --glob '*_usecase.rs' --glob 'object/*.rs' || true
 ) >"$RUSTFS_APP_USECASE_S3_API_BYPASS_HITS_FILE"
 
 if [[ -s "$RUSTFS_APP_USECASE_S3_API_BYPASS_HITS_FILE" ]]; then
@@ -2250,13 +2255,13 @@ fi
   {
     rg -n --with-filename \
       '(use crate::storage::(access|helper|options|request_context|sse|timeout_wrapper|head_prefix|concurrency|ecfs)|crate::storage::sse::EncryptionKeyKind|use crate::storage::\{|use crate::storage::[A-Z])' \
-      rustfs/src/app/select_object.rs rustfs/src/app/*_usecase.rs || true
+      rustfs/src/app/select_object.rs rustfs/src/app/*_usecase.rs rustfs/src/app/object || true
     rg -n --with-filename \
       'use super::(?:\{[^}]*\b(?:DynReader|HashReader|WriteEncryption|WritePlan|DecryptReader|EncryptReader|HardLimitReader|boxed_reader|wrap_reader|compression_metadata_value|is_disk_compressible|MIN_DISK_COMPRESSIBLE_SIZE|get_lock_acquire_timeout|is_valid_storage_class|StorageError|DiskError|is_all_buckets_not_found|is_err_bucket_not_found|is_err_object_not_found|is_err_version_not_found)\b|(?:object_api_utils::to_s3s_etag|storageclass|StorageError|DiskError|DynReader|HashReader|WriteEncryption|WritePlan|DecryptReader|EncryptReader|HardLimitReader|boxed_reader|wrap_reader|compression_metadata_value|is_disk_compressible|MIN_DISK_COMPRESSIBLE_SIZE|get_lock_acquire_timeout|is_valid_storage_class|is_all_buckets_not_found|is_err_bucket_not_found|is_err_object_not_found|is_err_version_not_found)\b)' \
-      rustfs/src/app/bucket_usecase.rs rustfs/src/app/object_usecase.rs rustfs/src/app/multipart_usecase.rs rustfs/src/app/lifecycle_transition_api_test.rs || true
+      rustfs/src/app/bucket_usecase.rs rustfs/src/app/object_usecase.rs rustfs/src/app/object rustfs/src/app/multipart_usecase.rs rustfs/src/app/lifecycle_transition_api_test.rs || true
     rg -n --with-filename \
       'use super::(?:\{[^}]*\b(?:AppObjectLockConfigExt|AppReplicationConfigExt|AppVersioningConfigExt|predict_lifecycle_expiration|validate_restore_request|bucket_target_sys|lifecycle|metadata|metadata_sys|object_lock|policy_sys|quota|replication|tagging|target|utils|versioning_sys|transition_api|ObjectInfo|ObjectOptions)\b|(?:AppObjectLockConfigExt|AppReplicationConfigExt|AppVersioningConfigExt|predict_lifecycle_expiration|validate_restore_request|bucket_target_sys|lifecycle|metadata|metadata_sys|object_lock|policy_sys|quota|replication|tagging|target|utils|versioning_sys|transition_api|ObjectInfo|ObjectOptions)\b)|super::(?:lifecycle|metadata_sys|object_lock|quota|replication|tagging|target|utils|versioning_sys|transition_api)::|super::super::(?:metadata_sys|lifecycle|target)::' \
-      rustfs/src/app/bucket_usecase.rs rustfs/src/app/object_usecase.rs rustfs/src/app/multipart_usecase.rs rustfs/src/app/lifecycle_transition_api_test.rs rustfs/src/app/capacity_dirty_scope_test.rs rustfs/src/app/context.rs rustfs/src/app/context/handles.rs rustfs/src/app/context/interfaces.rs rustfs/src/app/context/runtime_sources.rs || true
+      rustfs/src/app/bucket_usecase.rs rustfs/src/app/object_usecase.rs rustfs/src/app/object rustfs/src/app/multipart_usecase.rs rustfs/src/app/lifecycle_transition_api_test.rs rustfs/src/app/capacity_dirty_scope_test.rs rustfs/src/app/context.rs rustfs/src/app/context/handles.rs rustfs/src/app/context/interfaces.rs rustfs/src/app/context/runtime_sources.rs || true
   }
 ) >"$RUSTFS_APP_USECASE_STORAGE_API_BYPASS_HITS_FILE"
 
@@ -5447,11 +5452,17 @@ require_source_contains \
   "SetDisks storage-api HealOperations compile-time coverage test"
 
 # --- Leaf crates must stay free of internal dependencies (backlog#1834) ---
-# ARCHITECTURE.md invariant 2 names config, credentials, crypto, io-metrics,
-# and madmin as leaf crates that depend only on external crates. Allowlist:
-# io-metrics -> rustfs-s3-ops (contract crate; leaf-allowance adjudication is
-# tracked as backlog#1834 PR2). Adding any other rustfs-* dependency to a leaf
-# crate needs a maintainer decision, not a quiet Cargo.toml edit.
+# ARCHITECTURE.md invariant 2 names config, credentials, crypto, and io-metrics
+# as leaf crates that depend only on external crates. Allowlist:
+# io-metrics -> rustfs-s3-ops. That edge is DECIDED in backlog#1834: allowed as a
+# pure-contract-crate exception (types/enums only, no I/O, no globals, no
+# non-contract internal deps), narrowed to exactly this edge.
+# madmin left the leaf set when #6166 made it the SigV4-signed admin SDK client;
+# its internal dependency surface is pinned to exactly rustfs-signer so it cannot
+# quietly grow storage-side dependencies. Adding any other rustfs-* dependency to
+# any of these five crates needs its own adjudication, not a quiet Cargo.toml edit.
+# The pattern matches both TOML dependency spellings: `rustfs-x = ...` and the
+# dotted `rustfs-x.workspace = true` form (which previously escaped this guard).
 LEAF_CRATE_DEP_HITS_FILE="${TMP_DIR}/leaf_crate_dep_hits.txt"
 : >"$LEAF_CRATE_DEP_HITS_FILE"
 (
@@ -5460,20 +5471,26 @@ LEAF_CRATE_DEP_HITS_FILE="${TMP_DIR}/leaf_crate_dep_hits.txt"
     manifest="crates/${leaf}/Cargo.toml"
     [[ -f "$manifest" ]] || continue
     leaf_dep_status=0
-    rg -n --with-filename '^rustfs-[a-z0-9-]+ *=' "$manifest" >"${TMP_DIR}/leaf_dep_raw.txt" || leaf_dep_status=$?
+    rg -n --with-filename '^rustfs-[a-z0-9-]+(\.[a-zA-Z_-]+)* *=' "$manifest" >"${TMP_DIR}/leaf_dep_raw.txt" || leaf_dep_status=$?
     if [[ "$leaf_dep_status" -ne 0 && "$leaf_dep_status" -ne 1 ]]; then
       exit "$leaf_dep_status"
     fi
-    if [[ "$leaf" == "io-metrics" ]]; then
-      rg -v '^[^:]*:[0-9]+:rustfs-s3-ops *=' "${TMP_DIR}/leaf_dep_raw.txt" >>"$LEAF_CRATE_DEP_HITS_FILE" || true
-    else
-      cat "${TMP_DIR}/leaf_dep_raw.txt" >>"$LEAF_CRATE_DEP_HITS_FILE"
-    fi
+    case "$leaf" in
+      io-metrics)
+        rg -v '^[^:]*:[0-9]+:rustfs-s3-ops(\.[a-zA-Z_-]+)* *=' "${TMP_DIR}/leaf_dep_raw.txt" >>"$LEAF_CRATE_DEP_HITS_FILE" || true
+        ;;
+      madmin)
+        rg -v '^[^:]*:[0-9]+:rustfs-signer(\.[a-zA-Z_-]+)* *=' "${TMP_DIR}/leaf_dep_raw.txt" >>"$LEAF_CRATE_DEP_HITS_FILE" || true
+        ;;
+      *)
+        cat "${TMP_DIR}/leaf_dep_raw.txt" >>"$LEAF_CRATE_DEP_HITS_FILE"
+        ;;
+    esac
   done
 )
 
 if [[ -s "$LEAF_CRATE_DEP_HITS_FILE" ]]; then
-  report_failure "leaf crates (config/credentials/crypto/io-metrics/madmin) must not depend on internal rustfs-* crates (allowlist: io-metrics -> rustfs-s3-ops, backlog#1834): $(paste -sd '; ' "$LEAF_CRATE_DEP_HITS_FILE")"
+  report_failure "leaf/pinned-dep crates: config/credentials/crypto take no internal rustfs-* dependency; io-metrics only rustfs-s3-ops (pure contract crate, backlog#1834); madmin only rustfs-signer (admin SDK SigV4 client, #6166); any new edge needs its own adjudication: $(paste -sd '; ' "$LEAF_CRATE_DEP_HITS_FILE")"
 fi
 
 # --- ecstore module-level lint blankets (backlog#1823 step 9) ---

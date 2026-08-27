@@ -44,10 +44,11 @@ use super::kms_audit::{KmsAdminAudit, KmsAdminOperation};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{current_deployment_id, current_kms_runtime_service_manager};
+use crate::admin::utils::json_response;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use hyper::{HeaderMap, Method, StatusCode};
+use base64_simd::STANDARD as BASE64;
+use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_kms::backup::{
@@ -58,7 +59,6 @@ use rustfs_kms::backup::{
 use rustfs_kms::config::{BackendConfig, KmsConfig, LocalConfig, VaultAuthMethod};
 use rustfs_kms::{KmsBackend, KmsManager, KmsServiceManager, KmsServiceStatus};
 use rustfs_policy::policy::action::{Action, KmsAction};
-use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -429,7 +429,7 @@ impl BackupEnvironment {
 
         let decoded = Zeroizing::new(
             BASE64
-                .decode(raw_kek.trim())
+                .decode_to_vec(raw_kek.trim())
                 .map_err(|_| (StatusCode::PRECONDITION_FAILED, format!("{ENV_KMS_BACKUP_KEK} must be base64-encoded")))?,
         );
         if decoded.len() != 32 {
@@ -516,7 +516,9 @@ fn reuses_business_secret(kek_material: &[u8], raw_kek: &str, config: &KmsConfig
         if raw_kek == secret.as_str() || secret.as_bytes() == kek_material {
             return true;
         }
-        BASE64.decode(secret.as_str()).is_ok_and(|decoded| decoded == kek_material)
+        BASE64
+            .decode_to_vec(secret.as_str())
+            .is_ok_and(|decoded| decoded == kek_material)
     })
 }
 
@@ -888,13 +890,6 @@ async fn backup_status() -> KmsBackupStatusResponse {
 // HTTP plumbing
 // ---------------------------------------------------------------------------
 
-fn json_response<T: Serialize>(status: StatusCode, value: &T) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let data = serde_json::to_vec(value).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, "application/json".parse().expect("static content type should parse"));
-    Ok(S3Response::with_headers((status, Body::from(data)), headers))
-}
-
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     success: bool,
@@ -1185,7 +1180,7 @@ mod tests {
     const DEPLOYMENT: &str = "deployment-under-test";
 
     fn test_kek_bytes() -> Vec<u8> {
-        BASE64.decode(TEST_KEK_B64).expect("test KEK must decode")
+        BASE64.decode_to_vec(TEST_KEK_B64).expect("test KEK must decode")
     }
 
     fn local_config(key_dir: PathBuf) -> KmsConfig {
@@ -1310,7 +1305,7 @@ mod tests {
             .expect_err("an empty KEK must be refused");
         assert_eq!(error.0, StatusCode::PRECONDITION_FAILED);
 
-        let short = BASE64.encode([0x11; 16]);
+        let short = BASE64.encode_to_string([0x11; 16]);
         let error = BackupEnvironment::build(PathBuf::from("/tmp/root"), &short, "kek".to_string(), 1, &config)
             .expect_err("a KEK that is not 32 bytes must be refused");
         assert_eq!(error.0, StatusCode::PRECONDITION_FAILED);
@@ -1353,7 +1348,7 @@ mod tests {
         );
 
         // An unrelated KEK is accepted.
-        let independent = BASE64.encode([0x5a; 32]);
+        let independent = BASE64.encode_to_string([0x5a; 32]);
         assert!(BackupEnvironment::build(PathBuf::from("/tmp/root"), &independent, "kek".to_string(), 1, &config).is_ok());
     }
 
@@ -1372,7 +1367,7 @@ mod tests {
         let master_key = "local-master-key-super-secret";
         let vault_token = "hvs.vault-token-super-secret";
         let approle_secret = "approle-secret-id-super-secret";
-        let static_key = BASE64.encode([0x7c; 32]);
+        let static_key = BASE64.encode_to_string([0x7c; 32]);
 
         let local = local_config_with_master_key(PathBuf::from("/var/lib/rustfs/kms"), master_key);
         let kv2 = vault_kv2_config(VaultAuthMethod::Token {

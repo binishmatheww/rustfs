@@ -18,10 +18,10 @@ use super::kms_audit::{KmsAdminAudit, KmsAdminOperation};
 use crate::admin::auth::{validate_admin_request, validate_admin_request_with_kms_key};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{current_kms_runtime_service_manager, current_or_init_kms_runtime_service_manager};
+use crate::admin::utils::extract_query_params;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::kms_deletion_gate::current_key_impact;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
-use base64::Engine;
 use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
@@ -99,22 +99,6 @@ pub struct GenerateDataKeyApiResponse {
     pub key_id: String,
     pub plaintext_key: String,   // Base64 encoded
     pub ciphertext_blob: String, // Base64 encoded
-}
-
-/// The query parameters of an admin KMS request.
-///
-/// Parsed with `form_urlencoded`, as the rest of the admin surface does, so a
-/// parameter written without a value (`?status`) arrives as an empty value
-/// rather than disappearing: a validated parameter must be able to tell "not
-/// asked for" from "asked for, unreadable".
-pub(super) fn extract_query_params(uri: &hyper::Uri) -> HashMap<String, String> {
-    let mut params = HashMap::new();
-    if let Some(query) = uri.query() {
-        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-            params.insert(key.into_owned(), value.into_owned());
-        }
-    }
-    params
 }
 
 /// Status values a `status` filter may name, spelled as the response spells
@@ -1535,8 +1519,8 @@ impl Operation for GenerateDataKeyHandler {
             Ok(response) => {
                 let api_response = GenerateDataKeyApiResponse {
                     key_id: response.key_id,
-                    plaintext_key: base64::prelude::BASE64_STANDARD.encode(&response.plaintext_key),
-                    ciphertext_blob: base64::prelude::BASE64_STANDARD.encode(&response.ciphertext_blob),
+                    plaintext_key: base64_simd::STANDARD.encode_to_string(&response.plaintext_key),
+                    ciphertext_blob: base64_simd::STANDARD.encode_to_string(&response.ciphertext_blob),
                 };
 
                 let data = serde_json::to_vec(&api_response)

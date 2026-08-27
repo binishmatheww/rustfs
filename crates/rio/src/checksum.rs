@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::errors::ChecksumMismatch;
-use base64::{Engine as _, engine::general_purpose};
+use base64_simd::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
 use http::HeaderMap;
 use sha1::Sha1;
@@ -31,14 +31,28 @@ pub const RUSTFS_MULTIPART_CHECKSUM_TYPE: &str = "x-rustfs-multipart-checksum-ty
 
 /// Checksum type enumeration with flags
 ///
-/// One of three deliberately separate checksum registries (backlog#1833):
-/// this bitset owns the **on-disk xl.meta encoding** — the raw `u32` is
+/// This bitset owns the **on-disk xl.meta encoding** — the raw `u32` is
 /// varint-serialized into xl.meta (see `append_to`), so bits are append-only
-/// and must never be renumbered. `rustfs_checksums::ChecksumAlgorithm`
-/// (crates/checksums/src/lib.rs) owns the streaming-hash algorithm registry,
-/// and the MinIO-port client keeps its own `ChecksumMode`
-/// (crates/ecstore/src/client/checksum.rs). When adding an algorithm, extend
-/// all three (or record why not) — they do not derive from each other.
+/// and must never be renumbered. Canonical per-algorithm metadata (wire
+/// names, headers, digest lengths, checksum-type capabilities) lives in
+/// `rustfs_checksums::ChecksumAlgorithm` (crates/checksums/src/lib.rs), which
+/// the MinIO-port client's `ChecksumMode`
+/// (crates/s3-client/src/checksum.rs) consumes through its `algorithm()`
+/// bridge (backlog#1844).
+///
+/// The hasher implementations below stay rio-native rather than delegating
+/// to rustfs-checksums (backlog#1844 PR3 verdict): `ChecksumHasher` needs a
+/// non-consuming `finalize` plus `reset` on the server hot path, while the
+/// checksums `Checksum` trait finalizes by consuming the box; MD5 is a base
+/// type here (x-amz-checksum-md5, bit 14) but deliberately not a
+/// `ChecksumAlgorithm` variant; and both crates already drive the same
+/// backends (crc_fast, sha1/sha2, xxhash_rust, md5). Equivalence is enforced
+/// instead by pinning both sides to the same official known-answer vectors —
+/// see `hashers_match_rustfs_checksums_known_answer_vectors` below and the
+/// digest tests in crates/checksums. When adding an algorithm: extend
+/// `ChecksumAlgorithm` (exhaustive matches force the metadata), bridge it in
+/// the client, allocate a bit + hasher here, and pin the shared vector in
+/// both test suites (or record why a surface is skipped).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ChecksumType(pub u32);
 
@@ -330,7 +344,7 @@ impl Checksum {
         let mut hasher = checksum_type.hasher()?;
         hasher.write_all(data).ok()?;
         let raw = hasher.finalize();
-        let encoded = general_purpose::STANDARD.encode(&raw);
+        let encoded = BASE64_STANDARD.encode_to_string(&raw);
 
         let checksum = Checksum {
             checksum_type,
@@ -369,7 +383,7 @@ impl Checksum {
             value_string = value.to_string();
         }
         // let raw = base64_simd::URL_SAFE_NO_PAD.decode_to_vec(&value_string).ok()?;
-        let raw = general_purpose::STANDARD.decode(&value_string).ok()?;
+        let raw = BASE64_STANDARD.decode_to_vec(&value_string).ok()?;
 
         let checksum = Checksum {
             checksum_type,
@@ -413,14 +427,14 @@ impl Checksum {
         if self.want_parts > 0 && self.want_parts != parts {
             return Err(ChecksumMismatch {
                 want: format!("{}-{}", self.encoded, self.want_parts),
-                got: format!("{}-{}", general_purpose::STANDARD.encode(&sum), parts),
+                got: format!("{}-{}", base64_simd::STANDARD.encode_to_string(&sum), parts),
             });
         }
 
         if sum != self.raw {
             return Err(ChecksumMismatch {
                 want: self.encoded.clone(),
-                got: general_purpose::STANDARD.encode(&sum),
+                got: base64_simd::STANDARD.encode_to_string(&sum),
             });
         }
 
@@ -569,7 +583,7 @@ impl Checksum {
             }
         }
 
-        self.encoded = general_purpose::STANDARD.encode(&self.raw);
+        self.encoded = base64_simd::STANDARD.encode_to_string(&self.raw);
         Ok(())
     }
 }
@@ -1160,7 +1174,7 @@ pub fn read_checksums(mut buf: &[u8], part: i32) -> (HashMap<String, String>, bo
 
         let checksum_bytes = &buf[..length];
         buf = &buf[length..];
-        let mut checksum_str = general_purpose::STANDARD.encode(checksum_bytes);
+        let mut checksum_str = base64_simd::STANDARD.encode_to_string(checksum_bytes);
 
         if checksum_type.is(ChecksumType::MULTIPART) {
             is_multipart = true;
@@ -1190,7 +1204,7 @@ pub fn read_checksums(mut buf: &[u8], part: i32) -> (HashMap<String, String>, bo
                 if part > 0 && (part as u64) <= parts_count {
                     let offset = ((part - 1) as usize) * length;
                     let part_checksum = &buf[offset..offset + length];
-                    checksum_str = general_purpose::STANDARD.encode(part_checksum);
+                    checksum_str = base64_simd::STANDARD.encode_to_string(part_checksum);
                 }
                 buf = &buf[want_len..];
             }
@@ -1249,7 +1263,7 @@ pub fn read_part_checksums(mut buf: &[u8]) -> Vec<HashMap<String, String>> {
 
             let checksum_bytes = &buf[..length];
             buf = &buf[length..];
-            let checksum_str = general_purpose::STANDARD.encode(checksum_bytes);
+            let checksum_str = base64_simd::STANDARD.encode_to_string(checksum_bytes);
 
             part_checksum.insert(checksum_type.to_string(), checksum_str);
         }
@@ -1553,7 +1567,6 @@ mod tests {
     // asserted alongside the raw hex so both the digest and its encoding are pinned.
     #[test]
     fn xxhash_sha512_regression_lock_non_empty() {
-        use base64::{Engine as _, engine::general_purpose::STANDARD};
         let data = b"The quick brown fox jumps over the lazy dog";
 
         // XXH3-64(fox) = 0xce7d19a5418fb365 is the official upstream vector.
@@ -1565,7 +1578,11 @@ mod tests {
             let got_hex: String = c.raw.iter().map(|b| format!("{b:02x}")).collect();
             assert_eq!(got_hex, want_hex, "{t:?} raw hex drifted");
             // encoded field must be the standard-base64 of raw (S3 wire form)
-            assert_eq!(c.encoded, STANDARD.encode(&c.raw), "{t:?} encoded field != base64(raw)");
+            assert_eq!(
+                c.encoded,
+                base64_simd::STANDARD.encode_to_string(&c.raw),
+                "{t:?} encoded field != base64(raw)"
+            );
         }
     }
 
@@ -1640,6 +1657,24 @@ mod tests {
                 ..Default::default()
             };
             assert!(acc.add_part(&c1, part1.len() as i64).is_err(), "{t:?} must not be full-object mergeable");
+        }
+    }
+
+    // Drift lock for the backlog#1844 PR3 verdict: rio keeps its own hasher
+    // shells instead of delegating to rustfs-checksums, so both sides pin the
+    // SAME input and official digests (crates/checksums/src/lib.rs pins these
+    // values for "test data" in its own tests). If either implementation ever
+    // changes backend, seed, or byte order, one of the two suites fails loudly.
+    #[test]
+    fn hashers_match_rustfs_checksums_known_answer_vectors() {
+        for (t, want_hex) in [
+            (ChecksumType::CRC32, "d308aeb2"),
+            (ChecksumType::CRC32C, "3379b4ca"),
+            (ChecksumType::CRC64_NVME, "aecaf3af9c98a855"),
+            (ChecksumType::SHA1, "f48dd853820860816c75d54d0f584dc863327a7c"),
+            (ChecksumType::SHA256, "916f0027a575074ce72a331777c3478d6513f786a591bd892da1a577bf2335f9"),
+        ] {
+            assert_eq!(raw_hex(t, b"test data"), want_hex, "{t:?} digest drifted from the shared vector");
         }
     }
 

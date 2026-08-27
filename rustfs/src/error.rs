@@ -17,6 +17,23 @@ use crate::storage_api::error::{QuotaError, StorageError};
 use rustfs_kms::KmsUnavailableError;
 use s3s::{S3Error, S3ErrorCode};
 
+/// Marks a request body that exceeded a presigned upload size capability.
+///
+/// This marker must survive the body-reader and storage layers so the client
+/// receives `EntityTooLarge` instead of a generic internal error.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UploadLimitExceeded {
+    pub limit: u64,
+}
+
+impl std::fmt::Display for UploadLimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "upload exceeds the maximum content length of {} bytes", self.limit)
+    }
+}
+
+impl std::error::Error for UploadLimitExceeded {}
+
 #[derive(Debug)]
 pub struct ApiError {
     pub code: S3ErrorCode,
@@ -226,7 +243,7 @@ where
 }
 
 fn error_chain_has_upload_stream_sha256_mismatch(err: &(dyn std::error::Error + 'static)) -> bool {
-    if matches!(err.downcast_ref::<s3s::UploadStreamError>(), Some(s3s::UploadStreamError::Sha256Mismatch)) {
+    if err.to_string() == "UploadStreamError: Sha256Mismatch" {
         return true;
     }
 
@@ -239,7 +256,7 @@ fn error_chain_has_upload_stream_sha256_mismatch(err: &(dyn std::error::Error + 
 
     let mut current = err.source();
     while let Some(err) = current {
-        if matches!(err.downcast_ref::<s3s::UploadStreamError>(), Some(s3s::UploadStreamError::Sha256Mismatch)) {
+        if err.to_string() == "UploadStreamError: Sha256Mismatch" {
             return true;
         }
         current = err.source();
@@ -270,6 +287,17 @@ impl From<StorageError> for ApiError {
             return ApiError {
                 code: S3ErrorCode::BadDigest,
                 message: ApiError::error_code_to_message(&S3ErrorCode::BadDigest),
+                source: Some(Box::new(err)),
+            };
+        }
+
+        if let StorageError::Io(ref io_err) = err
+            && let Some(inner) = io_err.get_ref()
+            && error_chain_has_type::<UploadLimitExceeded>(inner)
+        {
+            return ApiError {
+                code: S3ErrorCode::EntityTooLarge,
+                message: ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge),
                 source: Some(Box::new(err)),
             };
         }
@@ -399,6 +427,13 @@ impl From<std::io::Error> for ApiError {
                     source: Some(Box::new(err)),
                 };
             }
+            if error_chain_has_type::<UploadLimitExceeded>(inner) {
+                return ApiError {
+                    code: S3ErrorCode::EntityTooLarge,
+                    message: ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge),
+                    source: Some(Box::new(err)),
+                };
+            }
             if error_chain_has_type::<rustfs_rio::IncompleteBody>(inner) {
                 return ApiError {
                     code: S3ErrorCode::IncompleteBody,
@@ -451,6 +486,34 @@ mod tests {
     use super::*;
     use s3s::{S3Error, S3ErrorCode};
     use std::io::{Error as IoError, ErrorKind};
+
+    #[derive(Debug)]
+    enum MockUploadStreamError {
+        Underlying(IoError),
+        Sha256Mismatch,
+        LengthMismatch,
+        Incomplete,
+    }
+
+    impl std::fmt::Display for MockUploadStreamError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Underlying(err) => write!(f, "UploadStreamError: Underlying: {err}"),
+                Self::Sha256Mismatch => f.write_str("UploadStreamError: Sha256Mismatch"),
+                Self::LengthMismatch => f.write_str("UploadStreamError: LengthMismatch"),
+                Self::Incomplete => f.write_str("UploadStreamError: Incomplete"),
+            }
+        }
+    }
+
+    impl std::error::Error for MockUploadStreamError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::Underlying(err) => Some(err),
+                Self::Sha256Mismatch | Self::LengthMismatch | Self::Incomplete => None,
+            }
+        }
+    }
 
     #[test]
     fn test_api_error_from_io_error() {
@@ -515,11 +578,11 @@ mod tests {
 
     #[test]
     fn upload_stream_sha256_mismatch_maps_to_bad_digest() {
-        let api_error = ApiError::from(IoError::other(s3s::UploadStreamError::Sha256Mismatch));
+        let api_error = ApiError::from(IoError::other(MockUploadStreamError::Sha256Mismatch));
         assert_eq!(api_error.code, S3ErrorCode::BadDigest);
         assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
 
-        let api_error = ApiError::from(StorageError::Io(IoError::other(s3s::UploadStreamError::Sha256Mismatch)));
+        let api_error = ApiError::from(StorageError::Io(IoError::other(MockUploadStreamError::Sha256Mismatch)));
         assert_eq!(api_error.code, S3ErrorCode::BadDigest);
         assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::BadDigest));
     }
@@ -527,9 +590,9 @@ mod tests {
     #[test]
     fn other_upload_stream_errors_do_not_map_to_bad_digest() {
         let errors = [
-            s3s::UploadStreamError::Underlying(Box::new(IoError::other("underlying body error"))),
-            s3s::UploadStreamError::LengthMismatch,
-            s3s::UploadStreamError::Incomplete,
+            MockUploadStreamError::Underlying(IoError::other("underlying body error")),
+            MockUploadStreamError::LengthMismatch,
+            MockUploadStreamError::Incomplete,
         ];
 
         for error in errors {
@@ -538,9 +601,9 @@ mod tests {
         }
 
         let errors = [
-            s3s::UploadStreamError::Underlying(Box::new(IoError::other("underlying body error"))),
-            s3s::UploadStreamError::LengthMismatch,
-            s3s::UploadStreamError::Incomplete,
+            MockUploadStreamError::Underlying(IoError::other("underlying body error")),
+            MockUploadStreamError::LengthMismatch,
+            MockUploadStreamError::Incomplete,
         ];
 
         for error in errors {
@@ -785,6 +848,16 @@ mod tests {
         assert_eq!(api_error.code, S3ErrorCode::IncompleteBody);
         assert_eq!(api_error.message, ApiError::error_code_to_message(&S3ErrorCode::IncompleteBody));
         assert!(api_error.source.is_some());
+    }
+
+    #[test]
+    fn upload_limit_marker_maps_to_entity_too_large_across_io_boundaries() {
+        let direct: ApiError = IoError::other(UploadLimitExceeded { limit: 5 }).into();
+        assert_eq!(direct.code, S3ErrorCode::EntityTooLarge);
+
+        let storage: ApiError = StorageError::Io(IoError::other(IoError::other(UploadLimitExceeded { limit: 5 }))).into();
+        assert_eq!(storage.code, S3ErrorCode::EntityTooLarge);
+        assert_eq!(storage.message, ApiError::error_code_to_message(&S3ErrorCode::EntityTooLarge));
     }
 
     #[test]

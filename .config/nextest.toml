@@ -138,7 +138,7 @@ test-group = 'e2e-inline-boundaries'
 # does not cross nextest process boundaries, so keep every Vault-backed test in
 # one group.
 [[profile.default.overrides]]
-filter = 'package(e2e_test) & (test(/^kms::kms_vault_test::/) | test(/^kms::configured_roundtrip_test::test_configured_vault_kms_admin_and_versioned_cleanup$/))'
+filter = 'package(e2e_test) & (test(/^kms::kms_vault_test::/) | test(/^kms::kms_rekey_sweep_test::/) | test(/^kms::configured_roundtrip_test::test_configured_vault_kms_admin_and_versioned_cleanup$/))'
 test-group = 'e2e-vault'
 
 # ---------------------------------------------------------------------------
@@ -196,6 +196,15 @@ test-group = 'ecstore-serial-flaky'
 filter = 'package(rustfs-ecstore) & test(walk_dir_does_not_charge_consumer_backpressure_to_the_stall_budget)'
 retries = 2
 
+# Serialize the relocated-pool GET resume regression under the ci profile too
+# (see the matching default-profile override near the top). No longer a
+# quarantine: the fixture race (rustfs#6701/rustfs#6703) was fixed by #6707,
+# which made the staging tolerate quorum-tolerated disk gaps; only the 8-disk
+# cross-disk-IO serialization remains.
+[[profile.ci.overrides]]
+filter = 'package(rustfs) & test(execute_get_object_resumes_from_relocated_pool_without_splicing_body)'
+test-group = 'ecstore-serial-flaky'
+
 # Serialize the 4-disk reliability / degraded-read e2e tests under the ci
 # profile too (see the e2e-reliability test-group note near the top). Not a
 # quarantine: no retries, just single-threaded so several 4-disk servers never
@@ -209,10 +218,6 @@ test-group = 'e2e-reliability'
 # no retries, just serialized 4-disk cross-disk-commit IO.
 [[profile.ci.overrides]]
 filter = 'package(rustfs-ecstore) & test(/^set_disk::ops::multipart::tests::crash_consistency::/)'
-test-group = 'ecstore-serial-flaky'
-
-[[profile.ci.overrides]]
-filter = 'package(rustfs) & test(execute_get_object_resumes_from_relocated_pool_without_splicing_body)'
 test-group = 'ecstore-serial-flaky'
 
 # Match the default-profile embedded test isolation without quarantining or
@@ -484,5 +489,5 @@ filter = 'package(e2e_test) & test(/^inline_fast_path_cluster_test::/)'
 test-group = 'e2e-inline-boundaries'
 
 [[profile.e2e-full.overrides]]
-filter = 'package(e2e_test) & (test(/^kms::kms_vault_test::/) | test(/^kms::configured_roundtrip_test::test_configured_vault_kms_admin_and_versioned_cleanup$/))'
+filter = 'package(e2e_test) & (test(/^kms::kms_vault_test::/) | test(/^kms::kms_rekey_sweep_test::/) | test(/^kms::configured_roundtrip_test::test_configured_vault_kms_admin_and_versioned_cleanup$/))'
 test-group = 'e2e-vault'

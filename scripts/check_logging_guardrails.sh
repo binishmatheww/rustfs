@@ -29,6 +29,15 @@ checked_files=(
   "rustfs/src/admin/handlers/kms_keys.rs"
   "rustfs/src/admin/handlers/kms_key_lifecycle.rs"
   "rustfs/src/admin/handlers/site_replication.rs"
+  "rustfs/src/site_replication/mod.rs"
+  "rustfs/src/site_replication/identity.rs"
+  "rustfs/src/site_replication/state_lock.rs"
+  "rustfs/src/site_replication/state.rs"
+  "rustfs/src/site_replication/transport.rs"
+  "rustfs/src/site_replication/retry.rs"
+  "rustfs/src/site_replication/repair.rs"
+  "rustfs/src/site_replication/hooks.rs"
+  "rustfs/src/site_replication/tests.rs"
   "rustfs/src/admin/handlers/group.rs"
   "rustfs/src/admin/handlers/quota.rs"
   "rustfs/src/admin/handlers/rebalance.rs"
@@ -1014,7 +1023,7 @@ if rg -n -U '(info|warn)!\(\s*target: "rustfs::heal::manager",[\s\S]{0,1000}"Hea
   exit 1
 fi
 
-if rg -n -U 'info!\([\s\S]{0,1000}"GetObject streaming body resumed from a reopened object read"' rustfs/src/app/object_usecase.rs >/dev/null; then
+if rg -n -U 'info!\([\s\S]{0,1000}"GetObject streaming body resumed from a reopened object read"' rustfs/src/app/object >/dev/null; then
   echo "❌ logging guardrail violation: successful per-object GetObject resume events must stay below INFO" >&2
   exit 1
 fi
@@ -1056,7 +1065,7 @@ trace_hot_spans=(
   "crates/ecstore/src/core/sets.rs:list_objects_v2"
   "crates/ecstore/src/set_disk/ops/list.rs:list_objects_v2"
   "rustfs/src/app/bucket_usecase.rs:execute_list_objects_v2"
-  "rustfs/src/app/object_usecase.rs:execute_get_object"
+  "rustfs/src/app/object:execute_get_object"
 )
 
 for hot_span in "${trace_hot_spans[@]}"; do

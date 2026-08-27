@@ -23,9 +23,10 @@ use super::kms_keys::scoped_key_id;
 use crate::admin::auth::validate_admin_request_with_kms_key;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::current_kms_runtime_service_manager;
+use crate::admin::utils::json_response;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
-use hyper::{HeaderMap, Method, StatusCode};
+use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_kms::{
@@ -33,7 +34,6 @@ use rustfs_kms::{
     types::{DescribeKeyRequest, KeyMetadata},
 };
 use rustfs_policy::policy::action::{Action, KmsAction};
-use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -268,13 +268,6 @@ async fn execute_metadata_update(
     }
 }
 
-fn json_response(status: StatusCode, response: &KmsKeyMetadataResponse) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let data = serde_json::to_vec(response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, "application/json".parse().expect("static content type should parse"));
-    Ok(S3Response::with_headers((status, Body::from(data)), headers))
-}
-
 fn unavailable_response(message: &str, key_id: String) -> S3Result<S3Response<(StatusCode, Body)>> {
     json_response(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -408,7 +401,6 @@ impl Operation for UntagKmsKeyHandler {
 mod tests {
     use super::*;
     use crate::admin::handlers::kms_keys::stable_json_value;
-    use base64::Engine as _;
     use rustfs_kms::KmsManager;
     use rustfs_kms::backends::local::LocalKmsBackend;
     use rustfs_kms::backends::static_kms::StaticKmsBackend;
@@ -431,8 +423,7 @@ mod tests {
     /// is the backend that must answer every metadata update with a capability
     /// gap rather than a failure of the request.
     async fn static_service() -> ObjectEncryptionService {
-        let config =
-            KmsConfig::static_kms("static-key".to_string(), base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]));
+        let config = KmsConfig::static_kms("static-key".to_string(), base64_simd::STANDARD.encode_to_string([0x42u8; 32]));
         let backend = Arc::new(
             StaticKmsBackend::new(config.clone())
                 .await

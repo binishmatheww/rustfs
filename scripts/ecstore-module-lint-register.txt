@@ -59,17 +59,14 @@ crates/s3-client/src/api_stat.rs|unused_variables
 crates/s3-client/src/bucket_cache.rs|clippy::all
 crates/s3-client/src/bucket_cache.rs|unused_must_use
 crates/s3-client/src/bucket_cache.rs|unused_variables
-crates/s3-client/src/checksum.rs|clippy::all
-crates/s3-client/src/checksum.rs|unused_must_use
-crates/s3-client/src/checksum.rs|unused_variables
 crates/s3-client/src/constants.rs|unused_must_use
 crates/s3-client/src/constants.rs|unused_variables
 crates/s3-client/src/credentials.rs|clippy::all
 crates/s3-client/src/credentials.rs|unused_must_use
 crates/s3-client/src/credentials.rs|unused_variables
-crates/ecstore/src/client/object_api_utils.rs|clippy::all
-crates/ecstore/src/client/object_api_utils.rs|unused_must_use
-crates/ecstore/src/client/object_api_utils.rs|unused_variables
+crates/ecstore/src/object_api/object_api_utils.rs|clippy::all
+crates/ecstore/src/object_api/object_api_utils.rs|unused_must_use
+crates/ecstore/src/object_api/object_api_utils.rs|unused_variables
 crates/s3-client/src/transition_api.rs|clippy::all
 crates/s3-client/src/transition_api.rs|unused_must_use
 crates/s3-client/src/transition_api.rs|unused_variables
@@ -110,4 +107,3 @@ crates/ecstore/src/services/tier/warm_backend_s3.rs|unused_variables
 crates/ecstore/src/services/tier/warm_backend_tencent.rs|clippy::all
 crates/ecstore/src/services/tier/warm_backend_tencent.rs|unused_must_use
 crates/ecstore/src/services/tier/warm_backend_tencent.rs|unused_variables
-crates/ecstore/src/set_disk/mod.rs|unused_variables

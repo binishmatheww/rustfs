@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::validate_admin_request;
+use crate::admin::auth::authorize_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::object_store_from_extensions;
 use crate::admin::storage_api::bucket::is_reserved_or_invalid_bucket;
@@ -30,9 +30,9 @@ use crate::admin::storage_api::lifecycle::{
     request_manual_transition_job_cancel, save_manual_transition_job_record, update_manual_transition_job_record,
 };
 use crate::admin::storage_api::runtime::ECStore;
-use crate::auth::{check_key_valid, get_session_token};
+use crate::admin::utils::json_response;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
-use http::{HeaderMap, HeaderValue};
+use http::HeaderMap;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
@@ -41,7 +41,6 @@ use rustfs_utils::{
     MaskedAccessKey,
     http::{AMZ_REQUEST_ID, REQUEST_ID_HEADER},
 };
-use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -52,7 +51,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-const JSON_CONTENT_TYPE: &str = "application/json";
 const DEFAULT_MANUAL_TRANSITION_MAX_OBJECTS: u64 = 10_000;
 const MAX_MANUAL_TRANSITION_OBJECTS: u64 = 100_000;
 const MAX_MANUAL_TRANSITION_DURATION_SECONDS: u64 = 3600;
@@ -406,20 +404,16 @@ async fn authorize_manual_transition_request(req: &S3Request<Body>) -> S3Result<
     authorize_transition_admin_request(req, AdminAction::SetTierAction).await
 }
 
+/// The credential pre-check keeps this endpoint family's historical
+/// missing-credentials message (the shared gate reports "get cred failed") and
+/// still yields the masked actor every transition audit log records.
 async fn authorize_transition_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<String> {
     let Some(input_cred) = req.credentials.as_ref() else {
         return Err(s3_error!(InvalidRequest, "authentication required"));
     };
     let actor = MaskedAccessKey(&input_cred.access_key).to_string();
 
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-    let remote_addr = req
-        .extensions
-        .get::<Option<RemoteAddr>>()
-        .and_then(|opt| opt.map(|addr| addr.0));
-
-    validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(action)], remote_addr).await?;
+    authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
 
     Ok(actor)
 }
@@ -632,17 +626,6 @@ fn map_manual_transition_job_load_error(err: StorageError, job_id: Uuid) -> S3Er
     } else {
         S3Error::with_message(S3ErrorCode::InternalError, format!("manual transition job store failed: {err}"))
     }
-}
-
-fn json_response<T: Serialize>(response: &T, status: StatusCode) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let body = serde_json::to_vec(response).map_err(|err| {
-        S3Error::with_message(S3ErrorCode::InternalError, format!("failed to encode manual transition response: {err}"))
-    })?;
-    let content_type = HeaderValue::from_str(JSON_CONTENT_TYPE)
-        .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("invalid content type: {err}")))?;
-    let mut headers = HeaderMap::new();
-    headers.insert(CONTENT_TYPE, content_type);
-    Ok(S3Response::with_headers((status, Body::from(body)), headers))
 }
 
 async fn update_manual_transition_job_record_if_owned(
@@ -926,10 +909,10 @@ impl Operation for ManualTransitionRunHandler {
                         cancel_endpoint: Some(status_endpoint),
                         report: record.report,
                     };
-                    return json_response(&response, StatusCode::ACCEPTED);
+                    return json_response(StatusCode::ACCEPTED, &response);
                 }
                 StartManualTransitionJobResult::Conflict(response) => {
-                    return json_response(&response, StatusCode::CONFLICT);
+                    return json_response(StatusCode::CONFLICT, &response);
                 }
             }
         }
@@ -965,7 +948,7 @@ impl Operation for ManualTransitionRunHandler {
             report,
         };
 
-        json_response(&response, StatusCode::OK)
+        json_response(StatusCode::OK, &response)
     }
 }
 
@@ -1005,7 +988,7 @@ impl Operation for ManualTransitionJobStatusHandler {
                 release_manual_transition_admission(store, &record);
             }
         }
-        json_response(&manual_transition_job_response(record), StatusCode::OK)
+        json_response(StatusCode::OK, &manual_transition_job_response(record))
     }
 }
 
@@ -1027,7 +1010,7 @@ impl Operation for ManualTransitionJobCancelHandler {
         {
             cancel_token.cancel();
         }
-        json_response(&manual_transition_job_response(record), StatusCode::OK)
+        json_response(StatusCode::OK, &manual_transition_job_response(record))
     }
 }
 
@@ -1044,7 +1027,7 @@ impl Operation for TransitionReconcileInspectHandler {
         let status = inspect_transition_transaction_for_operator(store, transaction_id)
             .await
             .map_err(map_transition_operator_error)?;
-        json_response(&status, StatusCode::OK)
+        json_response(StatusCode::OK, &status)
     }
 }
 
@@ -1079,7 +1062,7 @@ impl Operation for TransitionReconcileApplyHandler {
                     "exact_delete_completed_journal_already_finalized"
                 };
                 log_transition_reconcile_applied(transaction_id, "delete_candidate", outcome, &request_id, &actor, &remote_addr);
-                json_response(&TransitionCandidateDeleteResponse { outcome, result }, StatusCode::OK)
+                json_response(StatusCode::OK, &TransitionCandidateDeleteResponse { outcome, result })
             }
             ValidatedTransitionReconcileAction::FinalizeMissing => {
                 finalize_missing_transition_transaction_for_operator(store, transaction_id)
@@ -1094,12 +1077,12 @@ impl Operation for TransitionReconcileApplyHandler {
                     &remote_addr,
                 );
                 json_response(
+                    StatusCode::OK,
                     &TransitionFinalizeMissingResponse {
                         outcome: "journal_finalized",
                         journal_retained: false,
                         transaction_id,
                     },
-                    StatusCode::OK,
                 )
             }
         }
@@ -1489,6 +1472,50 @@ mod tests {
 
         assert!(auth_block.contains("AdminAction::SetTierAction"));
         assert!(!auth_block.contains("AdminAction::ServerInfoAdminAction"));
+    }
+
+    /// The transition wrapper now delegates to the shared admin gate, which reports
+    /// "get cred failed"; its own pre-check keeps the message these endpoints have
+    /// always returned (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn transition_admin_gate_keeps_its_missing_credentials_response() {
+        let err = authorize_transition_admin_request(
+            &manual_transition_job_request(Method::GET, "/rustfs/admin/v3/ilm/transition/jobs/job-123"),
+            AdminAction::ListTierAction,
+        )
+        .await
+        .expect_err("a transition admin request without credentials must fail");
+
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("authentication required"));
+    }
+
+    #[test]
+    fn transition_admin_gate_routes_through_the_shared_gate() {
+        let production = include_str!("ilm_transition.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production source must precede tests");
+        let wrapper = extract_block_between_markers(
+            production,
+            "async fn authorize_transition_admin_request",
+            "fn transition_transaction_id_from_params",
+        );
+
+        assert_eq!(
+            wrapper.matches("authorize_admin_request(").count(),
+            1,
+            "the transition wrapper must use exactly one shared gate"
+        );
+        assert!(
+            wrapper.contains("authorize_admin_request(req, vec![Action::AdminAction(action)])"),
+            "the transition wrapper must forward its parameterized action unchanged"
+        );
+        assert!(
+            wrapper.contains("MaskedAccessKey(&input_cred.access_key)"),
+            "the transition wrapper must keep returning the masked actor"
+        );
+        assert!(!production.contains("check_key_valid(get_session_token"));
     }
 
     #[test]

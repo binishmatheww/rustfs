@@ -12,7 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::*;
+use super::{
+    Arc, Bytes, DiskError, DiskStore, ErasureCache, Error, FileInfo, GetCodecStreamingFallbackReason, GetObjectFileInfo,
+    GetObjectMetadataCacheEntry, GetObjectMetadataCacheGeneration, GetObjectMetadataCacheKey, GetObjectReadPolicy, HashAlgorithm,
+    LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_SET_DISK, OBJECT_OP_IGNORED_ERRS, ObjectInfo, ObjectOptions, RUSTFS_META_BUCKET,
+    ReadOptions, Result, SetDisks, StorageError, adaptive_duplex_buffer_size, build_get_codec_streaming_decode_engine,
+    build_inline_bitrot_readers_from_refs, collect_inline_data_shard_fileinfos_by_index, debug, error,
+    get_codec_streaming_metrics_path, get_codec_streaming_multipart_max_parts, get_object_read_policy,
+    is_codec_streaming_multipart_enabled, is_multipart_reader_setup_prefetch_enabled, object_fits_single_block,
+    reduce_read_quorum_errs, to_object_err, try_read_inline_data_shards_direct, warn,
+};
 use crate::diagnostics::get::{
     GET_DIRECT_MEMORY_SUBPATH_DISK_DATA_BLOCKS, GET_DIRECT_MEMORY_SUBPATH_INLINE_BUFFERED, GET_METADATA_CACHE_DECISION_HIT,
     GET_METADATA_CACHE_DECISION_MISS, GET_METADATA_CACHE_DECISION_REJECT, GET_METADATA_CACHE_DECISION_SKIP,
@@ -22,43 +31,152 @@ use crate::diagnostics::get::{
     GET_METADATA_CACHE_REASON_NOT_READ_DATA, GET_METADATA_CACHE_REASON_PART_CHECKSUMS, GET_METADATA_CACHE_REASON_PART_NUMBER,
     GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ, GET_METADATA_CACHE_REASON_STALE_PUBLICATION,
     GET_METADATA_CACHE_REASON_USABLE, GET_METADATA_CACHE_REASON_VERSION_ID, GET_METADATA_CACHE_REASON_VERSION_SUSPENDED,
-    GET_METADATA_CACHE_REASON_VERSIONED, GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA,
-    GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER, GET_METADATA_EARLY_STOP_REASON_ERROR,
-    GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM, GET_METADATA_EARLY_STOP_REASON_NOT_FOUND,
-    GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST, GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM,
-    GET_METADATA_EARLY_STOP_REASON_VERSION_MATCH_QUORUM, GET_METADATA_EARLY_STOP_REASON_VERSION_NOT_FOUND,
-    GET_METADATA_RESPONSE_CORRUPT, GET_METADATA_RESPONSE_DISK_NOT_FOUND, GET_METADATA_RESPONSE_ERROR,
-    GET_METADATA_RESPONSE_IGNORED, GET_METADATA_RESPONSE_NOT_FOUND, GET_METADATA_RESPONSE_TIMEOUT, GET_METADATA_RESPONSE_VALID,
-    GET_METADATA_RESPONSE_VERSION_NOT_FOUND, GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_DIRECT_MEMORY,
-    GET_OBJECT_PATH_INTERNAL_META, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE,
-    GET_STAGE_METADATA_CACHE_LOOKUP, GET_STAGE_METADATA_RESOLVE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP,
-    GET_STAGE_READER_SETUP_DROP_PENDING, GET_STAGE_READER_SETUP_SCHEDULE, GET_STAGE_READER_SETUP_WAIT_QUORUM,
-    GET_STAGE_READER_TASK_BITROT_READER_INIT, GET_STAGE_READER_TASK_FILE_OPEN, GET_STAGE_READER_TASK_READER_CONSTRUCTION,
-    GetObjectFailureReason, classify_disk_error, get_stage_timer_if_enabled, mark_get_object_downstream_closed,
-    record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
+    GET_METADATA_CACHE_REASON_VERSIONED, GET_OBJECT_PATH_DIRECT_MEMORY, GET_OBJECT_PATH_INTERNAL_META,
+    GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE, GET_STAGE_METADATA_CACHE_LOOKUP,
+    GET_STAGE_METADATA_RESOLVE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GET_STAGE_READER_TASK_BITROT_READER_INIT,
+    GET_STAGE_READER_TASK_FILE_OPEN, GET_STAGE_READER_TASK_READER_CONSTRUCTION, GetObjectFailureReason, classify_disk_error,
+    get_stage_timer_if_enabled, mark_get_object_downstream_closed, record_get_object_pipeline_failure,
+    record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
-use crate::erasure::coding::BitrotReader;
-use crate::io_support::bitrot::{
-    BitrotReaderStageMetrics, DeferredReaderStripeHandle, create_bitrot_reader_with_stage_metrics, create_deferred_bitrot_reader,
-    object_mmap_read_enabled,
-};
+use crate::disk::DiskAPI;
+use crate::io_support::bitrot::{BitrotReaderStageMetrics, DeferredReaderStripeHandle, object_mmap_read_enabled};
+use crate::set_disk::coding;
+use crate::set_disk::runtime_sources;
 use crate::set_disk::shard_source::ShardReadCost;
-use futures::stream::{FuturesUnordered, StreamExt};
-use metrics::counter;
 use std::{
-    collections::{HashMap, VecDeque},
     future::Future,
     io::IoSlice,
     pin::Pin,
-    sync::OnceLock,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::RwLock;
-use tokio::task::JoinSet;
 
+#[cfg(test)]
+use super::DEFAULT_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES;
+#[cfg(test)]
+use super::DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_ENABLE;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_MAX_SIZE;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH;
+#[cfg(test)]
+use super::ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES;
+#[cfg(test)]
+use super::GET_OBJECT_METADATA_CACHE_TTL;
+#[cfg(test)]
+use super::GetCodecStreamingConfig;
+#[cfg(test)]
+use super::GetCodecStreamingDecision;
+#[cfg(test)]
+use super::GetCodecStreamingEngine;
+#[cfg(test)]
+use super::GetCodecStreamingGate;
+#[cfg(test)]
+use super::GetCodecStreamingObjectClass;
+#[cfg(test)]
+use super::GetCodecStreamingRollout;
+#[cfg(test)]
+use super::classify_get_codec_streaming_object_class;
 use super::core::io_primitives::*;
+#[cfg(test)]
+use super::get_codec_streaming_config_cached_core;
+#[cfg(test)]
+use super::get_codec_streaming_engine;
+#[cfg(test)]
+use super::get_codec_streaming_reader_gate;
+#[cfg(test)]
+use super::get_object_metadata_cache_max_entries;
+#[cfg(test)]
+use super::is_get_metadata_data_read_early_stop_enabled;
+#[cfg(test)]
+use super::is_get_metadata_early_stop_bounded_fanout_enabled;
+#[cfg(test)]
+use super::is_get_metadata_early_stop_enabled;
+#[cfg(test)]
+use super::is_version_early_stop_enabled;
+#[cfg(test)]
+use super::load_get_codec_streaming_config;
+#[cfg(test)]
+use super::with_get_object_read_policy;
+#[cfg(test)]
+use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
+#[cfg(test)]
+use crate::diagnostics::get::GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE;
+#[cfg(test)]
+use crate::diagnostics::get::GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE;
+#[cfg(test)]
+use crate::diagnostics::get::{
+    GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA, GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER,
+    GET_METADATA_EARLY_STOP_REASON_ERROR, GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM,
+    GET_METADATA_EARLY_STOP_REASON_NOT_FOUND, GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST,
+    GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM, GET_METADATA_EARLY_STOP_REASON_VERSION_MATCH_QUORUM,
+    GET_METADATA_EARLY_STOP_REASON_VERSION_NOT_FOUND, GET_METADATA_RESPONSE_CORRUPT, GET_METADATA_RESPONSE_DISK_NOT_FOUND,
+    GET_METADATA_RESPONSE_ERROR, GET_METADATA_RESPONSE_IGNORED, GET_METADATA_RESPONSE_NOT_FOUND, GET_METADATA_RESPONSE_TIMEOUT,
+    GET_METADATA_RESPONSE_VALID, GET_METADATA_RESPONSE_VERSION_NOT_FOUND,
+};
+#[cfg(test)]
+use crate::disk::ReadMultipleResp;
+#[cfg(test)]
+use crate::disk::format::FormatV3;
+#[cfg(test)]
+use crate::erasure::codec::bridge::CodecStreamingDecodeEngine;
+#[cfg(test)]
+use crate::erasure::codec::bridge::GET_CODEC_STREAMING_ENGINE_RUSTFS;
+#[cfg(test)]
+use crate::object_api::PutObjReader;
+#[cfg(test)]
+use crate::storage_api_contracts::object::ObjectIO;
+#[cfg(test)]
+use crate::storage_api_contracts::range::HTTPRangeSpec;
+#[cfg(test)]
+use rustfs_filemeta::ObjectPartInfo;
+#[cfg(test)]
+use rustfs_heal_contracts::heal_channel::HealAdmissionResult;
+#[cfg(test)]
+use rustfs_heal_contracts::heal_channel::HealChannelPriority;
+#[cfg(test)]
+use rustfs_utils::http::SUFFIX_COMPRESSION;
+#[cfg(test)]
+use rustfs_utils::http::insert_str;
+#[cfg(test)]
+use time::OffsetDateTime;
+#[cfg(test)]
+use tokio::sync::RwLock;
+#[cfg(test)]
+use tokio::time::timeout;
+#[cfg(test)]
+use uuid::Uuid;
 
 pub(super) struct GetObjectDownstreamWriter<W> {
     inner: W,
@@ -792,7 +910,7 @@ impl SetDisks {
         let use_mmap_read = object_mmap_read_enabled();
         let files = Arc::new(files);
         let disks = Arc::new(disks);
-        let prefetch_enabled = is_multipart_reader_setup_prefetch_enabled();
+        let prefetch_enabled = multipart_reader_setup_prefetch_enabled(get_object_read_policy());
         let mut prefetched: Option<(usize, PrefetchedReaderSetup)> = None;
 
         let mut total_read = 0;
@@ -1065,8 +1183,9 @@ impl SetDisks {
             let unattempted_data_shards = !reader_setup.data_shards_attempted(erasure.data_shards);
             let readers = reader_setup.readers;
             let deferred_stripe_handles = reader_setup.deferred_stripe_handles;
+            let deferred_reopeners = reader_setup.deferred_reopeners;
             let (written, err) = erasure
-                .decode_with_stripe_handles(
+                .decode_with_stripe_handles_and_reopeners(
                     writer,
                     readers,
                     part_offset,
@@ -1074,6 +1193,7 @@ impl SetDisks {
                     part_size,
                     read_costs,
                     deferred_stripe_handles,
+                    deferred_reopeners,
                 )
                 .await;
             let decode_elapsed = decode_stage_start.elapsed();
@@ -1476,6 +1596,7 @@ impl SetDisks {
                     erasure.clone(),
                     reader_setup.readers,
                     reader_setup.deferred_stripe_handles,
+                    reader_setup.deferred_reopeners,
                     read_costs,
                     part_offset,
                     part_length,
@@ -1488,6 +1609,7 @@ impl SetDisks {
 
         let readers = reader_setup.readers;
         let deferred_stripe_handles = reader_setup.deferred_stripe_handles;
+        let deferred_reopeners = reader_setup.deferred_reopeners;
         let source = if let Some(read_costs) = read_costs {
             coding::decode::ParallelReader::new_with_metrics_path_read_costs_and_reconstruction_verification(
                 readers,
@@ -1506,7 +1628,8 @@ impl SetDisks {
                 Some(metrics_path),
             )
         }
-        .with_deferred_parity_handles(deferred_stripe_handles);
+        .with_deferred_parity_handles(deferred_stripe_handles)
+        .with_deferred_parity_reopeners(deferred_reopeners);
         let engine = build_get_codec_streaming_decode_engine(erasure.clone())?;
         let reader =
             coding::decode_reader::ErasureDecodeReader::new_with_metrics_path(source, engine, part_length, metrics_path)?;
@@ -1533,6 +1656,10 @@ fn multipart_part_checksum_algo(fi: &FileInfo, part_number: usize) -> HashAlgori
     } else {
         checksum_info.algorithm
     }
+}
+
+fn multipart_reader_setup_prefetch_enabled(policy: GetObjectReadPolicy) -> bool {
+    policy.allows_multipart_setup_prefetch() && is_multipart_reader_setup_prefetch_enabled()
 }
 
 /// Run one part's bitrot reader setup and measure its wall-clock duration.
@@ -1762,10 +1889,12 @@ impl Drop for LazyMultipartCodecStreamingReader {
 /// background task drives the decode into the write half while the returned
 /// reader drains the read half. No extra file descriptors are opened — the
 /// readers are moved in from the setup that just ran.
+#[allow(clippy::too_many_arguments)]
 fn build_legacy_per_part_fallback_reader(
     erasure: coding::Erasure,
     readers: Vec<Option<ObjectBitrotReader>>,
     deferred_stripe_handles: Vec<Option<DeferredReaderStripeHandle>>,
+    deferred_reopeners: Vec<Option<DeferredReaderReopener>>,
     read_costs: Option<Vec<ShardReadCost>>,
     part_offset: usize,
     part_length: usize,
@@ -1775,7 +1904,7 @@ fn build_legacy_per_part_fallback_reader(
     let (read_half, mut write_half) = tokio::io::duplex(buffer);
     let decode = tokio::spawn(async move {
         let (_written, err) = erasure
-            .decode_with_stripe_handles(
+            .decode_with_stripe_handles_and_reopeners(
                 &mut write_half,
                 readers,
                 part_offset,
@@ -1783,6 +1912,7 @@ fn build_legacy_per_part_fallback_reader(
                 part_size,
                 read_costs,
                 deferred_stripe_handles,
+                deferred_reopeners,
             )
             .await;
         // Dropping `write_half` on return signals EOF to the reader half.
@@ -1896,7 +2026,7 @@ fn is_get_object_metadata_cache_request_eligible(bucket: &str, opts: &ObjectOpti
 #[cfg(test)]
 mod metadata_cache_tests {
     use super::*;
-    use rustfs_common::heal_channel::HealAdmissionDropReason;
+    use rustfs_heal_contracts::heal_channel::HealAdmissionDropReason;
     use serial_test::serial;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, OnceLock};
@@ -1974,7 +2104,9 @@ mod metadata_cache_tests {
         }
     }
 
-    fn slow_read_repair_submitter(_request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+    fn slow_read_repair_submitter(
+        _request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
+    ) -> ReadRepairAdmissionFuture {
         SLOW_READ_REPAIR_SUBMITTER_CALLS.fetch_add(1, Ordering::Relaxed);
         Box::pin(async {
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1982,14 +2114,18 @@ mod metadata_cache_tests {
         })
     }
 
-    fn dropped_read_repair_submitter(_request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+    fn dropped_read_repair_submitter(
+        _request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
+    ) -> ReadRepairAdmissionFuture {
         DROPPED_READ_REPAIR_SUBMITTER_CALLS.fetch_add(1, Ordering::Relaxed);
         Box::pin(async {
             ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped))
         })
     }
 
-    fn capture_read_repair_submitter(request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+    fn capture_read_repair_submitter(
+        request: rustfs_heal_contracts::heal_channel::HealChannelRequest,
+    ) -> ReadRepairAdmissionFuture {
         CAPTURED_READ_REPAIR_CALLS.fetch_add(1, Ordering::Relaxed);
         *CAPTURED_READ_REPAIR_PRIORITY.lock().expect("capture mutex poisoned") = Some(request.priority);
         Box::pin(async {
@@ -3230,6 +3366,7 @@ mod metadata_cache_tests {
 mod tests {
     use super::*;
     use crate::erasure::coding::BitrotWriter;
+    use serial_test::serial;
     use std::io::{Cursor, ErrorKind, IoSlice};
     use std::sync::{
         Arc,
@@ -3239,6 +3376,15 @@ mod tests {
 
     const CODEC_STREAMING_TEST_BUCKET: &str = "bucket";
     const CODEC_STREAMING_TEST_OBJECT: &str = "object";
+
+    #[test]
+    #[serial]
+    fn multipart_reader_setup_prefetch_is_disabled_only_for_copy_sources() {
+        temp_env::with_var(ENV_RUSTFS_GET_MULTIPART_READER_SETUP_PREFETCH, Some("true"), || {
+            assert!(multipart_reader_setup_prefetch_enabled(GetObjectReadPolicy::Default));
+            assert!(!multipart_reader_setup_prefetch_enabled(GetObjectReadPolicy::CopySource));
+        });
+    }
 
     #[tokio::test]
     async fn downstream_writer_marks_closed_duplex_reader_as_downstream_close() {
@@ -5475,6 +5621,7 @@ mod tests {
             erasure,
             setup.readers,
             setup.deferred_stripe_handles,
+            Vec::new(),
             None,
             0,
             data.len(),
@@ -5525,6 +5672,7 @@ mod tests {
                     erasure,
                     setup.readers,
                     setup.deferred_stripe_handles,
+                    Vec::new(),
                     None,
                     0,
                     part2_len,
@@ -5565,6 +5713,7 @@ mod tests {
             erasure,
             setup.readers,
             setup.deferred_stripe_handles,
+            Vec::new(),
             None,
             0,
             data.len(),
@@ -6001,6 +6150,49 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn codec_streaming_reader_gate_keeps_copy_source_demand_bound_for_all_classes() {
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("benchmark")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+            ],
+            async {
+                let fi = codec_streaming_test_fileinfo(1024, 2);
+                let object_info = codec_streaming_test_object_info(&fi);
+                let normal = codec_streaming_reader_gate_for_test(&None, &object_info, &fi, true);
+                assert_eq!(normal.decision, GetCodecStreamingDecision::Use);
+
+                let plain_fi = codec_streaming_test_fileinfo(1024, 1);
+                let plain_object_info = codec_streaming_test_object_info(&plain_fi);
+                let normal_plain = codec_streaming_reader_gate_for_test(&None, &plain_object_info, &plain_fi, true);
+                assert_eq!(normal_plain.object_class, GetCodecStreamingObjectClass::PlainSinglePart);
+                assert_eq!(normal_plain.decision, GetCodecStreamingDecision::Use);
+
+                let copy = with_get_object_read_policy(GetObjectReadPolicy::CopySource, async {
+                    let multipart = codec_streaming_reader_gate_for_test(&None, &object_info, &fi, true);
+                    let plain = codec_streaming_reader_gate_for_test(&None, &plain_object_info, &plain_fi, true);
+                    (multipart, plain)
+                })
+                .await;
+                assert_eq!(
+                    copy.0.decision,
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::CopySourceDemandBound)
+                );
+                assert_eq!(
+                    copy.1.decision,
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::CopySourceDemandBound)
+                );
+            },
+        )
+        .await;
+    }
+
     #[test]
     fn codec_streaming_reader_gate_keeps_multipart_default_off() {
         temp_env::with_vars(
@@ -6102,6 +6294,10 @@ mod tests {
         assert_eq!(GetCodecStreamingFallbackReason::InvalidMinSize.as_str(), "invalid_min_size");
         assert_eq!(GetCodecStreamingFallbackReason::ReadQuorumNotSafe.as_str(), "read_quorum_not_safe");
         assert_eq!(GetCodecStreamingFallbackReason::MultipartPartLimit.as_str(), "multipart_part_limit");
+        assert_eq!(
+            GetCodecStreamingFallbackReason::CopySourceDemandBound.as_str(),
+            "copy_source_demand_bound"
+        );
         assert_eq!(GetCodecStreamingObjectClass::PlainSinglePart.as_str(), "plain_single_part");
         assert_eq!(GetCodecStreamingObjectClass::Range.as_str(), "range");
         assert_eq!(GetCodecStreamingObjectClass::Encrypted.as_str(), "encrypted");

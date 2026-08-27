@@ -151,6 +151,15 @@ static HTTP_STATUS_CLASS_METRICS: std::sync::LazyLock<[HttpStatusClassMetrics; 6
     std::sync::LazyLock::new(|| HTTP_STATUS_CLASS_LABELS.map(HttpStatusClassMetrics::new));
 static HTTP_TRANSPORT_FAILURES_COUNTER: std::sync::LazyLock<metrics::Counter> =
     std::sync::LazyLock::new(|| counter!(METRIC_HTTP_SERVER_FAILURES_TOTAL, LABEL_HTTP_STATUS_CLASS => "transport"));
+
+fn rustfs_s3_config() -> S3Config {
+    let mut s3_config = S3Config::default();
+    s3_config.normalize_forward_slash_path = true;
+    s3_config.enable_sig_v2 = true;
+    s3_config.sig_v4_allowed_services.push("s3tables".to_string());
+    s3_config
+}
+
 const LOG_COMPONENT_SERVER: &str = "server";
 const LOG_SUBSYSTEM_HTTP: &str = "http";
 const LOG_SUBSYSTEM_TRANSPORT: &str = "transport";
@@ -922,8 +931,7 @@ pub async fn start_http_server(
         // `PUT /bucket//foo/bar` are rejected downstream with InvalidArgument
         // (ObjectNamePrefixAsSlash, issue #2427). MinIO collapses these slashes instead of preserving them,
         // so `//foo/bar` is stored and served as `foo/bar`.
-        let mut s3_config = S3Config::default();
-        s3_config.normalize_forward_slash_path = true;
+        let s3_config = rustfs_s3_config();
         b.set_config(Arc::new(StaticConfigProvider::new(Arc::new(s3_config))));
 
         // Virtual-hosted-style requests are only set up for S3 API when server domains are configured and console is disabled
@@ -1670,7 +1678,10 @@ fn process_connection(
                 .option_layer(if is_console { Some(RedirectLayer) } else { None })
                 .layer(BodylessStatusFixLayer)
                 .layer(HeadRequestBodyFixLayer)
-                .layer(PublicHealthEndpointLayer::new(Arc::clone(&server_ctx)))
+                .layer(PublicHealthEndpointLayer::new(
+                    Arc::clone(&server_ctx),
+                    Arc::clone(&readiness),
+                ))
                 .option_layer((!server_domains_configured && !is_console).then_some(VirtualHostStyleHintLayer))
                 .layer(DoubleSlashListBucketsCompatLayer)
                 .service(service)
@@ -2255,6 +2266,17 @@ mod tests {
         let unknown_status = StatusCode::from_u16(700).expect("extension status should parse");
         assert_eq!(status_class_index(unknown_status), HTTP_STATUS_UNKNOWN_INDEX);
         assert_eq!(HTTP_STATUS_CLASS_LABELS[HTTP_STATUS_UNKNOWN_INDEX], "unknown");
+    }
+
+    #[test]
+    fn rustfs_s3_config_preserves_compatibility_over_s3s_defaults() {
+        let s3_config = rustfs_s3_config();
+
+        assert!(s3_config.normalize_forward_slash_path);
+        assert!(s3_config.enable_sig_v2);
+        assert!(s3_config.sig_v4_allowed_services.iter().any(|service| service == "s3"));
+        assert!(s3_config.sig_v4_allowed_services.iter().any(|service| service == "sts"));
+        assert!(s3_config.sig_v4_allowed_services.iter().any(|service| service == "s3tables"));
     }
 
     #[test]

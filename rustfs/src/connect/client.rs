@@ -14,7 +14,6 @@
 
 use std::time::Duration;
 
-use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode, Url, header};
 use rustls::RootCertStore;
@@ -37,6 +36,9 @@ use super::registration::{
 
 const MAX_ATTEMPTS: usize = 3;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+#[cfg(feature = "connect-e2e-short-credentials")]
+const ROTATION_THRESHOLD_SECONDS: i64 = 120;
+#[cfg(not(feature = "connect-e2e-short-credentials"))]
 const ROTATION_THRESHOLD_SECONDS: i64 = 8 * 60 * 60;
 const PENDING_REGISTRATION_STATE_DOMAIN: &[u8] = b"RUSTFS-CONNECT-PENDING-REGISTRATION-V1";
 
@@ -225,8 +227,8 @@ impl ConnectClient {
         pending: &PendingRegistration,
         identity: &super::identity::DeviceIdentity,
     ) -> Result<DeviceCredential, ClientError> {
-        let csr_der = base64::engine::general_purpose::STANDARD
-            .decode(&pending.certificate_request)
+        let csr_der = base64_simd::STANDARD
+            .decode_to_vec(&pending.certificate_request)
             .map_err(|_| ClientError::PendingRegistration)?;
         let transcript = RegistrationTranscript::build(
             &token.registration_token_uid,
