@@ -105,7 +105,9 @@ use crate::{
         SnapshotLeaseToken, UpdateMetadataOpts, endpoint::Endpoint, error::DiskError, format::FormatV3,
     },
     error::{StorageError, to_object_err},
-    object_api::{GetObjectReader, NamespaceLockFence, ObjectInfo, ObjectLockConfigSnapshot, PutObjReader},
+    object_api::{
+        GetObjectReader, NamespaceLockFence, ObjectInfo, ObjectLockConfigSnapshot, PutObjReader, ScannerPublicationCommitScope,
+    },
     // event::name::EventName,
     services::event_notification::{EventArgs, send_event},
     store::init_format::{
@@ -3935,6 +3937,47 @@ impl SetDisks {
         drop(operation_guard);
         let owner = runtime_sources::object_store_handle().filter(|owner| Arc::ptr_eq(&owner.ctx, &self.ctx))?;
         owner.scanner_data_usage_publication_admission_guard().await
+    }
+
+    /// Acquire a storage-owned scanner publication scope for this set's
+    /// instance movement fence. The scope keeps the read permit alive across
+    /// scanner future cancellation until the mutation owner drains.
+    pub async fn scanner_data_usage_publication_commit_scope(
+        &self,
+        expected_movement_epoch: u64,
+        safe_deadline: tokio::time::Instant,
+        remote_lease_tokens: Vec<Uuid>,
+    ) -> Option<ScannerPublicationCommitScope> {
+        let (movement_permit, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
+        if epoch != expected_movement_epoch {
+            return None;
+        }
+        Some(ScannerPublicationCommitScope::new_storage_owned(
+            epoch,
+            safe_deadline,
+            remote_lease_tokens,
+            movement_permit,
+        ))
+    }
+
+    pub async fn scanner_data_usage_publication_commit_scope_with_release_flag(
+        &self,
+        expected_movement_epoch: u64,
+        safe_deadline: tokio::time::Instant,
+        remote_lease_tokens: Vec<Uuid>,
+        lease_release_safe: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<ScannerPublicationCommitScope> {
+        let (movement_permit, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
+        if epoch != expected_movement_epoch {
+            return None;
+        }
+        Some(ScannerPublicationCommitScope::new_storage_owned_with_release_flag(
+            epoch,
+            safe_deadline,
+            remote_lease_tokens,
+            movement_permit,
+            lease_release_safe,
+        ))
     }
 
     /// Whether both sets' namespace-lock implementations cover the same object key.

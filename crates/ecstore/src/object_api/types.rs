@@ -420,6 +420,7 @@ struct ScannerPublicationCommitScopeInner {
     /// future. A detached mutation task keeps the scope alive and therefore
     /// keeps this guard alive until it reports a terminal state.
     movement_permit: Mutex<Option<OwnedRwLockReadGuard<()>>>,
+    lease_release_safe: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Storage-owned ownership scope for one fenced scanner metadata mutation.
@@ -453,6 +454,25 @@ impl ScannerPublicationCommitScope {
         remote_lease_tokens: Vec<Uuid>,
         movement_permit: OwnedRwLockReadGuard<()>,
     ) -> Self {
+        Self::new_storage_owned_with_release_flag(
+            expected_movement_epoch,
+            safe_deadline,
+            remote_lease_tokens,
+            movement_permit,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        )
+    }
+
+    pub(crate) fn new_storage_owned_with_release_flag(
+        expected_movement_epoch: u64,
+        safe_deadline: tokio::time::Instant,
+        remote_lease_tokens: Vec<Uuid>,
+        movement_permit: OwnedRwLockReadGuard<()>,
+        lease_release_safe: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        // Admission itself is not a safe release point. The flag becomes true
+        // only after the storage mutation owner reports a terminal state.
+        lease_release_safe.store(false, Ordering::Release);
         Self {
             inner: Arc::new(ScannerPublicationCommitScopeInner {
                 expected_movement_epoch,
@@ -462,6 +482,7 @@ impl ScannerPublicationCommitScope {
                 state: AtomicU8::new(SCANNER_PUBLICATION_SCOPE_ADMITTED),
                 completed: Notify::new(),
                 movement_permit: Mutex::new(Some(movement_permit)),
+                lease_release_safe,
             }),
         }
     }
@@ -537,21 +558,20 @@ impl ScannerPublicationCommitScope {
     }
 
     pub fn mark_aborted_before_commit(&self) -> bool {
-        for expected in [SCANNER_PUBLICATION_SCOPE_ADMITTED, SCANNER_PUBLICATION_SCOPE_IN_FLIGHT] {
-            if self
-                .inner
-                .state
-                .compare_exchange(
-                    expected,
-                    SCANNER_PUBLICATION_SCOPE_ABORTED_BEFORE_COMMIT,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                self.inner.completed.notify_waiters();
-                return true;
-            }
+        if self
+            .inner
+            .state
+            .compare_exchange(
+                SCANNER_PUBLICATION_SCOPE_ADMITTED,
+                SCANNER_PUBLICATION_SCOPE_ABORTED_BEFORE_COMMIT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.inner.lease_release_safe.store(true, Ordering::Release);
+            self.inner.completed.notify_waiters();
+            return true;
         }
         false
     }
@@ -565,7 +585,12 @@ impl ScannerPublicationCommitScope {
             .state
             .compare_exchange(SCANNER_PUBLICATION_SCOPE_IN_FLIGHT, terminal.as_u8(), Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
-            .then(|| self.inner.completed.notify_waiters())
+            .then(|| {
+                if terminal.permits_lease_release() {
+                    self.inner.lease_release_safe.store(true, Ordering::Release);
+                }
+                self.inner.completed.notify_waiters()
+            })
             .is_some()
     }
 
@@ -592,6 +617,14 @@ impl ScannerPublicationCommitScope {
             return false;
         }
         self.inner.movement_permit.lock().await.take().is_some()
+    }
+}
+
+impl Drop for ScannerPublicationCommitScopeInner {
+    fn drop(&mut self) {
+        if !ScannerPublicationCommitState::from_u8(self.state.load(Ordering::Acquire)).permits_lease_release() {
+            self.lease_release_safe.store(false, Ordering::Release);
+        }
     }
 }
 

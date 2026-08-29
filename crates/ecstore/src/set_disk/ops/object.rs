@@ -3394,7 +3394,12 @@ impl SetDisks {
             let commit_tmp_dir = tmp_dir.clone();
             let commit_object_lock_guard = object_lock_guard.take();
             let commit_bucket_lifecycle_guard = bucket_lifecycle_guard.take();
-            let commit_allows_early_ack = commit_object_lock_guard.is_some();
+            let commit_scanner_publication_scope = opts.scanner_publication_commit_scope.clone();
+            // A scanner publication scope owns the movement permit until the
+            // complete rename fan-out drains. Keep this path synchronous so
+            // its terminal state is known before the coordinator releases
+            // remote leases.
+            let commit_allows_early_ack = commit_object_lock_guard.is_some() && commit_scanner_publication_scope.is_none();
             let detach_commit_owner = commit_allows_early_ack || commit_bucket_lifecycle_guard.is_some() || quota_mutation_fence;
             let commit_write_path_label = write_path.metric_label();
             let commit_is_versioned = opts.versioned || opts.version_suspended;
@@ -3491,7 +3496,7 @@ impl SetDisks {
                     }
                     Ok(())
                 };
-                let pre_rename_result = if cancellation.is_some() || request_cancellation.is_some() {
+                let mut pre_rename_result = if cancellation.is_some() || request_cancellation.is_some() {
                     tokio::select! {
                         biased;
                         _ = wait_for_put_object_commit_cancellation(cancellation.as_ref(), request_cancellation.as_ref()) => {
@@ -3502,7 +3507,21 @@ impl SetDisks {
                 } else {
                     pre_rename.await
                 };
+                if pre_rename_result.is_ok()
+                    && let Some(scope) = commit_scanner_publication_scope.as_ref()
+                    && let Err(err) = scope.try_begin()
+                {
+                    let _ = scope.mark_aborted_before_commit();
+                    pre_rename_result = Err(Error::other(format!("scanner publication commit scope cannot start: {err:?}")));
+                }
                 if let Err(err) = pre_rename_result {
+                    if let Some(scope) = commit_scanner_publication_scope.as_ref() {
+                        if scope.state() == crate::object_api::ScannerPublicationCommitState::Admitted {
+                            let _ = scope.mark_aborted_before_commit();
+                        } else {
+                            let _ = scope.mark_indeterminate();
+                        }
+                    }
                     SetDisks::abort_quota_reservation_after_fence(
                         quota_reservation,
                         &commit_disks,
@@ -3540,6 +3559,13 @@ impl SetDisks {
                     ),
                 )
                 .await;
+                if let Some(scope) = commit_scanner_publication_scope.as_ref() {
+                    if rename_result.is_ok() {
+                        let _ = scope.mark_committed();
+                    } else {
+                        let _ = scope.mark_indeterminate();
+                    }
+                }
                 #[cfg(any(test, feature = "test-util"))]
                 if rename_result.is_ok() {
                     pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::AfterRenameQuorum).await;

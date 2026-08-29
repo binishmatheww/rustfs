@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 #[cfg(test)]
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 
 use self::heal_info::{BackgroundHealInfoReadStatus, read_background_heal_info_with_epoch, save_background_heal_info_for_epoch};
@@ -63,7 +64,6 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::storage_api::owner::SCANNER_PUBLICATION_LEASE_TTL_MS;
 use crate::storage_api::scan::{
     BucketOperations, BucketOptions, NamespaceLocking as _, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION,
     SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_ACTIVITY_PROTOCOL_VERSION,
@@ -1205,10 +1205,6 @@ fn data_usage_persist_timeout() -> Duration {
     DataUsageCache::persistence_timeout()
 }
 
-fn scanner_publication_lease_budget_allows_persistence(timeout: Duration) -> bool {
-    timeout < Duration::from_millis(SCANNER_PUBLICATION_LEASE_TTL_MS)
-}
-
 #[cfg(not(test))]
 const SCANNER_CYCLE_EPOCH_FENCE_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
@@ -1493,11 +1489,6 @@ async fn run_data_scanner_cycle_with_budget(
     let mut remote_publication_leases = None;
     let remote_lease_defer_reason = if remote_publication_lease_targets.is_empty() {
         None
-    } else if !scanner_publication_lease_budget_allows_persistence(usage_persist_timeout) {
-        // The lease is intentionally fixed-duration and has no renewal path.
-        // Refuse a persistence budget that could outlive it instead of
-        // allowing the peer to admit movement while a local PUT is in flight.
-        Some(ScannerCycleDeferReason::PublicationLeaseBudgetExceeded)
     } else if let Some(notification_system) = storeapi.notification_system() {
         match notification_system
             .acquire_scanner_publication_leases(remote_publication_lease_targets.clone())
@@ -1548,26 +1539,16 @@ async fn run_data_scanner_cycle_with_budget(
         remote_lease_fence.is_some(),
     ))
     .then_some(ScannerCycleDeferReason::ActivityBaselineUnavailable);
-    let remote_lease_covers_persistence = remote_lease_deadline.is_none_or(|deadline| {
-        std::time::Instant::now()
-            .checked_add(usage_persist_timeout)
-            .is_some_and(|latest_finish| latest_finish < deadline)
-    });
     let publication_defer_reason = publication_defer_reason
         .or(remote_lease_defer_reason)
         .or(remote_lease_fence_defer_reason);
-    let publication_defer_reason = (!remote_lease_covers_persistence)
-        .then_some(ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded)
-        .or(publication_defer_reason);
     // Include reasons discovered while acquiring or validating remote leases.
-    // In particular, the static budget gate above is reached after the scan
-    // result is classified, so computing this flag earlier would suppress its
-    // deferred metric.
     let publication_deferred = publication_defer_reason.is_some();
     let budget_elapsed = cycle_budget.budget_elapsed() && !ctx.is_cancelled();
     let remote_lease_probe = remote_publication_leases
         .as_ref()
         .map(|(notification_system, grants)| (Arc::clone(notification_system), grants.clone()));
+    let remote_lease_release_safe = Arc::new(AtomicBool::new(true));
     let mut usage_persist_outcome = match publication_defer_reason {
         Some(reason) => {
             drop(receiver);
@@ -1581,6 +1562,11 @@ async fn run_data_scanner_cycle_with_budget(
             let ctx_clone = ctx.clone();
             let route_probe_store = storeapi.clone();
             let remote_lease_fence = remote_lease_fence.clone();
+            let remote_lease_release_safe_for_task = Arc::clone(&remote_lease_release_safe);
+            let remote_lease_tokens = remote_publication_leases
+                .as_ref()
+                .map(|(_, grants)| grants.iter().map(|grant| grant.lease.token).collect())
+                .unwrap_or_default();
             let mut usage_persist_task = AbortOnDropHandle::new(tokio::spawn(async move {
                 store_data_usage_in_backend_with_outcome_for_epoch_and_baseline_and_route_probe_for_publication_epoch_and_lease_fence(
                     ctx_clone,
@@ -1592,7 +1578,9 @@ async fn run_data_scanner_cycle_with_budget(
                         publication_epoch,
                         remote_lease_deadline,
                         remote_lease_fence,
-                    ),
+                    )
+                    .with_remote_lease_tokens(remote_lease_tokens)
+                    .with_lease_release_flag(remote_lease_release_safe_for_task),
                     move || {
                         let storeapi = route_probe_store.clone();
                         let remote_lease_probe = remote_lease_probe.clone();
@@ -1657,7 +1645,16 @@ async fn run_data_scanner_cycle_with_budget(
     let lease_expired = remote_publication_leases
         .as_ref()
         .is_some_and(|(_, grants)| grants.iter().any(|grant| !grant.lease.is_valid()));
-    if let Some((notification_system, grants)) = remote_publication_leases.take() {
+    if !remote_lease_release_safe.load(Ordering::Acquire) {
+        // A cancelled or detached storage mutation did not report a safe
+        // terminal state. Keep remote grants until their own expiry rather
+        // than releasing movement admission while a commit may be unknown.
+        usage_persist_outcome = if usage_persist_outcome == DataUsagePersistOutcome::Failed {
+            DataUsagePersistOutcome::Failed
+        } else {
+            DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded)
+        };
+    } else if let Some((notification_system, grants)) = remote_publication_leases.take() {
         let release_result = notification_system.release_scanner_publication_leases(grants).await;
         let lease_release_failed = release_result.is_err();
         if lease_expired || lease_release_failed {

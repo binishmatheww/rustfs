@@ -544,6 +544,30 @@ impl ECStore {
         ))
     }
 
+    /// Variant used by the scanner supervisor to observe whether a scope was
+    /// dropped before reaching a safe terminal state. The flag is in-memory
+    /// only and lets the supervisor avoid releasing remote leases on an
+    /// indeterminate cancellation path.
+    pub async fn scanner_data_usage_publication_commit_scope_with_release_flag(
+        &self,
+        expected_movement_epoch: u64,
+        safe_deadline: tokio::time::Instant,
+        remote_lease_tokens: Vec<Uuid>,
+        lease_release_safe: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<ScannerPublicationCommitScope> {
+        let (movement_permit, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
+        if epoch != expected_movement_epoch {
+            return None;
+        }
+        Some(ScannerPublicationCommitScope::new_storage_owned_with_release_flag(
+            epoch,
+            safe_deadline,
+            remote_lease_tokens,
+            movement_permit,
+            lease_release_safe,
+        ))
+    }
+
     /// Capture the current publication epoch without holding the movement
     /// gate across backend I/O. Callers must re-admit the same epoch before a
     /// mutation commits.
@@ -1521,6 +1545,10 @@ mod tests {
             .expect("a second idle publication scope should be granted");
         scope.try_begin().expect("scope should enter the mutation state");
         scope.cancel();
+        assert!(
+            !scope.mark_aborted_before_commit(),
+            "an in-flight mutation cannot claim pre-commit abort without storage proof"
+        );
         assert!(scope.mark_indeterminate());
         assert_eq!(
             scope.wait_for_completion().await,
