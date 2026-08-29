@@ -37,7 +37,6 @@ use crate::scanner_io::{
     scanner_maintenance_generation,
 };
 use crate::sleeper::{SCANNER_SLEEPER, set_scanner_default_speed};
-use crate::storage_api::owner::ScannerPublicationCommitState;
 use crate::{DataUsageInfo, ScannerActivityGuard, ScannerError, ScannerRuntimeGuard};
 use crate::{ScannerConfigObjectDelete, ScannerObjectIO, ScannerObjectOptions};
 use bytes::Bytes;
@@ -456,6 +455,7 @@ fn data_usage_backup_due(data_usage_info: &DataUsageInfo) -> bool {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 async fn sync_data_usage_backup_from_primary(
     ctx: &CancellationToken,
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
@@ -463,7 +463,7 @@ async fn sync_data_usage_backup_from_primary(
     sync_data_usage_backup_from_primary_for_epoch_and_lease_and_fence(ctx, storeapi, None, None, None).await
 }
 
-#[cfg(test)]
+#[allow(dead_code)]
 async fn sync_data_usage_backup_from_primary_for_epoch_and_lease_and_fence(
     ctx: &CancellationToken,
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
@@ -471,25 +471,25 @@ async fn sync_data_usage_backup_from_primary_for_epoch_and_lease_and_fence(
     remote_lease_deadline: Option<std::time::Instant>,
     scanner_publication_lease_fence: Option<&str>,
 ) -> Result<(), EcstoreError> {
-    sync_data_usage_backup_from_primary_for_epoch_and_lease_and_fence_with_scope(
+    sync_data_usage_backup_from_primary_for_epoch_and_lease_and_fence_and_scope(
         ctx,
         storeapi,
         expected_publication_epoch,
         remote_lease_deadline,
         scanner_publication_lease_fence,
-        &[],
+        Vec::new(),
         Arc::new(AtomicBool::new(true)),
     )
     .await
 }
 
-async fn sync_data_usage_backup_from_primary_for_epoch_and_lease_and_fence_with_scope(
+async fn sync_data_usage_backup_from_primary_for_epoch_and_lease_and_fence_and_scope(
     ctx: &CancellationToken,
     storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
     expected_publication_epoch: Option<u64>,
     remote_lease_deadline: Option<std::time::Instant>,
     scanner_publication_lease_fence: Option<&str>,
-    remote_lease_tokens: &[Uuid],
+    remote_lease_tokens: Vec<Uuid>,
     lease_release_safe: Arc<AtomicBool>,
 ) -> Result<(), EcstoreError> {
     let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
@@ -549,32 +549,31 @@ async fn sync_data_usage_backup_from_primary_for_epoch_and_lease_and_fence_with_
             if remote_lease_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
                 return Err(EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED));
             }
-            let publication_scope = storeapi
-                .scanner_data_usage_publication_commit_scope_with_release_flag(
-                    read_epoch,
-                    tokio::time::Instant::now()
-                        .checked_add(data_usage_persist_timeout())
-                        .unwrap_or_else(tokio::time::Instant::now)
-                        .min(
-                            remote_lease_deadline
-                                .map(tokio::time::Instant::from_std)
-                                .unwrap_or_else(|| tokio::time::Instant::now() + data_usage_persist_timeout()),
-                        ),
-                    remote_lease_tokens.to_vec(),
-                    Arc::clone(&lease_release_safe),
-                )
-                .await;
-            let legacy_publication_admission = if publication_scope.is_none() {
-                let Some(admission) = scanner_publication_admission_for_epoch(storeapi.clone(), read_epoch).await else {
-                    if retry < SCANNER_PERSIST_CAS_RETRIES {
-                        continue;
-                    }
-                    return Err(EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED));
-                };
-                Some(admission)
-            } else {
-                None
+            let Some(_publication_admission) = scanner_publication_admission_for_epoch(storeapi.clone(), read_epoch).await else {
+                if retry < SCANNER_PERSIST_CAS_RETRIES {
+                    continue;
+                }
+                return Err(EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED));
             };
+            let publication_scope = match expected_publication_epoch {
+                Some(expected_epoch) => {
+                    storeapi
+                        .scanner_data_usage_publication_commit_scope_with_release_flag(
+                            expected_epoch,
+                            usage_store::scanner_publication_scope_deadline(data_usage_persist_timeout(), remote_lease_deadline),
+                            remote_lease_tokens.clone(),
+                            Arc::clone(&lease_release_safe),
+                        )
+                        .await
+                }
+                None => None,
+            };
+            if expected_publication_epoch.is_some() && publication_scope.is_none() {
+                if retry < SCANNER_PERSIST_CAS_RETRIES {
+                    continue;
+                }
+                return Err(EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED));
+            }
             let save_result = save_config_shared_with_preconditions_and_lease_fence_and_scope(
                 storeapi.clone(),
                 &backup_path,
@@ -585,20 +584,19 @@ async fn sync_data_usage_backup_from_primary_for_epoch_and_lease_and_fence_with_
                 publication_scope.clone(),
             )
             .await;
-            drop(legacy_publication_admission);
             if let Some(scope) = publication_scope {
                 match scope.wait_for_completion().await {
-                    ScannerPublicationCommitState::Committed | ScannerPublicationCommitState::AbortedBeforeCommit => {}
-                    ScannerPublicationCommitState::Indeterminate
-                    | ScannerPublicationCommitState::Admitted
-                    | ScannerPublicationCommitState::InFlight => {
-                        return Err(EcstoreError::other(
-                            "scanner backup publication scope did not reach a safe terminal state",
-                        ));
-                    }
+                    crate::storage_api::owner::ScannerPublicationCommitState::Committed
+                    | crate::storage_api::owner::ScannerPublicationCommitState::AbortedBeforeCommit => save_result,
+                    crate::storage_api::owner::ScannerPublicationCommitState::Indeterminate
+                    | crate::storage_api::owner::ScannerPublicationCommitState::Admitted
+                    | crate::storage_api::owner::ScannerPublicationCommitState::InFlight => Err(EcstoreError::other(
+                        "scanner backup publication commit scope did not reach a safe terminal state",
+                    )),
                 }
+            } else {
+                save_result
             }
-            save_result
         };
 
         match save_result {
@@ -1475,13 +1473,10 @@ async fn run_data_scanner_cycle_with_budget(
         mark_scan_cycle_idle(cycle_info, &mut cycle_metrics_guard).await;
         return ScannerCycleOutcome::Deferred(ScannerCycleDeferReason::DataMovement);
     };
-    let usage_persist_baseline_result = read_config_with_revision(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await;
+    let usage_persist_baseline_result = read_data_usage_persist_baseline(storeapi.clone()).await;
     drop(baseline_publication_guard);
     let usage_persist_baseline = match usage_persist_baseline_result {
-        Ok((data, revision)) => DataUsagePersistBaseline {
-            data: data.map(Bytes::from),
-            revision,
-        },
+        Ok(baseline) => baseline,
         Err(err) => {
             error!(
                 target: "rustfs::scanner",
@@ -1520,6 +1515,20 @@ async fn run_data_scanner_cycle_with_budget(
                 .is_some_and(|publication_epoch| publication_epoch != baseline_publication_epoch) =>
         {
             Some(ScannerCycleDeferReason::DataMovement)
+        }
+        // A complete walk can still be retained as an observational snapshot
+        // when only the final activity proof was unavailable.  It must not
+        // block the observation receiver: the authoritative publication
+        // fence remains enforced by the usage store and the cycle is advanced
+        // as partial without acknowledging dirty usage.
+        Ok(result)
+            if result.has_observational_snapshot()
+                && matches!(
+                    result.status,
+                    ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+                ) =>
+        {
+            None
         }
         Ok(result) => final_data_usage_publication_defer_reason(storeapi.as_ref(), result.status).await,
         Err(_) => Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
@@ -2870,12 +2879,7 @@ fn finalize_scanner_cycle_result(
     scan_cycle_result: crate::scanner_io::ScannerCycleResult,
     usage_persist_outcome: DataUsagePersistOutcome,
 ) -> (ScannerCycleOutcome, bool, Vec<ScannerDirtyUsageAcknowledgement>) {
-    let completion_outcome = scanner_cycle_completion_outcome(
-        scan_cycle_result.status,
-        usage_persist_outcome,
-        scan_cycle_result.has_dirty_usage_to_acknowledge(),
-        scan_cycle_result.has_failed_dirty_usage(),
-    );
+    let completion_outcome = scanner_cycle_completion_outcome_for_result(&scan_cycle_result, usage_persist_outcome);
     let pending_maintenance_work = scan_cycle_result.has_pending_maintenance_work();
     let durable_complete_snapshot = scan_cycle_result.status == ScannerCycleStatus::Complete
         && matches!(
@@ -2888,6 +2892,34 @@ fn finalize_scanner_cycle_result(
         Vec::new()
     };
     (completion_outcome, pending_maintenance_work, remote_dirty_usage_acknowledgements)
+}
+
+fn scanner_cycle_completion_outcome_for_result(
+    scan_cycle_result: &crate::scanner_io::ScannerCycleResult,
+    usage_persist_outcome: DataUsagePersistOutcome,
+) -> ScannerCycleOutcome {
+    let has_dirty_usage = scan_cycle_result.has_dirty_usage_to_acknowledge();
+    let has_failed_dirty_usage = scan_cycle_result.has_failed_dirty_usage();
+    if scan_cycle_result.has_observational_snapshot()
+        && matches!(
+            scan_cycle_result.status,
+            ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+        )
+    {
+        return match usage_persist_outcome {
+            DataUsagePersistOutcome::Saved
+            | DataUsagePersistOutcome::AlreadyDurable
+            | DataUsagePersistOutcome::PriorCycleDurable
+            | DataUsagePersistOutcome::Current
+                if !has_failed_dirty_usage =>
+            {
+                ScannerCycleOutcome::Partial
+            }
+            DataUsagePersistOutcome::Deferred(reason) => ScannerCycleOutcome::Deferred(reason),
+            _ => ScannerCycleOutcome::Failed,
+        };
+    }
+    scanner_cycle_completion_outcome(scan_cycle_result.status, usage_persist_outcome, has_dirty_usage, has_failed_dirty_usage)
 }
 
 /// Decide whether an incoming usage snapshot must be skipped as stale, given the local
