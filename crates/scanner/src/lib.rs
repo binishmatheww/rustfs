@@ -773,8 +773,24 @@ where
     } else {
         None
     };
-    opts.scanner_publication_commit_scope = scanner_publication_commit_scope;
-    let result = api.delete_config_object(bucket, object, opts).await;
+    let result = if let Some(scope) = scanner_publication_commit_scope {
+        // Keep the storage mutation and its publication scope alive after the
+        // scanner persistence waiter is cancelled. The delete path can fan
+        // out to remote RPCs or blocking local namespace syscalls; dropping
+        // only the waiter must not release the movement permit early.
+        opts.scanner_publication_commit_scope = Some(scope.clone());
+        let bucket = bucket.to_owned();
+        let object = object.to_owned();
+        tokio::spawn(async move {
+            let _publication_scope_owner = scope;
+            api.delete_config_object(&bucket, &object, opts).await
+        })
+        .await
+        .map_err(|err| EcstoreError::other(format!("scanner publication delete owner failed: {err}")))?
+    } else {
+        opts.scanner_publication_commit_scope = None;
+        api.delete_config_object(bucket, object, opts).await
+    };
     drop(legacy_admission);
     result
 }
