@@ -1431,7 +1431,27 @@ mod tests {
             .await
             .expect("movement writer should proceed after lease expiry")
             .expect("expiry writer task should not panic");
+        assert!(
+            store.validate_scanner_publication_lease(expiring_token, 0).await.is_err(),
+            "an expired lease must not validate after its read guard is released"
+        );
         assert!(!store.release_scanner_publication_lease(expiring_token).await);
+    }
+
+    #[tokio::test]
+    async fn scanner_publication_lease_rejects_a_new_movement_generation() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let (token, generation) = store
+            .acquire_scanner_publication_lease(0, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL)
+            .await
+            .expect("an idle store should grant a publication lease");
+
+        assert_eq!(store.ctx.advance_data_movement_generation(), Some(1));
+        assert!(
+            store.validate_scanner_publication_lease(token, generation).await.is_err(),
+            "a lease from the prior movement generation must fail closed"
+        );
+        assert!(store.release_scanner_publication_lease(token).await);
     }
 
     #[tokio::test]
