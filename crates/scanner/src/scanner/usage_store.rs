@@ -754,6 +754,8 @@ where
                         expected_publication_epoch,
                         remote_lease_deadline,
                         scanner_publication_lease_fence.as_deref(),
+                        &remote_lease_tokens,
+                        Arc::clone(&lease_release_safe),
                     )
                     .await;
                     if expected_publication_epoch.is_some() && !cleanup_ok {
@@ -777,6 +779,8 @@ where
                         expected_publication_epoch,
                         remote_lease_deadline,
                         scanner_publication_lease_fence.as_deref(),
+                        &remote_lease_tokens,
+                        Arc::clone(&lease_release_safe),
                     )
                     .await;
                     if expected_publication_epoch.is_some() && !cleanup_ok {
@@ -819,6 +823,8 @@ where
                         expected_publication_epoch,
                         remote_lease_deadline,
                         scanner_publication_lease_fence.as_deref(),
+                        &remote_lease_tokens,
+                        Arc::clone(&lease_release_safe),
                     )
                     .await;
                     if expected_publication_epoch.is_some() && !cleanup_ok {
@@ -877,6 +883,8 @@ async fn cleanup_observed_data_usage_snapshot_for_epoch_and_lease(
     expected_publication_epoch: Option<u64>,
     remote_lease_deadline: Option<std::time::Instant>,
     scanner_publication_lease_fence: Option<&str>,
+    remote_lease_tokens: &[Uuid],
+    lease_release_safe: Arc<AtomicBool>,
 ) -> bool {
     if remote_lease_expired(remote_lease_deadline) {
         return false;
@@ -945,7 +953,15 @@ async fn cleanup_observed_data_usage_snapshot_for_epoch_and_lease(
         return false;
     }
 
-    let result = delete_config_with_publication_admission_for_epoch(
+    let publication_scope = storeapi
+        .scanner_data_usage_publication_commit_scope_with_release_flag(
+            read_epoch,
+            scanner_publication_scope_deadline(data_usage_persist_timeout(), remote_lease_deadline),
+            remote_lease_tokens.to_vec(),
+            Arc::clone(&lease_release_safe),
+        )
+        .await;
+    let result = crate::delete_config_with_publication_scope_for_epoch(
         storeapi,
         RUSTFS_META_BUCKET,
         DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
@@ -964,8 +980,22 @@ async fn cleanup_observed_data_usage_snapshot_for_epoch_and_lease(
             ..Default::default()
         },
         read_epoch,
+        publication_scope.clone(),
     )
     .await;
+
+    let result = if let Some(scope) = publication_scope {
+        match scope.wait_for_completion().await {
+            ScannerPublicationCommitState::Committed | ScannerPublicationCommitState::AbortedBeforeCommit => result,
+            ScannerPublicationCommitState::Indeterminate
+            | ScannerPublicationCommitState::Admitted
+            | ScannerPublicationCommitState::InFlight => Err(EcstoreError::other(
+                "scanner publication cleanup scope did not reach a safe terminal state",
+            )),
+        }
+    } else {
+        result
+    };
 
     match result {
         Ok(_)

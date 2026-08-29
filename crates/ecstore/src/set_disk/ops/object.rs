@@ -270,6 +270,22 @@ const OLD_DATA_CLEANUP_RECEIPT_FILE: &str = ".rustfs-old-data-cleanup-receipt.js
 const SCANNER_PUBLICATION_LEASE_FENCE_MAX_BYTES: usize = 64 * 1024;
 const SCANNER_PUBLICATION_LEASE_FENCE_MAX_ENTRIES: usize = 256;
 
+fn begin_scanner_publication_delete_mutation(scope: Option<&crate::object_api::ScannerPublicationCommitScope>) -> Result<()> {
+    let Some(scope) = scope else {
+        return Ok(());
+    };
+    if scope.state() == crate::object_api::ScannerPublicationCommitState::Admitted {
+        scope
+            .try_begin()
+            .map_err(|err| Error::other(format!("scanner publication delete scope cannot start: {err:?}")))?;
+    }
+    if !scope.can_commit() {
+        let _ = scope.mark_indeterminate();
+        return Err(StorageError::OperationCanceled);
+    }
+    Ok(())
+}
+
 fn take_scanner_publication_lease_tokens(user_defined: &mut HashMap<String, String>) -> Result<Option<HashMap<String, Uuid>>> {
     let Some(encoded) = user_defined.remove(SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY) else {
         return Ok(None);
@@ -7098,6 +7114,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
     #[tracing::instrument(skip(self, opts))]
     async fn delete_object(&self, bucket: &str, object: &str, mut opts: ObjectOptions) -> Result<ObjectInfo> {
+        let _scope_outcome_guard = opts
+            .scanner_publication_commit_scope
+            .clone()
+            .map(ScannerPublicationCommitScopeGuard::new);
+        let scanner_publication_commit_scope = opts.scanner_publication_commit_scope.clone();
         // Scanner cleanup carries the per-peer lease fence as transient
         // request metadata. Consume it before any delete-prefix fanout so it
         // cannot be persisted or treated as user metadata.
@@ -7192,6 +7213,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 }
                                 delete_request.set_skip_tier_free_version();
                             }
+                            begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
                             self.delete_object_version(bucket, object, &delete_request, false).await?;
                             if let Some((_, deleted_object)) = replication_delete {
                                 ReplicationLifecycleBridge::schedule_delete(bucket.to_string(), deleted_object).await;
@@ -7206,6 +7228,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 ..Default::default()
                             };
                             delete_request.set_tier_free_version_id(&Uuid::new_v4().to_string());
+                            begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
                             self.delete_object_version(bucket, object, &delete_request, false).await?;
                         }
                         for version in &versions.free_versions {
@@ -7217,9 +7240,13 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 ..Default::default()
                             };
                             delete_request.set_tier_free_version();
+                            begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
                             self.delete_object_version(bucket, object, &delete_request, false).await?;
                         }
                     }
+                }
+                if let Some(scope) = scanner_publication_commit_scope.as_ref() {
+                    let _ = scope.mark_committed();
                 }
                 self.invalidate_get_object_metadata_cache(bucket, object).await;
                 return Ok(ObjectInfo::default());
@@ -7228,10 +7255,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 self.validate_bucket_incarnation(bucket, expected_incarnation_id).await?;
             }
             ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
+            begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
             self.delete_prefix_with_scanner_publication_lease(bucket, object, scanner_publication_lease_tokens.as_ref())
                 .await
                 .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
 
+            if let Some(scope) = scanner_publication_commit_scope.as_ref() {
+                let _ = scope.mark_committed();
+            }
             self.invalidate_all_get_object_metadata_cache();
             return Ok(ObjectInfo::default());
         }
@@ -7304,10 +7335,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 ..Default::default()
             };
             ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
+            begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
             self.delete_object_version(bucket, object, &dfi, false)
                 .await
                 .map_err(|e| to_object_err(e, vec![bucket, object]))?;
             self.invalidate_get_object_metadata_cache(bucket, object).await;
+            if let Some(scope) = scanner_publication_commit_scope.as_ref() {
+                let _ = scope.mark_committed();
+            }
             return Ok(ObjectInfo::from_file_info(&dfi, bucket, object, opts.versioned || opts.version_suspended));
         }
 
@@ -7381,6 +7416,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             };
 
             ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
+            begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
             self.delete_object_version(bucket, object, &fi, should_force_delete_marker_for_missing_version(&opts))
                 .await
                 .map_err(|e| to_object_err(e, vec![bucket, object]))?;
@@ -7392,6 +7428,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             oi.user_tags = Arc::clone(&goi.user_tags);
             oi.replication_decision = goi.replication_decision;
             self.invalidate_get_object_metadata_cache(bucket, object).await;
+            if let Some(scope) = scanner_publication_commit_scope.as_ref() {
+                let _ = scope.mark_committed();
+            }
             return Ok(oi);
         }
 
@@ -7417,6 +7456,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         ensure_delete_commit_locks_held(_lock_guard.as_ref(), bucket, object, &opts)?;
+        begin_scanner_publication_delete_mutation(scanner_publication_commit_scope.as_ref())?;
         self.delete_object_version(bucket, object, &dfi, opts.delete_marker)
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
@@ -7442,6 +7482,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             obj_info.delete_marker = true;
         }
         self.invalidate_get_object_metadata_cache(bucket, object).await;
+        if let Some(scope) = scanner_publication_commit_scope.as_ref() {
+            let _ = scope.mark_committed();
+        }
         Ok(obj_info)
     }
 
