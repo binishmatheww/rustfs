@@ -58,7 +58,7 @@ use crate::{
     core::sets::Sets,
     disk::{BUCKET_META_PREFIX, DiskOption, DiskStore, RUSTFS_META_BUCKET},
     layout::endpoints::EndpointServerPools,
-    object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
+    object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader, ScannerPublicationCommitScope},
 };
 use futures::future::join_all;
 use http::HeaderMap;
@@ -520,6 +520,28 @@ impl ECStore {
         }
 
         Some((operation_guard, self.ctx.data_movement_operation_epoch()))
+    }
+
+    /// Acquire a storage-owned scanner publication scope. Unlike the legacy
+    /// admission helper, the movement permit is owned by the returned scope
+    /// and therefore survives cancellation of the scanner coordinator while
+    /// the actual metadata mutation drains.
+    pub async fn scanner_data_usage_publication_commit_scope(
+        &self,
+        expected_movement_epoch: u64,
+        safe_deadline: tokio::time::Instant,
+        remote_lease_tokens: Vec<Uuid>,
+    ) -> Option<ScannerPublicationCommitScope> {
+        let (movement_permit, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
+        if epoch != expected_movement_epoch {
+            return None;
+        }
+        Some(ScannerPublicationCommitScope::new_storage_owned(
+            epoch,
+            safe_deadline,
+            remote_lease_tokens,
+            movement_permit,
+        ))
     }
 
     /// Capture the current publication epoch without holding the movement
@@ -1420,6 +1442,71 @@ mod tests {
             .await
             .expect_err("a stale movement generation must not acquire a lease");
         assert!(error.to_string().contains("generation is stale"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scanner_publication_commit_scope_owns_permit_until_terminal_drain() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let scope = store
+            .scanner_data_usage_publication_commit_scope(
+                0,
+                tokio::time::Instant::now() + Duration::from_secs(30),
+                vec![Uuid::new_v4()],
+            )
+            .await
+            .expect("idle storage should grant a publication scope");
+        assert_eq!(scope.state(), crate::object_api::ScannerPublicationCommitState::Admitted);
+        assert_eq!(scope.remote_lease_tokens().len(), 1);
+
+        let gate = store.ctx.data_movement_operation_gate();
+        let writer = tokio::spawn(async move { gate.write_owned().await });
+        tokio::task::yield_now().await;
+        assert!(!writer.is_finished(), "the scope must own its movement permit after the caller returns");
+
+        scope.cancel();
+        assert!(scope.mark_aborted_before_commit());
+        assert_eq!(
+            scope.wait_for_completion().await,
+            crate::object_api::ScannerPublicationCommitState::AbortedBeforeCommit
+        );
+        assert!(scope.release_movement_permit().await);
+        tokio::time::timeout(Duration::from_secs(1), writer)
+            .await
+            .expect("movement writer should proceed after the scope drains")
+            .expect("movement writer task should not panic");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scanner_publication_commit_scope_rejects_late_start_and_keeps_indeterminate_permit() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let scope = store
+            .scanner_data_usage_publication_commit_scope(0, tokio::time::Instant::now() + Duration::from_secs(1), Vec::new())
+            .await
+            .expect("idle storage should grant a publication scope");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            scope.try_begin(),
+            Err(crate::object_api::ScannerPublicationCommitStartError::DeadlineExceeded)
+        );
+        assert!(
+            !scope.release_movement_permit().await,
+            "an admitted scope is not safe to release before owner resolution"
+        );
+        assert!(scope.mark_aborted_before_commit());
+        assert!(scope.release_movement_permit().await);
+
+        let scope = store
+            .scanner_data_usage_publication_commit_scope(0, tokio::time::Instant::now() + Duration::from_secs(30), Vec::new())
+            .await
+            .expect("a second idle publication scope should be granted");
+        scope.try_begin().expect("scope should enter the mutation state");
+        scope.cancel();
+        assert!(scope.mark_indeterminate());
+        assert_eq!(
+            scope.wait_for_completion().await,
+            crate::object_api::ScannerPublicationCommitState::Indeterminate
+        );
+        assert!(!scope.release_movement_permit().await, "indeterminate mutation must retain the permit");
     }
 
     #[tokio::test]
