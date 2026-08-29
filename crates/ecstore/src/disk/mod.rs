@@ -749,6 +749,7 @@ impl Disk {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn rename_data_borrowed_with_fence_and_guard(
         &self,
         src_volume: &str,
