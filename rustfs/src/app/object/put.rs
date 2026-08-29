@@ -2387,9 +2387,12 @@ mod tests {
         assert!(!use_zero_copy);
         assert!(use_small_eager);
 
-        let (streaming_path, _, use_zero_copy, use_small_eager) = select_put_path(1024 * 1024 + 1, &headers, false, false, false);
-        assert_eq!(streaming_path, "streaming");
-        assert!(!use_zero_copy);
+        // The small-eager boundary is crossed first, then the existing
+        // zero-copy precedence applies to objects just above 1 MiB.
+        let (zero_copy_path, _, use_zero_copy, use_small_eager) =
+            select_put_path(1024 * 1024 + 1, &headers, false, false, false);
+        assert_eq!(zero_copy_path, "zero_copy_eager");
+        assert!(use_zero_copy);
         assert!(!use_small_eager);
     }
 
@@ -2471,10 +2474,10 @@ mod tests {
 
     #[test]
     fn dynamic_small_eager_threshold_sheds_memory_only_above_concurrency_limits() {
-        assert_eq!(dynamic_small_eager_put_max_size_bytes(0), 512 * 1024);
-        assert_eq!(dynamic_small_eager_put_max_size_bytes(SMALL_EAGER_CONCURRENCY_SOFT_LIMIT), 512 * 1024);
-        assert_eq!(dynamic_small_eager_put_max_size_bytes(SMALL_EAGER_CONCURRENCY_SOFT_LIMIT + 1), 256 * 1024);
-        assert_eq!(dynamic_small_eager_put_max_size_bytes(SMALL_EAGER_CONCURRENCY_HARD_LIMIT + 1), 128 * 1024);
+        assert_eq!(dynamic_small_eager_put_max_size_bytes(0), 1024 * 1024);
+        assert_eq!(dynamic_small_eager_put_max_size_bytes(SMALL_EAGER_CONCURRENCY_SOFT_LIMIT), 1024 * 1024);
+        assert_eq!(dynamic_small_eager_put_max_size_bytes(SMALL_EAGER_CONCURRENCY_SOFT_LIMIT + 1), 512 * 1024);
+        assert_eq!(dynamic_small_eager_put_max_size_bytes(SMALL_EAGER_CONCURRENCY_HARD_LIMIT + 1), 256 * 1024);
     }
 
     #[test]
@@ -2485,7 +2488,7 @@ mod tests {
         assert_eq!(path, "small_eager");
         assert!(small_eager);
 
-        let (path, _, _, small_eager) = select_put_path_with_concurrency(256 * 1024, &headers, false, false, false, 256);
+        let (path, _, _, small_eager) = select_put_path_with_concurrency(256 * 1024 + 1, &headers, false, false, false, 256);
         assert_eq!(path, "streaming");
         assert!(!small_eager);
     }
