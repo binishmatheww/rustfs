@@ -753,6 +753,32 @@ pub(crate) fn scanner_publication_epoch_changed(error: &EcstoreError) -> bool {
     )
 }
 
+pub(crate) async fn delete_config_with_publication_scope_for_epoch<S>(
+    api: Arc<S>,
+    bucket: &str,
+    object: &str,
+    mut opts: ScannerObjectOptions,
+    expected_epoch: u64,
+    scanner_publication_commit_scope: Option<ScannerPublicationCommitScope>,
+) -> EcstoreResult<ScannerObjectInfo>
+where
+    S: ScannerObjectIO + ScannerConfigObjectDelete,
+{
+    let legacy_admission = if scanner_publication_commit_scope.is_none() {
+        Some(
+            scanner_publication_admission_for_epoch(api.clone(), expected_epoch)
+                .await
+                .ok_or_else(|| EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED))?,
+        )
+    } else {
+        None
+    };
+    opts.scanner_publication_commit_scope = scanner_publication_commit_scope;
+    let result = api.delete_config_object(bucket, object, opts).await;
+    drop(legacy_admission);
+    result
+}
+
 pub(crate) async fn delete_config_with_publication_admission_for_epoch<S>(
     api: Arc<S>,
     bucket: &str,
@@ -763,10 +789,7 @@ pub(crate) async fn delete_config_with_publication_admission_for_epoch<S>(
 where
     S: ScannerObjectIO + ScannerConfigObjectDelete,
 {
-    let Some(_admission) = scanner_publication_admission_for_epoch(api.clone(), expected_epoch).await else {
-        return Err(EcstoreError::other(SCANNER_PUBLICATION_EPOCH_CHANGED));
-    };
-    api.delete_config_object(bucket, object, opts).await
+    delete_config_with_publication_scope_for_epoch(api, bucket, object, opts, expected_epoch, None).await
 }
 
 /// Capture the storage-owned publication epoch without retaining the read

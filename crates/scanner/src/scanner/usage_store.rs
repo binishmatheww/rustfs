@@ -37,7 +37,7 @@ fn remote_lease_expired(deadline: Option<std::time::Instant>) -> bool {
     deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
 }
 
-pub(super) fn scanner_publication_scope_deadline(
+fn scanner_publication_scope_deadline(
     persist_timeout: Duration,
     remote_lease_deadline: Option<std::time::Instant>,
 ) -> tokio::time::Instant {
@@ -51,84 +51,6 @@ pub(super) fn scanner_publication_scope_deadline(
 pub(super) struct DataUsagePersistBaseline {
     pub(super) data: Option<Bytes>,
     pub(super) revision: DataUsageCacheRevision,
-}
-
-/// Read the bytes used as the baseline for a usage publication while keeping
-/// the v2 primary revision as the CAS fence. During an interrupted upgrade the
-/// primary can be valid JSON without a baseline identity; in that case a
-/// same-or-newer durable companion may still be used, but an older legacy
-/// snapshot must not cross the primary's epoch fence.
-pub(super) async fn read_data_usage_persist_baseline(
-    storeapi: Arc<impl ScannerObjectIO>,
-) -> Result<DataUsagePersistBaseline, EcstoreError> {
-    let (primary, revision) = read_config_with_revision(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await?;
-    let Some(primary) = primary else {
-        for path in [
-            format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str()),
-            LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
-            format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
-        ] {
-            let (candidate, _) = read_config_with_revision(storeapi.clone(), &path).await?;
-            let Some(candidate) = candidate else {
-                continue;
-            };
-            let Ok(usage) = serde_json::from_slice::<DataUsageInfo>(&candidate) else {
-                continue;
-            };
-            if data_usage_info_has_persisted_baseline_identity(&usage) {
-                return Ok(DataUsagePersistBaseline {
-                    data: Some(Bytes::from(candidate)),
-                    revision,
-                });
-            }
-        }
-        return Ok(DataUsagePersistBaseline { data: None, revision });
-    };
-
-    let Ok(primary_info) = serde_json::from_slice::<DataUsageInfo>(&primary) else {
-        // Preserve the original bytes and revision. A completed scan may
-        // replace the invalid primary under this CAS fence; an observation
-        // will still reject it below because it has no verifiable identity.
-        return Ok(DataUsagePersistBaseline {
-            data: Some(Bytes::from(primary)),
-            revision,
-        });
-    };
-    if data_usage_info_has_persisted_baseline_identity(&primary_info) || data_usage_info_is_bootstrap_pending(&primary_info) {
-        return Ok(DataUsagePersistBaseline {
-            data: Some(Bytes::from(primary)),
-            revision,
-        });
-    }
-
-    let invalid_primary_epoch = primary_info.scanner_epoch;
-    for path in [
-        format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str()),
-        LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str().to_string(),
-        format!("{}.bkp", LEGACY_DATA_USAGE_OBJ_NAME_PATH.as_str()),
-    ] {
-        let (candidate, _) = read_config_with_revision(storeapi.clone(), &path).await?;
-        let Some(candidate) = candidate else {
-            continue;
-        };
-        let Ok(usage) = serde_json::from_slice::<DataUsageInfo>(&candidate) else {
-            continue;
-        };
-        let candidate_epoch = usage.scanner_epoch.unwrap_or_default();
-        if data_usage_info_has_persisted_baseline_identity(&usage)
-            && invalid_primary_epoch.is_none_or(|epoch| candidate_epoch >= epoch)
-        {
-            return Ok(DataUsagePersistBaseline {
-                data: Some(Bytes::from(candidate)),
-                revision,
-            });
-        }
-    }
-
-    Ok(DataUsagePersistBaseline {
-        data: Some(Bytes::from(primary)),
-        revision,
-    })
 }
 
 /// Short-lived publication inputs captured for one usage persistence attempt.
@@ -388,8 +310,8 @@ where
             publication_epoch = Some(read_epoch);
             let authoritative_data = match next_baseline.as_ref() {
                 Some(baseline) => baseline.data.clone(),
-                None => match read_data_usage_persist_baseline(storeapi.clone()).await {
-                    Ok(baseline) => baseline.data,
+                None => match read_config_with_revision(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await {
+                    Ok((data, _)) => data.map(Bytes::from),
                     Err(err) => {
                         error!(
                             target: "rustfs::scanner",
@@ -754,6 +676,8 @@ where
                         expected_publication_epoch,
                         remote_lease_deadline,
                         scanner_publication_lease_fence.as_deref(),
+                        &remote_lease_tokens,
+                        Arc::clone(&lease_release_safe),
                     )
                     .await;
                     if expected_publication_epoch.is_some() && !cleanup_ok {
@@ -777,6 +701,8 @@ where
                         expected_publication_epoch,
                         remote_lease_deadline,
                         scanner_publication_lease_fence.as_deref(),
+                        &remote_lease_tokens,
+                        Arc::clone(&lease_release_safe),
                     )
                     .await;
                     if expected_publication_epoch.is_some() && !cleanup_ok {
@@ -819,6 +745,8 @@ where
                         expected_publication_epoch,
                         remote_lease_deadline,
                         scanner_publication_lease_fence.as_deref(),
+                        &remote_lease_tokens,
+                        Arc::clone(&lease_release_safe),
                     )
                     .await;
                     if expected_publication_epoch.is_some() && !cleanup_ok {
@@ -836,13 +764,13 @@ where
 
         if backup_due {
             let done_save = Metrics::time(Metric::SaveUsage);
-            let backup_result = sync_data_usage_backup_from_primary_for_epoch_and_lease_and_fence_and_scope(
+            let backup_result = sync_data_usage_backup_from_primary_for_epoch_and_lease_and_fence_with_scope(
                 &ctx,
                 storeapi.clone(),
                 expected_publication_epoch,
                 remote_lease_deadline,
                 scanner_publication_lease_fence.as_deref(),
-                remote_lease_tokens.clone(),
+                &remote_lease_tokens,
                 Arc::clone(&lease_release_safe),
             )
             .await;
@@ -877,6 +805,8 @@ async fn cleanup_observed_data_usage_snapshot_for_epoch_and_lease(
     expected_publication_epoch: Option<u64>,
     remote_lease_deadline: Option<std::time::Instant>,
     scanner_publication_lease_fence: Option<&str>,
+    remote_lease_tokens: &[Uuid],
+    lease_release_safe: Arc<AtomicBool>,
 ) -> bool {
     if remote_lease_expired(remote_lease_deadline) {
         return false;
@@ -945,7 +875,15 @@ async fn cleanup_observed_data_usage_snapshot_for_epoch_and_lease(
         return false;
     }
 
-    let result = delete_config_with_publication_admission_for_epoch(
+    let publication_scope = storeapi
+        .scanner_data_usage_publication_commit_scope_with_release_flag(
+            read_epoch,
+            scanner_publication_scope_deadline(data_usage_persist_timeout(), remote_lease_deadline),
+            remote_lease_tokens.to_vec(),
+            Arc::clone(&lease_release_safe),
+        )
+        .await;
+    let result = crate::delete_config_with_publication_scope_for_epoch(
         storeapi,
         RUSTFS_META_BUCKET,
         DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
@@ -964,8 +902,22 @@ async fn cleanup_observed_data_usage_snapshot_for_epoch_and_lease(
             ..Default::default()
         },
         read_epoch,
+        publication_scope.clone(),
     )
     .await;
+
+    let result = if let Some(scope) = publication_scope {
+        match scope.wait_for_completion().await {
+            ScannerPublicationCommitState::Committed | ScannerPublicationCommitState::AbortedBeforeCommit => result,
+            ScannerPublicationCommitState::Indeterminate
+            | ScannerPublicationCommitState::Admitted
+            | ScannerPublicationCommitState::InFlight => Err(EcstoreError::other(
+                "scanner publication cleanup scope did not reach a safe terminal state",
+            )),
+        }
+    } else {
+        result
+    };
 
     match result {
         Ok(_)
