@@ -66,6 +66,7 @@ use crate::bucket::lifecycle::bucket_lifecycle_ops::LifecycleOps;
 use crate::bucket::utils::is_meta_bucketname;
 use crate::bucket::versioning::VersioningApi;
 use crate::disk::DiskAPI;
+use crate::object_api::ScannerPublicationCommitScopeGuard;
 use crate::set_disk::coding;
 use crate::set_disk::core::io_primitives::GetCodecStreamingReaderBuildOutcome;
 use crate::set_disk::mem;
@@ -2624,6 +2625,10 @@ impl SetDisks {
         opts: &ObjectOptions,
     ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
         crate::hp_guard!("SetDisks::put_object");
+        let mut scope_outcome_guard = opts
+            .scanner_publication_commit_scope
+            .clone()
+            .map(ScannerPublicationCommitScopeGuard::new);
         let storage_class_config = self.storage_class_config_snapshot();
         self.invalidate_get_object_metadata_cache(bucket, object).await;
 
@@ -3400,7 +3405,10 @@ impl SetDisks {
             // its terminal state is known before the coordinator releases
             // remote leases.
             let commit_allows_early_ack = commit_object_lock_guard.is_some() && commit_scanner_publication_scope.is_none();
-            let detach_commit_owner = commit_allows_early_ack || commit_bucket_lifecycle_guard.is_some() || quota_mutation_fence;
+            let detach_commit_owner = commit_scanner_publication_scope.is_some()
+                || commit_allows_early_ack
+                || commit_bucket_lifecycle_guard.is_some()
+                || quota_mutation_fence;
             let commit_write_path_label = write_path.metric_label();
             let commit_is_versioned = opts.versioned || opts.version_suspended;
             let commit_versioned = opts.versioned;
@@ -3514,6 +3522,13 @@ impl SetDisks {
                     let _ = scope.mark_aborted_before_commit();
                     pre_rename_result = Err(Error::other(format!("scanner publication commit scope cannot start: {err:?}")));
                 }
+                if pre_rename_result.is_ok()
+                    && let Some(scope) = commit_scanner_publication_scope.as_ref()
+                    && !scope.can_commit()
+                {
+                    let _ = scope.mark_indeterminate();
+                    pre_rename_result = Err(StorageError::OperationCanceled);
+                }
                 if let Err(err) = pre_rename_result {
                     if let Some(scope) = commit_scanner_publication_scope.as_ref() {
                         if scope.state() == crate::object_api::ScannerPublicationCommitState::Admitted {
@@ -3556,7 +3571,8 @@ impl SetDisks {
                     crate::set_disk::core::io_primitives::RenameDataFenceOptions::new(
                         write_quorum,
                         commit_scanner_publication_lease_tokens.as_ref(),
-                    ),
+                    )
+                    .with_publication_scope(commit_scanner_publication_scope.clone()),
                 )
                 .await;
                 if let Some(scope) = commit_scanner_publication_scope.as_ref() {
@@ -3880,6 +3896,11 @@ impl SetDisks {
                 let _ = handoff.send(());
             }
             if detach_commit_owner {
+                if let Some(scope_outcome_guard) = scope_outcome_guard.as_mut() {
+                    // The spawned commit closure owns the scope clone and is
+                    // now responsible for its terminal outcome.
+                    scope_outcome_guard.disarm();
+                }
                 let mut cancellation = PutObjectCommitCancellation::new();
                 let child_token = cancellation.child_token();
                 let result = tokio::spawn(async move { Box::pin(commit(Some(child_token))).await })

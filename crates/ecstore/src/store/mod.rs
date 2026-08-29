@@ -1558,6 +1558,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scanner_publication_scope_guard_classifies_early_returns_conservatively() {
+        let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
+        let permit = store.ctx.data_movement_operation_gate().read_owned().await;
+        let scope = ScannerPublicationCommitScope::new_storage_owned(
+            0,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            Vec::new(),
+            permit,
+        );
+        {
+            let _guard = crate::object_api::ScannerPublicationCommitScopeGuard::new(scope.clone());
+        }
+        assert_eq!(scope.state(), crate::object_api::ScannerPublicationCommitState::AbortedBeforeCommit);
+        assert!(scope.release_movement_permit().await);
+
+        let permit = store.ctx.data_movement_operation_gate().read_owned().await;
+        let scope = ScannerPublicationCommitScope::new_storage_owned(
+            0,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            Vec::new(),
+            permit,
+        );
+        scope.try_begin().expect("scope should enter the mutation state");
+        {
+            let _guard = crate::object_api::ScannerPublicationCommitScopeGuard::new(scope.clone());
+        }
+        assert_eq!(scope.state(), crate::object_api::ScannerPublicationCommitState::Indeterminate);
+        assert!(!scope.release_movement_permit().await);
+    }
+
+    #[tokio::test]
     async fn scanner_target_guard_keeps_movement_writer_fenced_after_lease_release() {
         let store = build_store_with_ctx(Arc::new(InstanceContext::new()));
         let (token, _) = store

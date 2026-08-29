@@ -3657,6 +3657,7 @@ pub(in crate::set_disk) struct RenameTailOutcome {
 pub(in crate::set_disk) struct RenameDataFenceOptions<'a> {
     write_quorum: usize,
     scanner_publication_lease_tokens: Option<&'a HashMap<String, Uuid>>,
+    scanner_publication_commit_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
 }
 
 impl<'a> RenameDataFenceOptions<'a> {
@@ -3667,7 +3668,16 @@ impl<'a> RenameDataFenceOptions<'a> {
         Self {
             write_quorum,
             scanner_publication_lease_tokens,
+            scanner_publication_commit_scope: None,
         }
+    }
+
+    pub(in crate::set_disk) fn with_publication_scope(
+        mut self,
+        scanner_publication_commit_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
+    ) -> Self {
+        self.scanner_publication_commit_scope = scanner_publication_commit_scope;
+        self
     }
 }
 
@@ -3995,6 +4005,7 @@ impl SetDisks {
         let RenameDataFenceOptions {
             write_quorum,
             scanner_publication_lease_tokens,
+            scanner_publication_commit_scope: _scanner_publication_commit_scope,
         } = fence_options;
         if let Some(file_info) = disks
             .iter()
@@ -4352,6 +4363,7 @@ impl SetDisks {
         let RenameDataFenceOptions {
             write_quorum,
             scanner_publication_lease_tokens,
+            scanner_publication_commit_scope,
         } = fence_options;
         if let Some(file_info) = disks
             .iter()
@@ -4383,11 +4395,15 @@ impl SetDisks {
         let fanout_src_object = src_object.clone();
         let fanout_dst_bucket = dst_bucket.clone();
         let fanout_dst_object = dst_object.clone();
+        let fanout_publication_scope = scanner_publication_commit_scope.clone();
         // Keep one coordinator task so a cancelled caller cannot drop partially
         // completed disk mutations. Per-disk futures stay ordered in `join_all`,
         // preserving slot-indexed quorum and convergence accounting without a
         // scheduler task for every disk.
         let fanout = tokio::spawn(async move {
+            // Keep the storage-owned movement permit attached to the actual
+            // fan-out owner, even if the caller future is cancelled.
+            let _fanout_publication_scope = fanout_publication_scope;
             let successful_rename_completion_rank =
                 rustfs_io_metrics::put_stage_metrics_enabled().then(|| Arc::new(AtomicUsize::new(0)));
             let futures = fanout_disks
@@ -4401,6 +4417,7 @@ impl SetDisks {
                     let dst_object = fanout_dst_object.clone();
                     let dst_bucket = fanout_dst_bucket.clone();
                     let successful_rename_completion_rank = successful_rename_completion_rank.clone();
+                    let publication_scope = scanner_publication_commit_scope.clone();
 
                     std::panic::AssertUnwindSafe(async move {
                         // Test-only introspection guard: counts this operation as
@@ -4431,6 +4448,13 @@ impl SetDisks {
 
                         if let Some(err) = Self::rename_injected_error(&dst_object, i) {
                             return Err(err);
+                        }
+
+                        if let Some(scope) = publication_scope.as_ref()
+                            && !scope.can_commit()
+                        {
+                            let _ = scope.mark_indeterminate();
+                            return Err(DiskError::other("scanner publication commit scope deadline or cancellation reached"));
                         }
 
                         let disk_wait_started = rustfs_io_metrics::put_stage_timer();

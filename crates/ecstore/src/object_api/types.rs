@@ -433,6 +433,42 @@ pub struct ScannerPublicationCommitScope {
     inner: Arc<ScannerPublicationCommitScopeInner>,
 }
 
+/// RAII fallback for storage paths that return before their commit closure
+/// takes ownership. An in-flight scope is never guessed to be aborted: it is
+/// marked indeterminate so remote lease release remains blocked.
+pub(crate) struct ScannerPublicationCommitScopeGuard {
+    scope: Option<ScannerPublicationCommitScope>,
+}
+
+impl ScannerPublicationCommitScopeGuard {
+    pub(crate) fn new(scope: ScannerPublicationCommitScope) -> Self {
+        Self { scope: Some(scope) }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.scope = None;
+    }
+}
+
+impl Drop for ScannerPublicationCommitScopeGuard {
+    fn drop(&mut self) {
+        let Some(scope) = self.scope.as_ref() else {
+            return;
+        };
+        match scope.state() {
+            ScannerPublicationCommitState::Admitted => {
+                let _ = scope.mark_aborted_before_commit();
+            }
+            ScannerPublicationCommitState::InFlight => {
+                let _ = scope.mark_indeterminate();
+            }
+            ScannerPublicationCommitState::Committed
+            | ScannerPublicationCommitState::AbortedBeforeCommit
+            | ScannerPublicationCommitState::Indeterminate => {}
+        }
+    }
+}
+
 impl Debug for ScannerPublicationCommitScope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ScannerPublicationCommitScope")
