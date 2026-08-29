@@ -797,29 +797,6 @@ where
     Some(admission)
 }
 
-pub(crate) async fn save_config_shared_with_preconditions_and_lease_fence<S>(
-    api: Arc<S>,
-    file: &str,
-    data: Bytes,
-    sha256hex: Option<String>,
-    preconditions: HTTPPreconditions,
-    scanner_publication_lease_fence: Option<&str>,
-) -> EcstoreResult<ScannerObjectInfo>
-where
-    S: ScannerObjectIO,
-{
-    save_config_shared_with_preconditions_and_lease_fence_and_scope(
-        api,
-        file,
-        data,
-        sha256hex,
-        preconditions,
-        scanner_publication_lease_fence,
-        None,
-    )
-    .await
-}
-
 pub(crate) async fn save_config_shared_with_preconditions_and_lease_fence_and_scope<S>(
     api: Arc<S>,
     file: &str,

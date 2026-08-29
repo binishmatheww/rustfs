@@ -37,7 +37,7 @@ fn remote_lease_expired(deadline: Option<std::time::Instant>) -> bool {
     deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
 }
 
-fn scanner_publication_scope_deadline(
+pub(super) fn scanner_publication_scope_deadline(
     persist_timeout: Duration,
     remote_lease_deadline: Option<std::time::Instant>,
 ) -> tokio::time::Instant {
@@ -836,12 +836,14 @@ where
 
         if backup_due {
             let done_save = Metrics::time(Metric::SaveUsage);
-            let backup_result = sync_data_usage_backup_from_primary_for_epoch_and_lease_and_fence(
+            let backup_result = sync_data_usage_backup_from_primary_for_epoch_and_lease_and_fence_and_scope(
                 &ctx,
                 storeapi.clone(),
                 expected_publication_epoch,
                 remote_lease_deadline,
                 scanner_publication_lease_fence.as_deref(),
+                remote_lease_tokens.clone(),
+                Arc::clone(&lease_release_safe),
             )
             .await;
             done_save();
