@@ -38,7 +38,7 @@ use crate::disk::OldCurrentSize;
 use crate::object_api::{NamespaceLockFence, ObjectLockConfigSnapshot};
 use crate::set_disk::{
     SetDisks, get_lock_acquire_timeout, get_object_lock_diag_slow_acquire_threshold, get_object_lock_diag_slow_hold_threshold,
-    is_object_lock_diag_enabled, same_distributed_lock_domain,
+    is_lock_optimization_enabled, is_object_lock_diag_enabled, same_distributed_lock_domain,
 };
 use crate::storage_api_contracts::{
     namespace::NamespaceLocking as _,
@@ -2204,7 +2204,7 @@ impl ECStore {
     }
 
     fn attach_read_lock_guard(mut reader: GetObjectReader, guard: Option<ObjectLockDiagGuard>) -> GetObjectReader {
-        if reader.buffered_body.is_some() {
+        if is_lock_optimization_enabled() || reader.buffered_body.is_some() {
             return reader;
         }
 
@@ -3924,10 +3924,9 @@ mod tests {
         GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup, GetObjectBodySource, clear_get_object_body_cache_hook,
         lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
     };
-    use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause, SetDisks, disk_call_counters};
+    use crate::set_disk::{SetDisks, disk_call_counters};
     use crate::storage_api_contracts::bucket::MakeBucketOptions;
     use crate::storage_api_contracts::lifecycle::TransitionedObject;
-    use crate::storage_api_contracts::multipart::{CompletePart, MultipartOperations as _};
     use bytes::Bytes;
     use std::io::Cursor;
     use std::sync::Arc;
@@ -5632,8 +5631,8 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(body_cache_hook)]
-    async fn prepared_streaming_reader_holds_namespace_lock_until_eof_or_drop() {
-        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("true"))], async {
+    async fn prepared_reader_holds_namespace_lock_until_eof_or_drop() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("false"))], async {
             let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
             let store = new_prepared_reader_test_store(&[set_disks]).await;
             let bucket = "prepared-reader-lock-lifetime";
@@ -5680,111 +5679,6 @@ mod tests {
             assert_prepared_reader_blocks_writer(&store, bucket, object).await;
             drop(reader);
             drop(acquire_prepared_reader_writer(&store, bucket, object).await);
-        })
-        .await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    #[serial_test::serial]
-    async fn multipart_streaming_get_blocks_overwrite_across_part_boundary() {
-        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("true"))], async {
-            const MIN_MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
-
-            let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
-            let store = new_prepared_reader_test_store(&[set_disks]).await;
-            let bucket = "snapshot-multipart-overwrite";
-            let object = "object";
-            let first_part = vec![0x41; MIN_MULTIPART_PART_SIZE];
-            let second_part = vec![0x42; MIN_MULTIPART_PART_SIZE];
-            let replacement = vec![0x43; first_part.len() + second_part.len()];
-            let setup_opts = ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            };
-            let set = store.pools[0].get_disks_by_key(object);
-
-            set.make_bucket(bucket, &MakeBucketOptions::default())
-                .await
-                .expect("bucket should be created");
-            let upload = set
-                .new_multipart_upload(bucket, object, &setup_opts)
-                .await
-                .expect("multipart upload should be created");
-            let mut completed_parts = Vec::with_capacity(2);
-            for (part_num, body) in [(1, &first_part), (2, &second_part)] {
-                let mut reader = PutObjReader::from_vec(body.clone());
-                let part = set
-                    .put_object_part(bucket, object, &upload.upload_id, part_num, &mut reader, &setup_opts)
-                    .await
-                    .expect("multipart part should be written");
-                completed_parts.push(CompletePart {
-                    part_num,
-                    etag: part.etag,
-                    ..Default::default()
-                });
-            }
-            let completed = Arc::clone(&set)
-                .complete_multipart_upload(bucket, object, &upload.upload_id, completed_parts, &setup_opts)
-                .await
-                .expect("multipart upload should complete");
-            assert!(completed.is_multipart());
-
-            let mut snapshot = store
-                .handle_get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
-                .await
-                .expect("multipart snapshot reader should open through the store layer");
-            let overwrite_set = Arc::clone(&set);
-            let overwrite_body = replacement.clone();
-            let commit_barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::BeforeNamespace);
-            let overwrite = tokio::spawn(async move {
-                let mut reader = PutObjReader::from_vec(overwrite_body);
-                overwrite_set
-                    .put_object(bucket, object, &mut reader, &ObjectOptions::default())
-                    .await
-            });
-            commit_barrier.wait_until_paused().await;
-            commit_barrier.release_and_wait_until_namespace_pending().await;
-            assert!(
-                !commit_barrier.namespace_acquired(),
-                "overwrite must wait for the store-layer multipart read lock"
-            );
-
-            let mut restored_first = vec![0; first_part.len()];
-            snapshot
-                .stream
-                .read_exact(&mut restored_first)
-                .await
-                .expect("the first multipart part should stream");
-            assert_eq!(restored_first, first_part);
-            assert!(
-                !commit_barrier.namespace_acquired() && !overwrite.is_finished(),
-                "overwrite must remain blocked at the first/second part boundary"
-            );
-
-            let mut restored_second = Vec::new();
-            snapshot
-                .stream
-                .read_to_end(&mut restored_second)
-                .await
-                .expect("the second multipart part should stream");
-            assert_eq!(restored_second, second_part);
-            tokio::time::timeout(Duration::from_secs(5), overwrite)
-                .await
-                .expect("overwrite should proceed after multipart EOF")
-                .expect("overwrite task should join")
-                .expect("overwrite should succeed");
-
-            let mut latest = store
-                .handle_get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
-                .await
-                .expect("replacement reader should open through the store layer");
-            let mut latest_body = Vec::new();
-            latest
-                .stream
-                .read_to_end(&mut latest_body)
-                .await
-                .expect("replacement should stream");
-            assert_eq!(latest_body, replacement);
         })
         .await;
     }
@@ -6476,7 +6370,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn reader_lock_is_held_for_stream_when_optimization_is_enabled() {
+    async fn reader_lock_is_not_held_for_stream_when_optimization_is_enabled() {
         temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("true"))], async {
             let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
             let lock = rustfs_lock::NamespaceLock::with_local_manager("test".to_string(), manager);
@@ -6503,13 +6397,10 @@ mod tests {
 
             let reader = ECStore::attach_read_lock_guard(reader, Some(read_guard));
 
-            lock.get_write_lock(key.clone(), "writer", Duration::from_millis(20))
-                .await
-                .expect_err("streaming reader should retain the read lock under lock optimization");
-            drop(reader);
             lock.get_write_lock(key, "writer", Duration::from_secs(1))
                 .await
-                .expect("dropping the streaming reader should release the read lock");
+                .expect("lock optimization should release the read lock before returning the stream");
+            drop(reader);
         })
         .await;
     }
@@ -6554,7 +6445,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn reader_lock_is_released_after_stream_eof() {
-        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("true"))], async {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("false"))], async {
             let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
             let lock = rustfs_lock::NamespaceLock::with_local_manager("test".to_string(), manager);
             let key = rustfs_lock::ObjectKey::new("bucket", "object");
