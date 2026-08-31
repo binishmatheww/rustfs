@@ -1747,4 +1747,41 @@ mod integration_tests {
             other => panic!("expected primary admission after release, got {other:?}"),
         }
     }
+
+    /// Cancelling a primary waiter must remove its acquire future without
+    /// consuming the permit released afterwards. This is the minimum
+    /// cancellation contract a future source-aware admission queue must retain.
+    #[tokio::test]
+    async fn test_admit_disk_read_cancelled_waiter_preserves_released_permit() {
+        let manager = std::sync::Arc::new(ConcurrencyManager::with_disk_read_caps_for_test(1, 0));
+        let held = match manager.admit_disk_read(Duration::ZERO).await.unwrap() {
+            DiskReadAdmission::Primary(permit) => permit,
+            other => panic!("expected primary admission, got {other:?}"),
+        };
+
+        let waiter_manager = std::sync::Arc::clone(&manager);
+        let waiter = tokio::spawn(async move {
+            waiter_manager
+                .admit_disk_read(Duration::ZERO)
+                .await
+                .expect("primary semaphore should remain open")
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "the second zero-wait request must be waiting on the held permit");
+
+        waiter.abort();
+        assert!(
+            waiter
+                .await
+                .expect_err("cancelled waiter must report cancellation")
+                .is_cancelled()
+        );
+        drop(held);
+
+        let admitted = tokio::time::timeout(Duration::from_secs(1), manager.admit_disk_read(Duration::ZERO))
+            .await
+            .expect("a cancelled waiter must not strand the released permit")
+            .expect("primary admission should remain available");
+        assert!(matches!(admitted, DiskReadAdmission::Primary(_)));
+    }
 }
