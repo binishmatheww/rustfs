@@ -14,12 +14,13 @@
 
 use super::*;
 use crate::bucket::{
-    metadata::{BUCKET_TABLE_RESERVED_PREFIX, table_bucket_catalog_metadata_prefix},
+    metadata::{BUCKET_TABLE_RESERVED_PREFIX, BUCKET_TAGGING_CONFIG, ConfigState, table_bucket_catalog_metadata_prefix},
     utils::is_meta_bucketname,
 };
 use crate::error::is_err_bucket_not_found;
 use crate::runtime::sources as runtime_sources;
 use crate::set_disk::{BucketInfoQuorum, get_lock_acquire_timeout};
+use crate::storage_api_contracts::admin::DiskSetSelector;
 use crate::storage_api_contracts::bucket::{BUCKET_LIFECYCLE_LOCK_OBJECT, SRBucketDeleteOp};
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use futures::stream::{self, StreamExt};
@@ -121,14 +122,27 @@ async fn table_catalog_metadata_exists(ctx: &crate::runtime::instance::InstanceC
 }
 
 async fn validate_table_bucket_delete_guard(ctx: &crate::runtime::instance::InstanceContext, bucket: &str) -> Result<()> {
-    let table_bucket_enabled = metadata_sys::get_in(ctx, bucket)
-        .await
-        .is_ok_and(|metadata| metadata.table_bucket_enabled());
+    let table_bucket_enabled = table_bucket_enabled_in(ctx, bucket).await?;
     if table_bucket_enabled {
         validate_table_bucket_delete_allowed(bucket, true, table_catalog_metadata_exists(ctx, bucket).await?)?;
     }
 
     Ok(())
+}
+
+async fn table_bucket_enabled_in(ctx: &crate::runtime::instance::InstanceContext, bucket: &str) -> Result<bool> {
+    match metadata_sys::get_in(ctx, bucket).await {
+        Ok(metadata) => Ok(metadata.table_bucket_enabled()),
+        // A live bucket may be absent from the metadata cache during lazy
+        // startup. Re-read persisted metadata before deciding that it is an
+        // ordinary bucket; an actual metadata backend failure must never turn
+        // a protected-bucket check into a best-effort operation.
+        Err(Error::ConfigNotFound) => {
+            let (metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(ctx, bucket).await?;
+            Ok(persisted && metadata.table_bucket_enabled())
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn bucket_delete_metadata_cleanup_prefixes(bucket: &str) -> [String; 2] {
@@ -189,6 +203,52 @@ where
         await_bucket_namespace_operation(namespace_guard, bucket, operation, future),
     )
     .await
+}
+
+fn bucket_recovery_lock_unavailable(bucket: &str, object: &str) -> StorageError {
+    StorageError::NamespaceLockQuorumUnavailable {
+        mode: "write",
+        bucket: bucket.to_string(),
+        object: object.to_string(),
+        required: 1,
+        achieved: 0,
+    }
+}
+
+async fn await_orphan_bucket_recovery<T, F>(
+    bucket: &str,
+    publication_guard: &rustfs_lock::NamespaceLockGuard,
+    lifecycle_guard: &rustfs_lock::NamespaceLockGuard,
+    metadata_guard: &rustfs_lock::NamespaceLockGuard,
+    namespace_guard: &rustfs_lock::NamespaceLockGuard,
+    future: F,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    let metadata_lock_object = crate::bucket::metadata_sys::bucket_metadata_transaction_lock_key(bucket);
+    for ((lock_bucket, lock_object), guard) in [
+        (
+            (bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH),
+            publication_guard,
+        ),
+        ((bucket, BUCKET_LIFECYCLE_LOCK_OBJECT), lifecycle_guard),
+        ((RUSTFS_META_BUCKET, metadata_lock_object.as_str()), metadata_guard),
+        ((bucket, bucket), namespace_guard),
+    ] {
+        if guard.is_lock_lost() {
+            return Err(bucket_recovery_lock_unavailable(lock_bucket, lock_object));
+        }
+    }
+
+    tokio::select! {
+        biased;
+        _ = publication_guard.lock_lost_notified() => Err(bucket_recovery_lock_unavailable(bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)),
+        _ = lifecycle_guard.lock_lost_notified() => Err(bucket_recovery_lock_unavailable(bucket, BUCKET_LIFECYCLE_LOCK_OBJECT)),
+        _ = metadata_guard.lock_lost_notified() => Err(bucket_recovery_lock_unavailable(RUSTFS_META_BUCKET, &metadata_lock_object)),
+        _ = namespace_guard.lock_lost_notified() => Err(bucket_recovery_lock_unavailable(bucket, bucket)),
+        result = future => result,
+    }
 }
 
 async fn run_bucket_usage_cleanup<F>(guard: Option<&rustfs_lock::NamespaceLockGuard>, bucket: &str, future: F) -> Result<()>
@@ -259,6 +319,20 @@ async fn bucket_delete_local_blocker(
 }
 
 impl ECStore {
+    /// Run a multi-step storage mutation on the instance task tracker so its
+    /// caller may stop waiting without releasing guards before the mutation
+    /// finishes.
+    pub async fn run_detached_mutation<F>(&self, mutation: F) -> Result<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.ctx
+            .run_detached_mutation(mutation)
+            .await
+            .map_err(|error| StorageError::other_with_context("detached ECStore mutation failed", error))
+    }
+
     fn bucket_sets(&self) -> impl Iterator<Item = (usize, usize, Arc<crate::set_disk::SetDisks>)> + '_ {
         self.pools.iter().flat_map(|pool| {
             pool.disk_set
@@ -267,9 +341,146 @@ impl ECStore {
         })
     }
 
+    async fn ensure_bucket_volume_absent_on_all_sets(&self, bucket: &str) -> Result<()> {
+        let sets: Vec<_> = self.bucket_sets().map(|(_, _, set)| set).collect();
+        if sets.is_empty() {
+            return Err(StorageError::ErasureReadQuorum);
+        }
+        let results = join_all(sets.iter().map(|set| set.ensure_bucket_volume_absent_on_every_disk(bucket))).await;
+        for result in results {
+            result?;
+        }
+        Ok(())
+    }
+
+    /// Return whether an old bucket generation has a durable retirement record.
+    /// A live matching incarnation is never considered retired, even if a stale
+    /// record exists from a previous generation.
+    pub async fn is_bucket_incarnation_retired(&self, bucket: &str, expected: Uuid) -> Result<bool> {
+        if expected.is_nil() {
+            return Ok(false);
+        }
+        let retirement_store = metadata_sys::object_store_if_initialized_in(&self.ctx).await.ok_or_else(|| {
+            StorageError::InsufficientReadQuorum(RUSTFS_META_BUCKET.to_string(), "bucket-retirements".to_string())
+        })?;
+        if crate::bucket::metadata::load_bucket_incarnation(retirement_store.clone(), bucket).await? == Some(expected) {
+            return Ok(false);
+        }
+        crate::bucket::retirement::is_retired(retirement_store, bucket, expected).await
+    }
+
+    /// Reconcile bucket metadata after an operator removed all physical volume
+    /// directories. The expected generation, all-disk absence proof and durable
+    /// retirement record make retries safe after partial metadata cleanup.
+    pub fn recover_orphaned_bucket<'a>(&'a self, bucket: &'a str, expected: Uuid) -> futures::future::BoxFuture<'a, Result<()>> {
+        Box::pin(async move { Box::pin(self.recover_orphaned_bucket_inner(bucket, expected)).await })
+    }
+
+    async fn recover_orphaned_bucket_inner(&self, bucket: &str, expected: Uuid) -> Result<()> {
+        if let Err(error) = check_valid_bucket_name_strict(bucket) {
+            return Err(StorageError::BucketNameInvalid(error.to_string()));
+        }
+        if is_meta_bucketname(bucket) || expected.is_nil() {
+            return Err(StorageError::InvalidArgument(
+                "RecoverOrphanedBucket".to_string(),
+                "bucket".to_string(),
+                "a user bucket and non-nil incarnation are required".to_string(),
+            ));
+        }
+
+        // Lock order matches bucket deletion: publication -> lifecycle ->
+        // metadata transaction -> exact namespace.
+        let publication_guard = self.acquire_bucket_publication_write_lock(bucket).await?;
+        let lifecycle_guard = self.acquire_bucket_lifecycle_write_lock(bucket).await?;
+        let metadata_guard = metadata_sys::acquire_bucket_metadata_transaction_lock_in(&self.ctx, bucket).await?;
+        let ns_lock = self.new_ns_lock(bucket, bucket).await?;
+        let ns_guard = ns_lock
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .map_err(|error| match error {
+                rustfs_lock::LockError::QuorumNotReached { required, achieved } => StorageError::NamespaceLockQuorumUnavailable {
+                    mode: "write",
+                    bucket: bucket.to_string(),
+                    object: bucket.to_string(),
+                    required,
+                    achieved,
+                },
+                other => StorageError::Lock(other),
+            })?;
+
+        let recover = Box::pin(async {
+            self.ensure_bucket_volume_absent_on_all_sets(bucket).await?;
+            let retirement_store = metadata_sys::object_store_if_initialized_in(&self.ctx).await.ok_or_else(|| {
+                StorageError::InsufficientReadQuorum(RUSTFS_META_BUCKET.to_string(), "bucket-retirements".to_string())
+            })?;
+            let current_incarnation = crate::bucket::metadata::load_bucket_incarnation(retirement_store.clone(), bucket).await?;
+            if current_incarnation.is_some_and(|current| current != expected) {
+                return Err(StorageError::PreconditionFailed);
+            }
+
+            let retired = crate::bucket::retirement::is_retired(retirement_store.clone(), bucket, expected).await?;
+            if current_incarnation.is_none() && !retired {
+                return Err(StorageError::PreconditionFailed);
+            }
+            if !retired {
+                let mut record_opts = ObjectOptions {
+                    max_parity: true,
+                    ..Default::default()
+                };
+                record_opts.add_bucket_lifecycle_lock_guard(&lifecycle_guard);
+                record_opts.add_namespace_lock_guard(&ns_guard);
+                let publish_retirement = Box::pin(crate::bucket::retirement::commit_retirement(
+                    retirement_store.clone(),
+                    bucket,
+                    expected,
+                    &record_opts,
+                ));
+                publish_retirement.await?;
+            }
+
+            crate::bucket::quota::reservation::cleanup_retired_bucket_ledger(retirement_store.clone(), bucket, expected).await?;
+            crate::data_usage::prepare_bucket_usage_for_namespace_change(bucket, Some(&ns_guard)).await?;
+            crate::data_usage::remove_bucket_usage_from_backend_with_guard_fenced(self, bucket, Some(&ns_guard)).await?;
+            self.cleanup_deleted_bucket_metadata_strict(bucket, true).await?;
+            crate::store::list_objects::observe_scanner_namespace_mutations(bucket, 1);
+            Ok(())
+        });
+        await_orphan_bucket_recovery(bucket, &publication_guard, &lifecycle_guard, &metadata_guard, &ns_guard, recover).await
+    }
+
     pub async fn get_bucket_metadata(&self, bucket: &str) -> Result<Arc<BucketMetadata>> {
         let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
         sys.read().await.get(bucket).await
+    }
+
+    /// Resolve stored tags for authorization. Only confirmed absence returns an
+    /// empty map; unavailable, fabricated or malformed metadata must not grant access.
+    pub async fn get_bucket_tags_for_policy(&self, bucket: &str) -> Result<HashMap<String, String>> {
+        let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
+        let metadata = match sys.read().await.get_authoritative_metadata(bucket).await {
+            Ok(metadata) => metadata,
+            Err(Error::ConfigNotFound) => return Ok(HashMap::new()),
+            Err(err) => return Err(err),
+        };
+        let Some(tagging) =
+            ConfigState::of(&metadata.tagging_config_xml, &metadata.tagging_config).require(bucket, BUCKET_TAGGING_CONFIG)?
+        else {
+            return Ok(HashMap::new());
+        };
+        let mut tags = HashMap::with_capacity(tagging.tag_set.len());
+        for tag in &tagging.tag_set {
+            let (Some(key), Some(value)) = (&tag.key, &tag.value) else {
+                return Err(Error::other("stored bucket tag is missing a key or value"));
+            };
+            if key.is_empty() || tags.insert(key.clone(), value.clone()).is_some() {
+                return Err(Error::other("stored bucket tags contain empty or duplicate keys"));
+            }
+        }
+        Ok(tags)
+    }
+
+    pub async fn table_bucket_enabled(&self, bucket: &str) -> Result<bool> {
+        table_bucket_enabled_in(&self.ctx, bucket).await
     }
 
     pub async fn get_bucket_policy(&self, bucket: &str) -> Result<(BucketPolicy, OffsetDateTime)> {
@@ -290,6 +501,21 @@ impl ECStore {
 
     pub async fn update_bucket_metadata_config(&self, bucket: &str, config_file: &str, data: Vec<u8>) -> Result<OffsetDateTime> {
         metadata_sys::update_in(&self.ctx, bucket, config_file, data).await
+    }
+
+    /// Validate an external fence while holding the bucket metadata transaction.
+    /// Callers acquire their external fence before the lifecycle and transaction locks.
+    pub async fn update_bucket_metadata_config_validated<F>(
+        &self,
+        bucket: &str,
+        config_file: &str,
+        data: Vec<u8>,
+        validate: F,
+    ) -> Result<OffsetDateTime>
+    where
+        F: FnOnce() -> Result<()> + Send,
+    {
+        metadata_sys::update_validated_in(&self.ctx, bucket, config_file, data, validate).await
     }
 
     pub async fn bucket_incarnation_id(&self, bucket: &str) -> Result<Uuid> {
@@ -387,6 +613,26 @@ impl ECStore {
                         mode: "bucket_lifecycle_write",
                         bucket: bucket.to_string(),
                         object: BUCKET_LIFECYCLE_LOCK_OBJECT.to_string(),
+                        required,
+                        achieved,
+                    }
+                }
+                other => StorageError::Lock(other),
+            })
+    }
+
+    async fn acquire_bucket_publication_write_lock(&self, bucket: &str) -> Result<rustfs_lock::NamespaceLockGuard> {
+        let lock = self
+            .new_ns_lock(bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
+            .await?;
+        lock.get_write_lock(get_lock_acquire_timeout())
+            .await
+            .map_err(|err| match err {
+                rustfs_lock::error::LockError::QuorumNotReached { required, achieved } => {
+                    StorageError::NamespaceLockQuorumUnavailable {
+                        mode: "table_bucket_publication_write",
+                        bucket: bucket.to_string(),
+                        object: rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH.to_string(),
                         required,
                         achieved,
                     }
@@ -526,6 +772,25 @@ impl ECStore {
         Ok(())
     }
 
+    async fn cleanup_deleted_bucket_metadata_strict(&self, bucket: &str, include_deleted_marker: bool) -> Result<()> {
+        let options = ObjectOptions {
+            delete_prefix_object: true,
+            ..Default::default()
+        };
+        for prefix in bucket_delete_metadata_cleanup_prefixes(bucket) {
+            self.delete_prefix(RUSTFS_META_BUCKET, &prefix, &options).await?;
+        }
+
+        if include_deleted_marker {
+            let marker_prefix = bucket_deleted_marker_prefix(bucket);
+            self.delete_prefix(RUSTFS_META_BUCKET, &marker_prefix, &options).await?;
+        }
+
+        metadata_sys::remove_bucket_metadata_in(&self.ctx, bucket).await?;
+        runtime_sources::delete_bucket_monitor_entry(bucket);
+        Ok(())
+    }
+
     async fn cleanup_bucket_usage(&self, bucket: &str, guard: Option<&rustfs_lock::NamespaceLockGuard>) -> Result<()> {
         run_bucket_usage_cleanup(guard, bucket, async {
             crate::data_usage::prepare_bucket_usage_for_namespace_change(bucket, guard).await?;
@@ -637,7 +902,46 @@ impl ECStore {
             }
         };
         let confirmed_missing = existing_bucket_info.is_none();
-        let existing_metadata = if opts.force_create && !confirmed_missing && !is_meta_bucketname(bucket) {
+        let mut pending_creation_metadata = None;
+        if confirmed_missing
+            && !opts.no_lock
+            && !is_meta_bucketname(bucket)
+            && let Some(metadata_store) = metadata_sys::object_store_if_initialized_in(&self.ctx).await
+            && let Some(old_incarnation) = crate::bucket::metadata::load_bucket_incarnation(metadata_store, bucket).await?
+        {
+            // A quorum-level absence is not proof that every disk lost the old
+            // generation. Require the explicit recovery path to verify all disks
+            // and retire this incarnation before a same-name create can mutate
+            // any volume.
+            self.ensure_bucket_volume_absent_on_all_sets(bucket)
+                .await
+                .map_err(|error| match error {
+                    StorageError::BucketExists(_) => StorageError::InvalidArgument(
+                        "CreateBucket".to_string(),
+                        "bucket".to_string(),
+                        "an old bucket volume remains on disk; administrator recovery refused".to_string(),
+                    ),
+                    other => other,
+                })?;
+            let (metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await?;
+            let metadata_store = metadata_sys::object_store_in(&self.ctx).await?;
+            let pending_intent = persisted
+                && metadata.bucket_incarnation_id == old_incarnation
+                && metadata.needs_bucket_creation_commit()
+                && !crate::bucket::retirement::is_retired(metadata_store, bucket, old_incarnation).await?;
+            if pending_intent {
+                pending_creation_metadata = Some(metadata);
+            } else {
+                return Err(StorageError::InvalidArgument(
+                    "CreateBucket".to_string(),
+                    "bucket".to_string(),
+                    format!("orphaned bucket generation {old_incarnation} requires administrator recovery before recreation"),
+                ));
+            }
+        }
+        let existing_metadata = if let Some(metadata) = pending_creation_metadata {
+            Some(metadata)
+        } else if opts.force_create && !confirmed_missing && !is_meta_bucketname(bucket) {
             let (mut metadata, persisted) = metadata_sys::get_config_from_disk_with_presence_in(&self.ctx, bucket).await?;
             if !persisted {
                 metadata = BucketMetadata::new(bucket);
@@ -848,7 +1152,7 @@ impl ECStore {
         let mut scoped_results = futures::future::join_all(self.bucket_sets().map(|(pool_index, set_index, set)| async move {
             let result = match quorum {
                 BucketInfoQuorum::Read => set.stat_bucket_with_quorum(bucket, quorum).await,
-                BucketInfoQuorum::Write => set.get_bucket_info(bucket, opts).await,
+                BucketInfoQuorum::Write | BucketInfoQuorum::HealCandidates => set.get_bucket_info(bucket, opts).await,
             };
             (pool_index, set_index, result)
         }))
@@ -928,34 +1232,70 @@ impl ECStore {
     #[instrument(skip(self))]
     pub(super) async fn handle_list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
         // TODO(backlog): support cached bucket listing via opts.cached
-        Ok(self.list_bucket_from_sets(opts, usize::MAX).await?.buckets)
+        Ok(self
+            .list_bucket_from_sets(opts, usize::MAX, BucketInfoQuorum::Write, None)
+            .await?
+            .buckets)
     }
 
     pub async fn list_bucket_for_scanner(&self, opts: &BucketOptions) -> Result<crate::cluster::rpc::ScannerBucketListing> {
-        self.list_bucket_from_sets(opts, SCANNER_BUCKET_LIST_SET_CONCURRENCY).await
+        self.list_bucket_from_sets(opts, SCANNER_BUCKET_LIST_SET_CONCURRENCY, BucketInfoQuorum::Write, None)
+            .await
+    }
+
+    /// Discover candidates for metadata initialization at each set's namespace
+    /// read quorum. Metadata loading still validates persisted configuration;
+    /// this listing must not be used as a complete scanner or mutation view.
+    pub async fn list_buckets_for_metadata_startup(&self) -> Result<Vec<BucketInfo>> {
+        Ok(self
+            .list_bucket_from_sets(
+                &BucketOptions {
+                    no_metadata: true,
+                    ..Default::default()
+                },
+                SCANNER_BUCKET_LIST_SET_CONCURRENCY,
+                BucketInfoQuorum::Read,
+                None,
+            )
+            .await?
+            .buckets)
+    }
+
+    /// Preserve namespace completeness for administrator traversal. A scoped
+    /// request must not depend on unrelated sets being available.
+    pub async fn list_buckets_for_admin_heal(
+        &self,
+        selector: Option<DiskSetSelector>,
+    ) -> Result<crate::cluster::rpc::ScannerBucketListing> {
+        self.list_bucket_from_sets(
+            &BucketOptions {
+                no_metadata: true,
+                ..Default::default()
+            },
+            SCANNER_BUCKET_LIST_SET_CONCURRENCY,
+            BucketInfoQuorum::HealCandidates,
+            selector,
+        )
+        .await
     }
 
     async fn list_bucket_from_sets(
         &self,
         opts: &BucketOptions,
         max_concurrency: usize,
+        quorum: BucketInfoQuorum,
+        selector: Option<DiskSetSelector>,
     ) -> Result<crate::cluster::rpc::ScannerBucketListing> {
-        let set_count = self.pools.iter().map(|pool| pool.disk_set.len()).sum();
+        let sets = self
+            .bucket_sets()
+            .filter(|(pool, set, _)| selector.is_none_or(|scope| scope.pool_idx == *pool && scope.set_idx == *set))
+            .collect::<Vec<_>>();
+        let set_count = sets.len();
         let concurrency = bucket_list_set_concurrency(set_count, max_concurrency);
-        let deleted = opts.deleted;
-        let cached = opts.cached;
-        let no_metadata = opts.no_metadata;
-        let mut set_listings = stream::iter(self.bucket_sets().map(move |(pool_index, set_index, set)| {
-            let opts = BucketOptions {
-                deleted,
-                cached,
-                no_metadata,
-            };
-            async move {
-                set.list_bucket_for_scanner(&opts)
-                    .await
-                    .map(|(buckets, complete)| (pool_index, set_index, buckets, complete))
-            }
+        let mut set_listings = stream::iter(sets.into_iter().map(move |(pool_index, set_index, set)| async move {
+            set.list_bucket_with_quorum(quorum)
+                .await
+                .map(|(buckets, complete)| (pool_index, set_index, buckets, complete))
         }))
         .buffer_unordered(concurrency);
         let mut topology_complete = set_count != 0;
@@ -1015,7 +1355,7 @@ impl ECStore {
         &self,
         bucket: &str,
         opts: &DeleteBucketOptions,
-        mut diagnostic_budget: BucketDeleteDiagnosticBudget,
+        diagnostic_budget: BucketDeleteDiagnosticBudget,
     ) -> Result<()> {
         if is_meta_bucketname(bucket) {
             return Err(StorageError::BucketNameInvalid(bucket.to_string()));
@@ -1025,8 +1365,52 @@ impl ECStore {
             return Err(StorageError::BucketNameInvalid(err.to_string()));
         }
 
+        // Bucket deletion is a publication mutation too: a durable catalog
+        // backup must not enumerate or verify table objects while their
+        // containing bucket is being physically removed. Acquire this fence
+        // before the lifecycle and namespace locks to match object writers.
+        // `no_lock` is reserved for callers that already own the enclosing
+        // mutation locks (for example, failed bucket-creation rollback).
+        let publication_guard = if !opts.no_lock {
+            Some(self.acquire_bucket_publication_write_lock(bucket).await?)
+        } else {
+            None
+        };
+
+        await_bucket_namespace_operation(
+            publication_guard.as_ref(),
+            bucket,
+            "table-bucket publication fence during bucket deletion",
+            self.handle_delete_bucket_under_publication_lock(bucket, opts, diagnostic_budget),
+        )
+        .await
+    }
+
+    async fn handle_delete_bucket_under_publication_lock(
+        &self,
+        bucket: &str,
+        opts: &DeleteBucketOptions,
+        mut diagnostic_budget: BucketDeleteDiagnosticBudget,
+    ) -> Result<()> {
         let bucket_lifecycle_guard = if !opts.no_lock {
             Some(self.acquire_bucket_lifecycle_write_lock(bucket).await?)
+        } else {
+            None
+        };
+        // Match metadata migration: lifecycle -> metadata transaction ->
+        // bucket namespace. Holding the transaction while waiting for the
+        // namespace prevents a migration writer and force delete from
+        // acquiring these two locks in opposite orders.
+        let object_lock_metadata_transaction = if opts.force && !is_meta_bucketname(bucket) {
+            Some(
+                await_bucket_namespace_operation(
+                    bucket_lifecycle_guard.as_ref(),
+                    bucket,
+                    "Object Lock metadata transaction acquisition",
+                    crate::bucket::metadata_sys::acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket),
+                )
+                .await?,
+            )
         } else {
             None
         };
@@ -1085,6 +1469,29 @@ impl ECStore {
             }
         }
 
+        // Keep configuration changes fenced until data deletion finishes;
+        // a force delete cannot bypass any Object Lock protection.
+        let object_lock_metadata_guard = if bucket_exists && let Some(guard) = object_lock_metadata_transaction {
+            let (state, incarnation, _) =
+                crate::bucket::metadata_sys::get_object_lock_config_and_incarnation_from_disk_with_guard_in(
+                    &self.ctx,
+                    bucket,
+                    Some(ns_guard.as_ref().unwrap_or(&guard)),
+                )
+                .await?;
+            match state {
+                crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent => Some((guard, incarnation)),
+                crate::bucket::metadata_sys::ObjectLockConfigState::Configured { .. } => {
+                    return Err(StorageError::PrefixAccessDenied(bucket.to_owned(), String::new()));
+                }
+                crate::bucket::metadata_sys::ObjectLockConfigState::Fabricated => {
+                    return Err(StorageError::FileCorrupt);
+                }
+            }
+        } else {
+            None
+        };
+
         if sr_delete && !bucket_exists {
             delete_opts.force_if_empty = true;
         }
@@ -1098,7 +1505,12 @@ impl ECStore {
                 ns_guard.as_ref(),
                 bucket,
                 "bucket delete marker creation",
-                self.mark_bucket_deleted(bucket),
+                await_bucket_namespace_operation(
+                    object_lock_metadata_guard.as_ref().map(|(guard, _)| guard),
+                    bucket,
+                    "Object Lock configuration fence during bucket retirement",
+                    self.mark_bucket_deleted(bucket),
+                ),
             )
             .await?;
         }
@@ -1107,9 +1519,13 @@ impl ECStore {
         // Legacy buckets without a stamp cannot produce retirement authority.
         let retirement = if bucket_exists && bucket_lifecycle_guard.is_some() && !is_meta_bucketname(bucket) {
             if let Some(store) = metadata_sys::object_store_if_initialized_in(&self.ctx).await {
-                crate::bucket::metadata::load_bucket_incarnation(store.clone(), bucket)
-                    .await?
-                    .map(|incarnation| (store, incarnation))
+                if let Some((_, incarnation)) = object_lock_metadata_guard.as_ref() {
+                    Some((store, *incarnation))
+                } else {
+                    crate::bucket::metadata::load_bucket_incarnation(store.clone(), bucket)
+                        .await?
+                        .map(|incarnation| (store, incarnation))
+                }
             } else {
                 None
             }
@@ -1121,13 +1537,19 @@ impl ECStore {
             bucket_lifecycle_guard.as_ref(),
             bucket,
             "physical bucket deletion",
-            run_physical_bucket_deletion(ns_guard.as_ref(), bucket, async {
-                self.delete_bucket_on_sets(bucket, &delete_opts)
-                    .await
-                    .map_err(|err| to_object_err(err, vec![bucket]))
-            }),
+            await_bucket_namespace_operation(
+                object_lock_metadata_guard.as_ref().map(|(guard, _)| guard),
+                bucket,
+                "Object Lock configuration fence during bucket deletion",
+                run_physical_bucket_deletion(ns_guard.as_ref(), bucket, async {
+                    self.delete_bucket_on_sets(bucket, &delete_opts)
+                        .await
+                        .map_err(|err| to_object_err(err, vec![bucket]))
+                }),
+            ),
         )
         .await;
+        drop(object_lock_metadata_guard);
         if let Err(err) = delete_result
             && (!sr_delete || !is_err_strict_volume_not_found(&err))
         {
@@ -1186,9 +1608,9 @@ mod tests {
         BUCKET_DELETE_DIAGNOSTIC_MAX_ELAPSED, BUCKET_DELETE_DIAGNOSTIC_MAX_ENTRIES, BUCKET_DELETE_XLMETA_DIAGNOSTIC_MAX_BYTES,
         BucketDeleteBlockerKind, BucketDeleteDiagnosticBudget, BucketMetadataLessResidue, SCANNER_BUCKET_LIST_SET_CONCURRENCY,
         await_bucket_namespace_operation, bucket_delete_metadata_cleanup_prefixes, bucket_deleted_marker_prefix,
-        bucket_deleted_marker_volume, bucket_list_set_concurrency, record_bucket_delete_blocker, run_bucket_usage_cleanup,
-        run_physical_bucket_deletion, scan_metadata_less_residue, scan_metadata_less_residue_with_budget,
-        should_override_created_from_metadata, validate_table_bucket_delete_allowed,
+        bucket_deleted_marker_volume, bucket_list_set_concurrency, get_lock_acquire_timeout, record_bucket_delete_blocker,
+        run_bucket_usage_cleanup, run_physical_bucket_deletion, scan_metadata_less_residue,
+        scan_metadata_less_residue_with_budget, should_override_created_from_metadata, validate_table_bucket_delete_allowed,
     };
     use crate::bucket::metadata::{BucketMetadata, table_bucket_catalog_metadata_prefix};
     use crate::bucket::metadata_sys;
@@ -1212,6 +1634,7 @@ mod tests {
     use rustfs_filemeta::{FileInfo, FileMeta, TRANSITION_COMPLETE};
     use rustfs_lock::{LocalClient, LockRequest, LockType, NamespaceLock, ObjectKey};
     use serial_test::serial;
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1504,6 +1927,65 @@ mod tests {
         setup_bucket_quorum_test_env(&[4, 4], None).await
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn orphaned_bucket_recovery_requires_every_volume_absent_and_is_retryable() {
+        let (temp_dir, store) = setup_multi_pool_bucket_test_env().await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("orphan-recovery-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket before simulated operator removal");
+        let incarnation = store
+            .bucket_incarnation_id_from_disk(&bucket)
+            .await
+            .expect("persisted bucket generation");
+
+        let first_disk_volume = temp_dir.path().join("pool0-disk0").join(&bucket);
+        tokio::fs::remove_dir_all(&first_disk_volume)
+            .await
+            .expect("simulate operator removal on one disk");
+        let blocked = store
+            .recover_orphaned_bucket(&bucket, incarnation)
+            .await
+            .expect_err("recovery must refuse while any configured disk still has the volume");
+        assert!(matches!(blocked, StorageError::BucketExists(_)), "unexpected error: {blocked}");
+        assert_eq!(
+            crate::bucket::metadata::load_bucket_incarnation(store.clone(), &bucket)
+                .await
+                .expect("generation sidecar remains readable"),
+            Some(incarnation),
+            "a refused recovery must preserve the old generation identity"
+        );
+
+        for disk_index in 1..4 {
+            tokio::fs::remove_dir_all(temp_dir.path().join(format!("pool0-disk{disk_index}")).join(&bucket))
+                .await
+                .expect("remove remaining volume from first set");
+        }
+        for disk_index in 0..4 {
+            tokio::fs::remove_dir_all(temp_dir.path().join(format!("pool1-disk{disk_index}")).join(&bucket))
+                .await
+                .expect("remove volume from second set");
+        }
+
+        store
+            .recover_orphaned_bucket(&bucket, incarnation)
+            .await
+            .expect("recovery should retire the exact generation and clean stale metadata");
+        assert!(
+            store
+                .is_bucket_incarnation_retired(&bucket, incarnation)
+                .await
+                .expect("retirement proof remains readable")
+        );
+        store
+            .recover_orphaned_bucket(&bucket, incarnation)
+            .await
+            .expect("retry after metadata cleanup should converge from durable retirement proof");
+    }
+
     async fn setup_bucket_quorum_test_env(
         drives_per_pool: &[usize],
         standard_parity: Option<usize>,
@@ -1620,12 +2102,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bucket_tags_for_policy_distinguish_absence_from_corrupt_metadata() {
+        let (_temp_dir, store) = setup_bucket_quorum_test_env(&[4], None).await;
+        metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        assert!(
+            store
+                .get_bucket_tags_for_policy("not-created")
+                .await
+                .expect("confirmed missing bucket")
+                .is_empty()
+        );
+
+        let bucket = "policy-bucket-tags";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create tagged bucket");
+        let original = store.get_bucket_metadata(bucket).await.expect("read bucket metadata");
+        let cases = &[
+            (b"".as_slice(), Some(HashMap::new())),
+            (b"<Tagging><TagSet/></Tagging>", Some(HashMap::new())),
+            (
+                b"<Tagging><TagSet><Tag><Key>Department</Key><Value>Finance</Value></Tag><Tag><Key>note</Key><Value></Value></Tag></TagSet></Tagging>",
+                Some(HashMap::from([("Department".to_string(), "Finance".to_string()), ("note".to_string(), String::new())])),
+            ),
+            (b"<Tagging><TagSet>", None),
+            (b"<Tagging><TagSet><Tag><Value>finance</Value></Tag></TagSet></Tagging>", None),
+            (b"<Tagging><TagSet><Tag><Key>department</Key></Tag></TagSet></Tagging>", None),
+            (b"<Tagging><TagSet><Tag><Key></Key><Value>finance</Value></Tag></TagSet></Tagging>", None),
+            (
+                b"<Tagging><TagSet><Tag><Key>department</Key><Value>finance</Value></Tag><Tag><Key>department</Key><Value>engineering</Value></Tag></TagSet></Tagging>",
+                None,
+            ),
+        ];
+        for (xml, expected) in cases {
+            let mut metadata = (*original).clone();
+            metadata.tagging_config_xml = xml.to_vec();
+            metadata.tagging_config = crate::bucket::utils::deserialize(xml).ok();
+            metadata_sys::set_bucket_metadata_in(&store.ctx, metadata)
+                .await
+                .expect("inject persisted tag state");
+            let result = store.get_bucket_tags_for_policy(bucket).await;
+            match expected {
+                Some(tags) => assert_eq!(&result.expect("valid tag configuration"), tags),
+                None => assert!(result.is_err(), "corrupt tags must not become an untagged bucket: {xml:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn request_metadata_methods_fail_closed_before_instance_initialization() {
         let (_temp_dir, store) = setup_multi_pool_bucket_test_env().await;
 
         let expected = "bucket metadata sys not initialized for this instance";
         let errors = [
             store.get_bucket_metadata("bucket").await.unwrap_err(),
+            store
+                .get_bucket_tags_for_policy("bucket")
+                .await
+                .expect_err("uninitialized metadata must deny tag lookup"),
             store.get_bucket_policy("bucket").await.unwrap_err(),
             store.get_bucket_policy_raw("bucket").await.unwrap_err(),
             store.restricts_public_bucket_access("bucket").await.unwrap_err(),
@@ -1724,6 +2259,64 @@ mod tests {
                 .await
                 .expect("metadata marker should be written");
         }
+    }
+
+    #[tokio::test]
+    async fn admin_bucket_discovery_preserves_completeness_and_scope() {
+        use crate::storage_api_contracts::admin::DiskSetSelector;
+        let (temp, store) = setup_bucket_quorum_test_env(&[2, 2], None).await;
+        let empty = store
+            .list_buckets_for_admin_heal(None)
+            .await
+            .expect("empty namespace enumeration");
+        assert!(empty.buckets.is_empty());
+        assert!(empty.topology_complete);
+        for disk in 0..2 {
+            tokio::fs::create_dir(temp.path().join(format!("pool0-disk{disk}/healthy-bucket")))
+                .await
+                .expect("healthy bucket");
+        }
+        tokio::fs::create_dir(temp.path().join("pool1-disk0/partial-bucket"))
+            .await
+            .expect("single surviving bucket directory");
+        let global = store
+            .list_buckets_for_admin_heal(None)
+            .await
+            .expect("online disk enumeration");
+        assert!(global.topology_complete, "every disk answered the candidate inventory");
+        assert_eq!(
+            global.buckets.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
+            ["healthy-bucket", "partial-bucket"]
+        );
+        let healthy = store
+            .list_buckets_for_admin_heal(Some(DiskSetSelector::new(0, 0)))
+            .await
+            .expect("healthy scope");
+        assert!(healthy.topology_complete);
+        assert_eq!(healthy.buckets.len(), 1);
+        assert_eq!(healthy.set_buckets.len(), 1);
+        let partial = store
+            .list_buckets_for_admin_heal(Some(DiskSetSelector::new(1, 0)))
+            .await
+            .expect("partial scope");
+        assert!(partial.topology_complete);
+        assert_eq!(partial.buckets[0].name, "partial-bucket");
+        let invalid = store
+            .list_buckets_for_admin_heal(Some(DiskSetSelector::new(0, 1)))
+            .await
+            .expect("unconfigured scope");
+        assert!(!invalid.topology_complete);
+        assert!(invalid.buckets.is_empty());
+        let offline = take_set_disks_offline(&store, &store.pools[1].disk_set[0], &[0]).await;
+        assert!(store.list_buckets_for_admin_heal(None).await.is_err(), "quorum errors must remain errors");
+        assert!(
+            store
+                .list_buckets_for_admin_heal(Some(DiskSetSelector::new(0, 0)))
+                .await
+                .expect("unrelated offline pool")
+                .topology_complete
+        );
+        restore_set_disks(&store, &store.pools[1].disk_set[0], offline).await;
     }
 
     #[test]
@@ -3047,6 +3640,79 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn metadata_startup_listing_uses_each_sets_read_quorum() {
+        for drives_per_pool in [vec![2], vec![3], vec![4], vec![6], vec![8], vec![4, 6]] {
+            let (_temp_dir, store) = setup_bucket_quorum_test_env(&drives_per_pool, None).await;
+            let bucket = "metadata-startup-read-quorum";
+            for pool in &store.pools {
+                pool.disk_set[0]
+                    .make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("healthy set should create the startup candidate");
+            }
+            let mut offline = Vec::new();
+            for (pool_index, &width) in drives_per_pool.iter().enumerate() {
+                let set = &store.pools[pool_index].disk_set[0];
+                let indexes = (width.div_ceil(2)..width).collect::<Vec<_>>();
+                offline.push(take_set_disks_offline(&store, set, &indexes).await);
+            }
+            let listing = store
+                .list_buckets_for_metadata_startup()
+                .await
+                .expect("startup must discover buckets at every set's read quorum");
+            assert_eq!(listing.len(), 1);
+            assert_eq!(listing[0].name, bucket);
+            if drives_per_pool.iter().any(|width| width % 2 == 0) {
+                let error = store
+                    .list_bucket_for_scanner(&BucketOptions::default())
+                    .await
+                    .expect_err("startup discovery must not weaken scanner quorum");
+                assert_eq!(error, StorageError::ErasureWriteQuorum);
+                let error = store
+                    .list_bucket(&BucketOptions {
+                        no_metadata: true,
+                        ..Default::default()
+                    })
+                    .await
+                    .expect_err("ordinary listing must retain its existing quorum");
+                assert_eq!(error, StorageError::ErasureWriteQuorum);
+            }
+            // A healthy earlier pool must not hide read-quorum loss in a later pool.
+            let last_pool = store.pools.len() - 1;
+            let set = &store.pools[last_pool].disk_set[0];
+            let extra = take_set_disks_offline(&store, set, &[0]).await;
+            let error = store
+                .list_buckets_for_metadata_startup()
+                .await
+                .expect_err("every set must retain read quorum for startup discovery");
+            assert_eq!(error, StorageError::ErasureReadQuorum);
+            restore_set_disks(&store, set, extra).await;
+            for (pool_index, disks) in offline.into_iter().enumerate() {
+                restore_set_disks(&store, &store.pools[pool_index].disk_set[0], disks).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn metadata_startup_listing_does_not_accept_single_disk_bucket_remnants() {
+        let (temp_dir, store) = setup_bucket_quorum_test_env(&[4], None).await;
+        let bucket = "incomplete-startup-bucket";
+        tokio::fs::create_dir(temp_dir.path().join("pool0-disk0").join(bucket))
+            .await
+            .expect("create one uncommitted directory remnant");
+        let set = &store.pools[0].disk_set[0];
+        let offline = take_set_disks_offline(&store, set, &[2, 3]).await;
+        let listing = store
+            .list_buckets_for_metadata_startup()
+            .await
+            .expect("two responsive disks satisfy discovery quorum");
+        assert!(listing.iter().all(|info| info.name != bucket));
+        restore_set_disks(&store, set, offline).await;
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn scanner_bucket_listing_unions_every_erasure_set() {
         let (_temp_dir, ecstore) = setup_multi_pool_bucket_test_env().await;
         let bucket = format!("second-pool-only-{}", Uuid::new_v4().simple());
@@ -3201,6 +3867,40 @@ mod tests {
         assert!(any_disk_path_exists(&disk_paths, bucket_deleted_marker_volume(&bucket)).await);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn bucket_delete_waits_for_table_publication_readers() {
+        let (_disk_paths, ecstore) = setup_bucket_delete_test_env().await;
+        let bucket = format!("bucket-delete-publication-{}", Uuid::new_v4().simple());
+        ecstore
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+
+        let publication_lock = ecstore
+            .new_ns_lock(&bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
+            .await
+            .expect("publication lock should be created");
+        let publication_reader = publication_lock
+            .get_read_lock(get_lock_acquire_timeout())
+            .await
+            .expect("publication reader should be acquired");
+
+        let delete_store = Arc::clone(&ecstore);
+        let mut delete = tokio::spawn(async move { delete_store.delete_bucket(&bucket, &DeleteBucketOptions::default()).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), &mut delete).await.is_err(),
+            "bucket deletion must remain behind the table publication reader"
+        );
+
+        drop(publication_reader);
+        tokio::time::timeout(Duration::from_secs(10), &mut delete)
+            .await
+            .expect("bucket deletion should proceed after publication reader release")
+            .expect("bucket deletion task should join")
+            .expect("empty bucket deletion should succeed");
+    }
+
     #[tokio::test]
     #[serial]
     async fn bucket_delete_mark_delete_rejects_non_empty_bucket_without_force() {
@@ -3223,6 +3923,116 @@ mod tests {
         assert!(matches!(err, StorageError::BucketNotEmpty(name) if name == bucket));
         assert!(any_disk_has_object_metadata(&disk_paths, &bucket).await);
         assert!(!any_disk_path_exists(&disk_paths, bucket_deleted_marker_volume(&bucket)).await);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn force_bucket_delete_preserves_object_lock_versions() {
+        let (_temp_dir, store) = setup_bucket_quorum_test_env(&[4], Some(2)).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("force-delete-worm-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create Object Lock bucket");
+        let until = (OffsetDateTime::now_utc() + time::Duration::days(365))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("format future retention date");
+        let written = store
+            .put_object(
+                &bucket,
+                "retained",
+                &mut PutObjReader::from_vec(b"retained bytes".to_vec()),
+                &ObjectOptions {
+                    versioned: true,
+                    user_defined: HashMap::from([
+                        ("x-amz-object-lock-mode".to_owned(), "COMPLIANCE".to_owned()),
+                        ("x-amz-object-lock-retain-until-date".to_owned(), until),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write retained object");
+        for operation in [SRBucketDeleteOp::NoOp, SRBucketDeleteOp::MarkDelete, SRBucketDeleteOp::Purge] {
+            let err = store
+                .delete_bucket(
+                    &bucket,
+                    &DeleteBucketOptions {
+                        force: true,
+                        srdelete_op: operation,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("force deletion must not bypass Object Lock");
+            assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)), "unexpected denial: {err}");
+            let info = store
+                .get_object_info(
+                    &bucket,
+                    "retained",
+                    &ObjectOptions {
+                        version_id: written.version_id.map(|version| version.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("retained version must survive the rejected bucket deletion");
+            assert_eq!(info.etag, written.etag);
+            assert_eq!(info.size, written.size);
+            assert_eq!(info.version_id, written.version_id);
+        }
+        metadata_sys::inject_object_lock_disk_read_error_in(&store.ctx, &bucket)
+            .await
+            .expect("inject authoritative metadata read failure");
+        let error = store
+            .delete_bucket(
+                &bucket,
+                &DeleteBucketOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("an unreadable Object Lock configuration must fail closed");
+        assert!(error.to_string().contains("injected Object Lock metadata disk read failure"));
+        let info = store
+            .get_object_info(&bucket, "retained", &ObjectOptions::default())
+            .await
+            .expect("metadata read failure must leave the retained object intact");
+        assert_eq!(info.version_id, written.version_id);
+
+        let unlocked = format!("force-delete-unlocked-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&unlocked, &MakeBucketOptions::default())
+            .await
+            .expect("create unlocked control bucket");
+        store
+            .put_object(
+                &unlocked,
+                "ordinary",
+                &mut PutObjReader::from_vec(b"ordinary bytes".to_vec()),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("write ordinary control object");
+        store
+            .delete_bucket(
+                &unlocked,
+                &DeleteBucketOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("force deletion must still work for an unlocked bucket");
     }
 
     #[tokio::test]

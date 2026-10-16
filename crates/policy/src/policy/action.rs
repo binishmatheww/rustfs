@@ -447,6 +447,10 @@ pub enum AdminAction {
     ServiceFreezeAdminAction,
     #[strum(serialize = "admin:ConfigUpdate")]
     ConfigUpdateAdminAction,
+    #[strum(serialize = "admin:TLSCertificatePublish")]
+    TLSCertificatePublishAdminAction,
+    #[strum(serialize = "admin:TLSCertificateStatus")]
+    TLSCertificateStatusAdminAction,
     #[strum(serialize = "admin:CreateUser")]
     CreateUserAdminAction,
     #[strum(serialize = "admin:DeleteUser")]
@@ -527,6 +531,9 @@ pub enum AdminAction {
     ImportBucketMetadataAction,
     #[strum(serialize = "admin:ExportBucketMetadata")]
     ExportBucketMetadataAction,
+    /// Reconcile metadata left after an operator removed all physical bucket volumes.
+    #[strum(serialize = "admin:RecoverOrphanedBucket")]
+    RecoverOrphanedBucketAction,
     #[strum(serialize = "admin:GetTableCatalog")]
     GetTableCatalogAction,
     #[strum(serialize = "admin:MigrateTableCatalog")]
@@ -643,6 +650,8 @@ impl AdminAction {
                 | AdminAction::ServiceStopAdminAction
                 | AdminAction::ServiceFreezeAdminAction
                 | AdminAction::ConfigUpdateAdminAction
+                | AdminAction::TLSCertificatePublishAdminAction
+                | AdminAction::TLSCertificateStatusAdminAction
                 | AdminAction::CreateUserAdminAction
                 | AdminAction::DeleteUserAdminAction
                 | AdminAction::ListUsersAdminAction
@@ -682,6 +691,7 @@ impl AdminAction {
                 | AdminAction::GetReplicationMetricsAction
                 | AdminAction::ImportBucketMetadataAction
                 | AdminAction::ExportBucketMetadataAction
+                | AdminAction::RecoverOrphanedBucketAction
                 | AdminAction::GetTableCatalogAction
                 | AdminAction::MigrateTableCatalogAction
                 | AdminAction::GetTableBucketAction
@@ -910,6 +920,14 @@ mod tests {
     }
 
     #[test]
+    fn orphaned_bucket_recovery_admin_action_is_valid() {
+        let action = AdminAction::try_from("admin:RecoverOrphanedBucket").expect("parse recovery action");
+        assert_eq!(action, AdminAction::RecoverOrphanedBucketAction);
+        assert!(action.is_valid());
+        assert_eq!(<&str>::from(action), "admin:RecoverOrphanedBucket");
+    }
+
+    #[test]
     fn test_bucket_on_demand_migration_admin_actions_are_valid() {
         let set_action = AdminAction::try_from("admin:SetBucketOnDemandMigration").expect("parse set action");
         let get_action = AdminAction::try_from("admin:GetBucketOnDemandMigration").expect("parse get action");
@@ -927,6 +945,34 @@ mod tests {
         assert!(all_admin.is_match(&Action::AdminAction(set_action)));
         assert!(all_admin.is_match(&Action::AdminAction(get_action)));
         assert!(!Action::AdminAction(get_action).is_match(&Action::AdminAction(set_action)));
+    }
+
+    #[test]
+    fn tls_certificate_actions_preserve_least_privilege() {
+        let publish = Action::try_from("admin:TLSCertificatePublish").expect("parse certificate publish action");
+        let status = Action::try_from("admin:TLSCertificateStatus").expect("parse certificate status action");
+        for (action, name) in [
+            (&publish, "admin:TLSCertificatePublish"),
+            (&status, "admin:TLSCertificateStatus"),
+        ] {
+            let Action::AdminAction(admin_action) = action else {
+                panic!("certificate policy must use an admin action");
+            };
+            assert!(admin_action.is_valid());
+            assert_eq!(serde_json::to_string(action).expect("serialize action"), format!("\"{name}\""));
+        }
+        assert!(!status.is_match(&publish));
+        assert!(!publish.is_match(&status));
+        let config = Action::AdminAction(AdminAction::ConfigUpdateAdminAction);
+        let server_info = Action::AdminAction(AdminAction::ServerInfoAdminAction);
+        assert!(!config.is_match(&publish));
+        assert!(!server_info.is_match(&publish));
+        let admin = Action::AdminAction(AdminAction::AllAdminActions);
+        assert!(admin.is_match(&publish));
+        assert!(admin.is_match(&status));
+        let s3 = Action::try_from("s3:*").expect("parse S3 wildcard");
+        assert!(!s3.is_match(&publish));
+        assert!(!s3.is_match(&status));
     }
 
     #[test]

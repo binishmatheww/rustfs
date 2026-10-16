@@ -76,6 +76,14 @@ const REPLACEMENT_RECOVERY_CORRUPTION_PREFIX: &str = "replacement recovery corru
 /// latest. Discard their cursor and progress and scan from the beginning.
 const CURRENT_RESUME_SCHEMA: u32 = 7;
 
+fn dangling_delete_deadline_is_representable(deadline: u64) -> bool {
+    let Some(not_before) = UNIX_EPOCH.checked_add(Duration::from_secs(deadline)) else {
+        return false;
+    };
+    let remaining = not_before.duration_since(SystemTime::now()).unwrap_or_default();
+    Instant::now().checked_add(remaining).is_some()
+}
+
 /// Persistence throttle for per-object bookkeeping: flush after this many
 /// buffered mutations or once the interval elapses, whichever comes first.
 /// Object heal is idempotent, so a crash re-heals at most one throttle window.
@@ -313,6 +321,10 @@ pub struct ResumeState {
     /// the version listing. `None` means "start from the beginning".
     #[serde(default)]
     pub resume_cursor: Option<String>,
+    /// Ordinary coverage overlapped unresolved hidden delete recovery. The
+    /// scan must restart after recovery settles, even if another worker settled it.
+    #[serde(default)]
+    pub delete_recovery_rescan_pending: bool,
     /// task id
     pub task_id: String,
     /// task type
@@ -356,11 +368,20 @@ pub struct ResumeState {
     /// and may receive one bounded compatibility re-arm.
     #[serde(default)]
     pub replacement_legacy_retry_compatibility_done: bool,
+    /// New generations cannot consume the one-shot compatibility handoff for
+    /// a pre-format intent stranded by historical rebalance topology. Missing
+    /// fields in older schema-seven snapshots remain eligible for validation.
+    #[serde(default)]
+    pub replacement_preformat_handoff_retry_done: bool,
     /// The current pass was rewound because the replacement mount was not
     /// ready.  Task-level error persistence must not turn this readiness wait
     /// back into a consumed retry attempt.
     #[serde(default)]
     pub replacement_retry_waiting_for_target: bool,
+    /// A pure dangling-delete grace pass waits until this UNIX deadline
+    /// without consuming the generation's failure retry budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dangling_delete_retry_not_before: Option<u64>,
     /// start time
     pub start_time: u64,
     /// last update time
@@ -422,6 +443,7 @@ impl ResumeState {
         Self {
             schema_version: CURRENT_RESUME_SCHEMA,
             resume_cursor: None,
+            delete_recovery_rescan_pending: false,
             task_id,
             task_type,
             set_disk_id,
@@ -438,7 +460,9 @@ impl ResumeState {
             replacement_legacy_import: None,
             replacement_legacy_successor: None,
             replacement_legacy_retry_compatibility_done: false,
+            replacement_preformat_handoff_retry_done: false,
             replacement_retry_waiting_for_target: false,
+            dangling_delete_retry_not_before: None,
             start_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             last_update: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             completed: false,
@@ -482,6 +506,7 @@ impl ResumeState {
         // New generations already use readiness-aware persistence and must
         // never enter the one-shot compatibility path for legacy snapshots.
         state.replacement_legacy_retry_compatibility_done = true;
+        state.replacement_preformat_handoff_retry_done = true;
         state
     }
 
@@ -557,6 +582,7 @@ impl ResumeState {
 
     pub fn mark_completed(&mut self) {
         self.completed = true;
+        self.dangling_delete_retry_not_before = None;
         self.last_update = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     }
 
@@ -868,6 +894,14 @@ impl ResumeManager {
                 message: "Resume state task id does not match filename".to_string(),
             });
         }
+        if state
+            .dangling_delete_retry_not_before
+            .is_some_and(|deadline| !dangling_delete_deadline_is_representable(deadline))
+        {
+            return Err(Error::TaskExecutionFailed {
+                message: "Resume state has an unrepresentable dangling-delete grace deadline".to_string(),
+            });
+        }
 
         // Older progress cannot prove that the exact null slot was inspected.
         if state.schema_version > CURRENT_RESUME_SCHEMA {
@@ -916,6 +950,7 @@ impl ResumeManager {
             state.baseline_generation = None;
             state.baseline_known = false;
             state.counter_unknown = false;
+            state.dangling_delete_retry_not_before = None;
             state.completed = false;
             state.pending_buckets.append(&mut state.completed_buckets);
             state.pending_buckets.sort();
@@ -1023,6 +1058,30 @@ impl ResumeManager {
     /// get current state
     pub async fn get_state(&self) -> ResumeState {
         self.state.read().await.clone()
+    }
+
+    pub(crate) async fn set_delete_recovery_rescan_pending(&self, pending: bool) -> Result<()> {
+        let mut state = self.state.write().await;
+        let previous = state.delete_recovery_rescan_pending;
+        if previous == pending {
+            return Ok(());
+        }
+        state.delete_recovery_rescan_pending = pending;
+        drop(state);
+        if let Err(error) = self.save_state_strict().await {
+            self.state.write().await.delete_recovery_rescan_pending = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Keep the coverage obligation until the companion checkpoint rewind is durable.
+    pub(crate) async fn restart_scan_after_delete_recovery(&self) -> Result<()> {
+        let mut state = self.state.write().await;
+        state.delete_recovery_rescan_pending = true;
+        state.reset_for_retry();
+        drop(state);
+        self.save_state_strict().await
     }
 
     /// update progress
@@ -1149,11 +1208,32 @@ impl ResumeManager {
             return Ok(false);
         }
         state.replacement_retry_waiting_for_target = false;
+        state.dangling_delete_retry_not_before = None;
         state.increment_retry();
         state.reset_for_retry();
         drop(state);
         self.save_state().await?;
         Ok(true)
+    }
+
+    /// Rewind a pure grace-wait pass without spending a failure retry. The
+    /// durable deadline also fences checkpoint reset recovery after a crash.
+    pub(crate) async fn defer_retry_until_dangling_delete_ready(&self, retry_not_before: u64) -> Result<()> {
+        if !dangling_delete_deadline_is_representable(retry_not_before) {
+            return Err(Error::TaskExecutionFailed {
+                message: "Cannot defer to an unrepresentable dangling-delete grace deadline".to_string(),
+            });
+        }
+        let mut state = self.state.write().await;
+        if !state.can_retry() {
+            return Err(Error::ReplacementRetryBudgetExhausted);
+        }
+        state.replacement_retry_waiting_for_target = false;
+        state.dangling_delete_retry_not_before = Some(retry_not_before);
+        state.reset_for_retry();
+        state.error_message = Some(Error::DanglingDeleteDeferred { retry_not_before }.to_string());
+        drop(state);
+        self.save_state_strict().await
     }
 
     /// Rewind one replacement pass while its target is not ready, without
@@ -1177,6 +1257,7 @@ impl ResumeManager {
             state.replacement_legacy_retry_compatibility_done = true;
         }
         state.replacement_retry_waiting_for_target = true;
+        state.dangling_delete_retry_not_before = None;
         state.reset_for_retry();
         state.error_message = Some(REPLACEMENT_TARGET_READINESS_DEFERRED.to_string());
         drop(state);
@@ -1197,6 +1278,9 @@ impl ResumeManager {
         }
         if state.max_retries == 0 {
             return Ok(false);
+        }
+        if self.rearm_preformat_handoff_retry_if_needed(storage).await? {
+            return Ok(true);
         }
         let legacy_rearm = replacement_retry_is_legacy_transient_skip(&state);
         let ready = storage

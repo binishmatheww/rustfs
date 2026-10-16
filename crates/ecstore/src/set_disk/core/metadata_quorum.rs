@@ -29,6 +29,27 @@ use crate::disk::error_reduce::OBJECT_OP_IGNORED_ERRS;
 use crate::set_disk::file_info_is_valid_for_metadata;
 use rustfs_filemeta::FileInfo;
 
+/// One disk's observation. Pending is neither a successful vote nor an offline
+/// disk: the scheduler may not have issued this slot or may still be waiting.
+// Option<Result<...>> keeps FileInfo inline without a per-response Box.
+// None is pending; Some(Ok(_)) is success; Some(Err(_)) retains a disk error.
+pub(in crate::set_disk) type MetadataDiskResult = Option<crate::disk::error::Result<FileInfo>>;
+
+#[derive(Debug)]
+pub(in crate::set_disk) struct MetadataDiskObservation {
+    pub(in crate::set_disk) disk_index: usize,
+    pub(in crate::set_disk) result: MetadataDiskResult,
+}
+
+impl MetadataDiskObservation {
+    pub(in crate::set_disk) fn file_info(&self) -> Option<&FileInfo> {
+        match &self.result {
+            Some(Ok(metadata)) => Some(metadata),
+            None | Some(Err(_)) => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::set_disk) struct MetadataEarlyStopDecision {
     pub(in crate::set_disk) reason: &'static str,
@@ -59,6 +80,14 @@ pub(in crate::set_disk) struct MetadataQuorumAccumulator {
 }
 
 impl MetadataQuorumAccumulator {
+    pub(in crate::set_disk) fn observe(&mut self, observation: &MetadataDiskObservation) {
+        match &observation.result {
+            None => {}
+            Some(Ok(metadata)) => self.observe_file_info_at(observation.disk_index, metadata),
+            Some(Err(error)) => self.observe_error(error),
+        }
+    }
+
     pub(in crate::set_disk) fn new(total_disks: usize, default_parity_count: usize, allow_early_stop: bool) -> Self {
         Self {
             total_disks,
@@ -86,6 +115,7 @@ impl MetadataQuorumAccumulator {
         self
     }
 
+    #[cfg(test)]
     pub(in crate::set_disk) fn observe_file_info(&mut self, file_info: &FileInfo) {
         self.observe_file_info_with_index(None, file_info);
     }
@@ -382,4 +412,283 @@ pub(in crate::set_disk) fn metadata_early_stop_candidate_matches(left: &FileInfo
 
 pub(in crate::set_disk) fn is_metadata_fanout_ignored_error(err: &DiskError) -> bool {
     OBJECT_OP_IGNORED_ERRS.iter().any(|ignored| ignored == err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::set_disk::SetDisks;
+    use time::OffsetDateTime;
+    use uuid::Uuid;
+
+    fn payload(disk_index: usize) -> FileInfo {
+        let mut metadata = FileInfo::new("object", 2, 2);
+        metadata.volume = "bucket".to_string();
+        metadata.name = "object".to_string();
+        metadata.size = 1;
+        metadata.mod_time = Some(OffsetDateTime::UNIX_EPOCH);
+        metadata.data_dir = Some(Uuid::from_u128(1));
+        metadata.erasure.index = metadata.erasure.distribution[disk_index];
+        metadata.metadata.insert("etag".to_string(), "etag".to_string());
+        metadata.add_object_part(1, "etag".to_string(), 1, None, 1, None, None);
+        assert!(file_info_is_valid_for_metadata(&metadata), "the observation corpus needs a valid payload");
+        metadata
+    }
+
+    fn observation(disk_index: usize, state: usize) -> MetadataDiskObservation {
+        MetadataDiskObservation {
+            disk_index,
+            result: match state {
+                0 => Some(Ok(payload(disk_index))),
+                1 => Some(Err(DiskError::FileNotFound)),
+                2 => Some(Err(DiskError::FileCorrupt)),
+                3 => Some(Err(DiskError::DiskNotFound)),
+                4 => None,
+                _ => panic!("unexpected test state"),
+            },
+        }
+    }
+
+    fn assert_same_reduction(typed: &MetadataQuorumAccumulator, legacy: &MetadataQuorumAccumulator) {
+        assert_eq!(typed.early_stop_decision(), legacy.early_stop_decision());
+        assert_eq!(typed.version_early_stop_decision(), legacy.version_early_stop_decision());
+        assert_eq!(typed.final_miss_reason(), legacy.final_miss_reason());
+        assert_eq!(typed.valid_responses, legacy.valid_responses);
+        assert_eq!(typed.not_found_responses, legacy.not_found_responses);
+        assert_eq!(typed.version_not_found_responses, legacy.version_not_found_responses);
+        assert_eq!(typed.ignored_errors, legacy.ignored_errors);
+        assert_eq!(typed.hard_errors, legacy.hard_errors);
+        assert_eq!(typed.candidate_votes, legacy.candidate_votes);
+        assert_eq!(typed.candidate_shard_mask, legacy.candidate_shard_mask);
+        assert_eq!(typed.matching_version_votes, legacy.matching_version_votes);
+        assert_eq!(typed.delete_marker_votes, legacy.delete_marker_votes);
+        assert_eq!(typed.conflicting_metadata, legacy.conflicting_metadata);
+        assert_eq!(
+            typed.candidate.as_ref().map(SetDisks::file_info_quorum_hash),
+            legacy.candidate.as_ref().map(SetDisks::file_info_quorum_hash)
+        );
+    }
+
+    fn observe_legacy(accumulator: &mut MetadataQuorumAccumulator, observation: &MetadataDiskObservation) {
+        match &observation.result {
+            None => {}
+            Some(Ok(metadata)) => accumulator.observe_file_info_at(observation.disk_index, metadata),
+            Some(Err(error)) => accumulator.observe_error(error),
+        }
+    }
+
+    #[test]
+    fn metadata_observation_all_four_slot_states_and_arrival_orders_preserve_reduction() {
+        let permutations = (0..4)
+            .flat_map(|a| (0..4).filter(move |b| *b != a).map(move |b| (a, b)))
+            .flat_map(|(a, b)| (0..4).filter(move |c| *c != a && *c != b).map(move |c| (a, b, c)))
+            .map(|(a, b, c)| [a, b, c, 6 - a - b - c])
+            .collect::<Vec<_>>();
+        assert_eq!(permutations.len(), 24);
+        // 5^4 states and all 4! arrivals, both with early-stop enabled and disabled.
+        for encoded in 0..625usize {
+            let states = [encoded % 5, encoded / 5 % 5, encoded / 25 % 5, encoded / 125 % 5];
+            let inputs = std::array::from_fn::<_, 4, _>(|index| observation(index, states[index]));
+            for enabled in [false, true] {
+                for order in &permutations {
+                    let mut typed = MetadataQuorumAccumulator::new(4, 2, enabled);
+                    let mut legacy = MetadataQuorumAccumulator::new(4, 2, enabled);
+                    for &index in order {
+                        typed.observe(&inputs[index]);
+                        observe_legacy(&mut legacy, &inputs[index]);
+                        assert_same_reduction(&typed, &legacy);
+                    }
+                    assert_eq!(typed.valid_responses, states.iter().filter(|&&state| state == 0).count());
+                    assert_eq!(typed.not_found_responses, states.iter().filter(|&&state| state == 1).count());
+                    assert_eq!(typed.hard_errors, states.iter().filter(|&&state| state == 2).count());
+                    assert_eq!(typed.ignored_errors, states.iter().filter(|&&state| state == 3).count());
+                    let expected_early_stop =
+                        enabled && typed.valid_responses >= 3 && !states.iter().any(|&state| state == 1 || state == 2);
+                    assert_eq!(
+                        typed.early_stop_decision().is_some(),
+                        expected_early_stop,
+                        "states={states:?}, order={order:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_observation_mixed_current_identity_arrivals_preserve_selection() {
+        let permutations = (0..4)
+            .flat_map(|a| (0..4).filter(move |b| *b != a).map(move |b| (a, b)))
+            .flat_map(|(a, b)| (0..4).filter(move |c| *c != a && *c != b).map(move |c| (a, b, c)))
+            .map(|(a, b, c)| [a, b, c, 6 - a - b - c])
+            .collect::<Vec<_>>();
+        assert_eq!(permutations.len(), 24);
+
+        for (case, newer_version) in [("newer-current-version", true), ("same-time-different-directory", false)] {
+            let metadata = std::array::from_fn::<_, 4, _>(|index| {
+                let mut file_info = payload(index);
+                file_info.version_id = Some(Uuid::from_u128(if index > 0 && newer_version { 11 } else { 10 }));
+                file_info.is_latest = true;
+                if index > 0 {
+                    file_info.data_dir = Some(Uuid::from_u128(2));
+                    if newer_version {
+                        file_info.mod_time = Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1));
+                    }
+                }
+                assert!(file_info_is_valid_for_metadata(&file_info), "case={case}, disk={index}");
+                file_info
+            });
+            let expected_current = &metadata[1];
+            let expected_hash = SetDisks::file_info_quorum_hash(expected_current);
+            assert_ne!(SetDisks::file_info_quorum_hash(&metadata[0]), expected_hash);
+
+            for enabled in [false, true] {
+                for order in &permutations {
+                    let mut slots = std::array::from_fn::<_, 4, _>(|index| observation(index, 4));
+                    let mut typed = MetadataQuorumAccumulator::new(4, 2, enabled);
+                    let mut legacy = MetadataQuorumAccumulator::new(4, 2, enabled);
+                    for slot in &slots {
+                        typed.observe(slot);
+                        observe_legacy(&mut legacy, slot);
+                    }
+                    assert_same_reduction(&typed, &legacy);
+                    assert_eq!(typed.valid_responses, 0, "pending slots cannot supply votes");
+
+                    let mut old_seen = false;
+                    let mut current_votes = 0;
+                    for (prefix, &index) in order.iter().enumerate() {
+                        slots[index].result = Some(Ok(metadata[index].clone()));
+                        typed.observe(&slots[index]);
+                        observe_legacy(&mut legacy, &slots[index]);
+                        assert_same_reduction(&typed, &legacy);
+                        if index == 0 {
+                            old_seen = true;
+                        } else {
+                            current_votes += 1;
+                        }
+
+                        // A+B+B must wait for pending B; three B responses may
+                        // finish early only before the conflicting A arrives.
+                        let expected_decision = if enabled && !old_seen && current_votes == 3 {
+                            Some(MetadataEarlyStopDecision {
+                                reason: GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM,
+                            })
+                        } else {
+                            None
+                        };
+                        assert_eq!(
+                            typed.early_stop_decision(),
+                            expected_decision,
+                            "case={case}, enabled={enabled}, order={order:?}, prefix={prefix}"
+                        );
+                        assert_eq!(typed.valid_responses, prefix + 1);
+                        assert_eq!(typed.conflicting_metadata, old_seen && current_votes > 0);
+                        assert_eq!(typed.version_early_stop_decision(), None, "current reads do not request a version ID");
+                        if expected_decision.is_some() {
+                            assert_eq!(
+                                SetDisks::file_info_quorum_hash(
+                                    typed.candidate.as_ref().expect("three B votes need a candidate")
+                                ),
+                                expected_hash
+                            );
+                        }
+                    }
+
+                    let completed_metadata = slots
+                        .iter()
+                        .map(|slot| slot.file_info().expect("every disk must have arrived").clone())
+                        .collect::<Vec<_>>();
+                    let (_, selected, selection_quorum) =
+                        SetDisks::select_valid_fileinfo(&vec![None; 4], &completed_metadata, &vec![None; 4], "", 2, 3)
+                            .expect("three matching B disks must select the current identity");
+                    assert_eq!(selection_quorum, 3);
+                    assert_eq!(selected.version_id, expected_current.version_id);
+                    assert_eq!(selected.mod_time, expected_current.mod_time);
+                    assert_eq!(selected.data_dir, expected_current.data_dir);
+                    assert_eq!(SetDisks::file_info_quorum_hash(&selected), expected_hash);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_observation_pending_newer_version_and_same_time_different_directory_force_full_wait() {
+        let mut accumulator = MetadataQuorumAccumulator::new(4, 2, true);
+        for index in 0..2 {
+            accumulator.observe(&observation(index, 0));
+        }
+        accumulator.observe(&observation(2, 4));
+        assert_eq!(accumulator.candidate_votes, 2, "an outstanding response cannot supply the deciding vote");
+        assert_eq!(accumulator.early_stop_decision(), None);
+
+        let mut newer = payload(2);
+        newer.mod_time = Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1));
+        accumulator.observe(&MetadataDiskObservation {
+            disk_index: 2,
+            result: Some(Ok(newer)),
+        });
+        assert!(accumulator.conflicting_metadata);
+        assert_eq!(accumulator.early_stop_decision(), None);
+
+        let mut same_time_different_directory = payload(3);
+        same_time_different_directory.data_dir = Some(Uuid::from_u128(2));
+        accumulator.observe(&MetadataDiskObservation {
+            disk_index: 3,
+            result: Some(Ok(same_time_different_directory)),
+        });
+        assert_eq!(accumulator.early_stop_decision(), None);
+    }
+
+    #[test]
+    fn metadata_observation_duplicate_shard_cannot_supply_a_read_reserve() {
+        let mut accumulator = MetadataQuorumAccumulator::new(4, 2, true);
+        let first = payload(0);
+        for disk_index in 0..3 {
+            accumulator.observe(&MetadataDiskObservation {
+                disk_index,
+                result: Some(Ok(first.clone())),
+            });
+        }
+        assert_eq!(accumulator.candidate_votes, 3);
+        assert!(
+            !accumulator.candidate_has_read_reserve(),
+            "copied erasure indexes cannot supply independent data shards"
+        );
+    }
+
+    #[test]
+    fn metadata_observation_null_versions_markers_and_invalid_success_keep_their_meaning() {
+        let mut null_version = MetadataQuorumAccumulator::new(4, 2, true);
+        for index in 0..3 {
+            null_version.observe(&observation(index, 0));
+        }
+        assert!(null_version.early_stop_decision().is_some());
+        assert_eq!(null_version.matching_version_votes, 0);
+
+        let mut marker = MetadataQuorumAccumulator::new(4, 2, true);
+        for disk_index in 0..3 {
+            let metadata = FileInfo {
+                volume: "bucket".to_string(),
+                name: "object".to_string(),
+                deleted: true,
+                mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1)),
+                ..Default::default()
+            };
+            assert!(metadata.is_canonical_delete_marker(), "the null marker fixture must reach marker voting");
+            marker.observe(&MetadataDiskObservation {
+                disk_index,
+                result: Some(Ok(metadata)),
+            });
+        }
+        assert_eq!(marker.delete_marker_votes, 3);
+        assert!(marker.early_stop_decision().is_some());
+
+        let mut invalid = MetadataQuorumAccumulator::new(4, 2, true);
+        invalid.observe(&MetadataDiskObservation {
+            disk_index: 0,
+            result: Some(Ok(FileInfo::default())),
+        });
+        assert_eq!(invalid.valid_responses, 0);
+        assert_eq!(invalid.hard_errors, 1);
+        assert_eq!(invalid.early_stop_decision(), None);
+    }
 }

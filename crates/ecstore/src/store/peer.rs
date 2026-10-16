@@ -18,6 +18,11 @@ use crate::disk::error::{DiskError, Result as DiskResult};
 use crate::disk::{DeleteOptions, Disk, RenameDataGuards, RenameDataResp};
 use crate::runtime::instance::{InstanceContext, NamespaceCommitGuard};
 use crate::runtime::sources as runtime_sources;
+use rustfs_io_metrics::{
+    PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_ADMIT, PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_LOCAL_RENAME,
+    PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_LOOKUP, PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_OVERHEAD,
+    PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_TOTAL,
+};
 use tracing::{debug, error};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -80,6 +85,13 @@ fn validate_bootstrap_volume(volume: &str) -> DiskResult<()> {
 }
 
 impl ECStore {
+    /// Resolve a quota lease against this request's captured storage instance.
+    pub async fn quota_mutation_fence_disk(&self, disk_ref: &str) -> DiskResult<DiskStore> {
+        let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
+        let _owner = admit_local_disk(&self.ctx, &disk, id, false).await?;
+        Ok(disk)
+    }
+
     pub async fn write_local_metadata_at_incarnation(
         self: &Arc<Self>,
         disk_ref: &str,
@@ -232,7 +244,7 @@ impl ECStore {
     ) -> DiskResult<RenameDataResp> {
         let external_guard: Option<Arc<dyn Send + Sync>> = if let Some(token) = scanner_token {
             Some(Arc::new(
-                self.acquire_scanner_publication_lease_guard(token)
+                self.acquire_scanner_publication_lease_guard_for_rename(token, destination.0, destination.1)
                     .await
                     .map_err(|err| DiskError::other(err.to_string()))?,
             ))
@@ -331,15 +343,38 @@ async fn rename_local_data_with_ctx(
     destination: (&str, &str),
     mut guards: RenameDataGuards,
 ) -> DiskResult<RenameDataResp> {
+    let handler_started = rustfs_io_metrics::put_stage_timer();
+    let lookup_started = rustfs_io_metrics::put_stage_timer();
     let (disk, disk_id) = local_disk_candidate(ctx, disk_ref).await?;
+    let lookup_ms = lookup_started.map(|started| started.elapsed().as_secs_f64() * 1000.0);
+    if let Some(duration_ms) = lookup_ms {
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_LOOKUP, duration_ms);
+    }
     let mutates_namespace = !is_meta_bucketname(source.0) || !is_meta_bucketname(destination.0);
+    let admit_started = rustfs_io_metrics::put_stage_timer();
     let owner = admit_local_disk(ctx, &disk, disk_id, mutates_namespace).await?;
+    let admit_ms = admit_started.map(|started| started.elapsed().as_secs_f64() * 1000.0);
+    if let Some(duration_ms) = admit_ms {
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_ADMIT, duration_ms);
+    }
     guards.namespace_owner = owner.as_ref().map(|owner| owner.clone() as Arc<dyn Send + Sync>);
+    let local_rename_started = rustfs_io_metrics::put_stage_timer();
     let result = disk
         .rename_data_borrowed_with_fence_observed(source.0, source.1, fi, destination.0, destination.1, guards)
         .await
         .result;
+    let local_rename_ms = local_rename_started.map(|started| started.elapsed().as_secs_f64() * 1000.0);
+    if let Some(duration_ms) = local_rename_ms {
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_LOCAL_RENAME, duration_ms);
+    }
     drop(owner);
+    if let Some(handler_started) = handler_started {
+        let handler_ms = handler_started.elapsed().as_secs_f64() * 1000.0;
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_TOTAL, handler_ms);
+        let child_ms = lookup_ms.unwrap_or(0.0) + admit_ms.unwrap_or(0.0) + local_rename_ms.unwrap_or(0.0);
+        let overhead_ms = (handler_ms - child_ms).max(0.0);
+        rustfs_io_metrics::record_put_object_stage_duration(PUT_STAGE_SET_DISK_RENAME_REMOTE_HANDLER_OVERHEAD, overhead_ms);
+    }
     result
 }
 
@@ -1192,6 +1227,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observational_lease_renames_only_the_observed_usage_object() {
+        let ctx = Arc::new(InstanceContext::new());
+        let root = tempfile::tempdir().expect("target root");
+        let disk = target_disk(&ctx, root.path(), Uuid::new_v4()).await;
+        let store = super::super::tests::build_store_with_ctx(ctx.clone());
+        let disk_ref = disk.endpoint().to_string();
+        let volume = crate::disk::RUSTFS_META_BUCKET;
+        let observed_path = format!(
+            "{}/{}",
+            crate::disk::BUCKET_META_PREFIX,
+            rustfs_data_usage::DATA_USAGE_OBSERVED_OBJECT_NAME
+        );
+        let source_path = format!("{}/.staged-observation", crate::disk::BUCKET_META_PREFIX);
+        let fi = target_file_info(&observed_path, Uuid::new_v4(), b"non-authoritative");
+        seed_target(&disk, volume, &source_path, fi.clone()).await;
+
+        let pending = ctx.begin_namespace_commit();
+        let (token, generation) = store
+            .acquire_scanner_publication_lease_with_purpose(0, crate::runtime::instance::SCANNER_PUBLICATION_LEASE_TTL, true)
+            .await
+            .expect("observational lease should permit a pending namespace commit");
+        let error = store
+            .rename_local_data(&disk_ref, (volume, &source_path), &fi, (volume, "buckets/.usage.v2.json"), Some(token))
+            .await
+            .expect_err("observational token must not authorize the authoritative usage path");
+        assert!(error.to_string().contains("observed usage publication"));
+        assert!(root.path().join(volume).join(&source_path).join("xl.meta").exists());
+
+        store
+            .rename_local_data(&disk_ref, (volume, &source_path), &fi, (volume, &observed_path), Some(token))
+            .await
+            .expect("observational token may rename only the observed usage key");
+        assert!(
+            store
+                .validate_scanner_publication_lease_with_purpose(token, generation, true)
+                .await
+                .is_ok(),
+            "namespace commits do not invalidate the movement-only observation lease"
+        );
+        let wrong_purpose = store
+            .validate_scanner_publication_lease_with_purpose(token, generation, false)
+            .await
+            .expect_err("the same token must not validate as authoritative");
+        assert!(wrong_purpose.to_string().contains("purpose"));
+        drop(pending);
+        assert!(store.release_scanner_publication_lease(token).await);
+        let observed = disk
+            .read_version(
+                volume,
+                volume,
+                &observed_path,
+                &fi.version_id.expect("fixture version").to_string(),
+                &crate::disk::ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("observed metadata should be present");
+        assert_eq!(observed.data.as_deref(), Some(&b"non-authoritative"[..]));
+    }
+
+    #[tokio::test]
     async fn completed_namespace_commit_rejects_stale_scanner_target_admission() {
         use futures::FutureExt;
         use std::time::{Duration, Instant};
@@ -1491,7 +1589,11 @@ mod tests {
             );
             assert_eq!(
                 ctx.scanner_publication_lease_generations(old_token).await,
-                Some((movement_generation, namespace_generation)),
+                Some((
+                    movement_generation,
+                    Some(namespace_generation),
+                    crate::runtime::instance::ScannerPublicationLeasePurpose::Authoritative,
+                )),
                 "rejection must not refresh or discard the old lease"
             );
             let (fresh_token, fresh_generation) = store
@@ -1602,7 +1704,9 @@ mod tests {
     #[serial_test::serial]
     async fn target_ordinary_timeout_keeps_its_physical_namespace_owner() {
         use crate::disk::os::prepared_publication_test_hooks as hooks;
-        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("1"))], async {
+        // Allow real fixture I/O to finish under load. Expire the operation
+        // with virtual time only after its physical publication is paused.
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("60"))], async {
             let ctx = Arc::new(InstanceContext::new());
             let store = super::super::tests::build_store_with_ctx(ctx.clone());
             let root = tempfile::tempdir().expect("root");
@@ -1636,7 +1740,7 @@ mod tests {
             .await
             .expect("bounded entry");
             tokio::time::pause();
-            tokio::time::advance(std::time::Duration::from_secs(2)).await;
+            tokio::time::advance(std::time::Duration::from_secs(61)).await;
             tokio::time::resume();
             let result = tokio::time::timeout(std::time::Duration::from_secs(5), &mut rename)
                 .await

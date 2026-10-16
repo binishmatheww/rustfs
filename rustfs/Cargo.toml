@@ -77,6 +77,11 @@ rio-v2 = ["rustfs-ecstore/rio-v2"]
 pyroscope = ["rustfs-obs/pyroscope", "dep:pyroscope", "dep:object", "dep:symbolic-demangle"]
 # Tokio runtime telemetry. Requires `--cfg tokio_unstable`; use `make build-profiling`.
 dial9 = ["rustfs-obs/dial9"]
+# Diagnostic-only Rust GlobalAlloc live-byte accounting; adds per-allocation atomic updates.
+diagnostic-allocator-live = []
+# Diagnostic-only S3-operation attribution for internode ReadVersion and list-walker metrics.
+diagnostic-read-version-caller = ["rustfs-ecstore/diagnostic-read-version-caller", "rustfs-io-metrics/diagnostic-read-version-caller", "rustfs-scanner/diagnostic-read-version-caller"]
+http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn"]
 hotpath = [
     "hotpath/hotpath",
     "hotpath/tokio",
@@ -300,6 +305,9 @@ tokio-util = { workspace = true, features = ["io", "compat", "time"] }
 tonic = { workspace = true, features = ["gzip", "deflate"] }
 tower = { workspace = true, features = ["timeout"] }
 tower-http = { workspace = true, features = ["trace", "compression-full", "cors", "catch-panic", "timeout", "limit", "request-id", "add-extension"] }
+h3 = { workspace = true, optional = true }
+h3-quinn = { workspace = true, optional = true }
+quinn = { workspace = true, optional = true }
 
 # Serialization and Data Formats
 apache-avro = { workspace = true }
@@ -385,6 +393,7 @@ symbolic-demangle = { version = "=13.9.0", default-features = false, features = 
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4", "v5", "fast-rng", "macro-diagnostics"] }
+rustfs-iam = { workspace = true, features = ["test-util"] }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
 aws-config = { workspace = true }

@@ -294,7 +294,8 @@ impl ScannerIOCache for SetDisks {
             };
             cache.info.last_update = Some(now);
             cache.info.snapshot_complete = true;
-            cache.info.scan_execution_digest = Some(execution_digest);
+            let replication_execution = super::cache::scanner_replication_execution_digest(execution_digest, &cache);
+            cache.info.scan_execution_digest = Some(replication_execution);
             cache.info.segment_invalidation_proof = completed_segment_invalidation_proof;
             cache.info.lkg_snapshot_complete = false;
             cache.info.lkg_next_cycle = None;
@@ -469,21 +470,34 @@ impl ScannerIOCache for SetDisks {
                 "Scanner set assigned remote disks without namespace scanner support to coordinator-driven workers"
             );
         }
-        let disk_scan_limit = scanner_budgeted_concurrency_limit(
-            scanner_max_concurrent_disk_scans(workers.len()),
-            budget.requires_serial_progress_accounting(),
-        );
+        let online_disks = workers.len();
+        let walkers_per_disk = crate::runtime_config::scanner_walkers_per_disk_configured();
+        let walkers = namespace_scanner_walkers(workers, walkers_per_disk, |disk| disk.is_local());
+        let dispatch_limit = scanner_max_concurrent_disk_scans(walkers.len());
+        let configured_disk_scans = crate::runtime_config::scanner_max_concurrent_disk_scans_configured();
+        let serial_progress_accounting = budget.requires_serial_progress_accounting();
+        let disk_scan_limit = scanner_budgeted_concurrency_limit(dispatch_limit, serial_progress_accounting);
         record_disk_scan_concurrency_limit(&pool_label, &set_label, disk_scan_limit);
-        debug!(
+        tracing::info!(
             target: "rustfs::scanner::io",
             event = EVENT_SCANNER_SET_STATE,
             component = LOG_COMPONENT_SCANNER,
             subsystem = LOG_SUBSYSTEM_IO,
+            state = "disk_concurrency_budget",
+            reason = if serial_progress_accounting {
+                "count_budget"
+            } else if configured_disk_scans != 0 && configured_disk_scans < walkers.len() {
+                "configured_cap"
+            } else {
+                "available_walkers"
+            },
             pool = self.pool_index,
             set = self.set_index,
-            online_disks = workers.len(),
+            online_disks,
+            walkers_per_disk,
+            walkers = walkers.len(),
+            dispatch_limit,
             concurrency_limit = disk_scan_limit,
-            state = "disk_concurrency_budget",
             "Scanner disk concurrency budget resolved"
         );
         let disk_scan_semaphore = Arc::new(Semaphore::new(disk_scan_limit));
@@ -627,7 +641,7 @@ impl ScannerIOCache for SetDisks {
 
         let cache_mutex: Arc<Mutex<DataUsageCache>> = Arc::new(Mutex::new(cache));
 
-        let (bucket_result_tx, mut bucket_result_rx) = mpsc::channel::<DataUsageEntryInfo>(workers.len());
+        let (bucket_result_tx, mut bucket_result_rx) = mpsc::channel::<DataUsageEntryInfo>(walkers.len());
 
         let cache_mutex_clone = cache_mutex.clone();
         let ctx_clone = ctx.clone();
@@ -660,7 +674,12 @@ impl ScannerIOCache for SetDisks {
         let bucket_rx_mutex: Arc<Mutex<mpsc::Receiver<BucketInfo>>> = Arc::new(Mutex::new(bucket_rx));
         let remaining_bucket_work = Arc::new(AtomicUsize::new(buckets.len()));
         let bucket_work_complete = CancellationToken::new();
-        for (disk, worker_mode) in workers {
+        for NamespaceScannerWalker {
+            disk,
+            mode: worker_mode,
+            local_admission,
+        } in walkers
+        {
             let service_cohort_clone = service_cohort.clone();
             let bucket_rx_mutex_clone = bucket_rx_mutex.clone();
             let bucket_tx_clone = bucket_tx.clone();
@@ -905,8 +924,8 @@ impl ScannerIOCache for SetDisks {
                         continue;
                     }
 
-                    let _local_admission = if disk.is_local() {
-                        match crate::remote_scanner::try_admit_remote_scanner(&disk) {
+                    let _local_admission = if let Some(share) = &local_admission {
+                        match share.acquire(&disk) {
                             Ok(admission) => Some(admission),
                             Err(e) => {
                                 if requeue_bucket_work(&bucket_tx_clone, &bucket, &mut work_guard).await {
@@ -934,6 +953,8 @@ impl ScannerIOCache for SetDisks {
                     } else {
                         None
                     };
+                    #[cfg(test)]
+                    super::tests::observe_coordinator_bucket_scan_admitted(&bucket.name).await;
 
                     // Lock order: scanner leader fence -> set-scoped per-bucket cache lock ->
                     // cache object read/write.
@@ -1189,8 +1210,14 @@ impl ScannerIOCache for SetDisks {
                                     await_scanner_disk_shutdown(scan.as_mut()).await;
                                     break Err(Error::other("scanner leader fence changed before checkpoint save"));
                                 }
+                                let Some(fence_store) = crate::resolve_scanner_object_store_handle() else {
+                                    scan_ctx.cancel();
+                                    await_scanner_disk_shutdown(scan.as_mut()).await;
+                                    break Err(Error::other("scanner global cycle fence store is unavailable before checkpoint save"));
+                                };
                                 match persist_scanner_checkpoint(
                                     store_clone_clone.clone(),
+                                    fence_store,
                                     ScannerCheckpointPersistContext {
                                         ctx: &ctx_clone,
                                         expected_publication_epoch: expected_publication_epoch_clone,
@@ -1203,7 +1230,7 @@ impl ScannerIOCache for SetDisks {
                                 )
                                 .await
                                 {
-                                    ScannerCheckpointPersistResult::Saved => {
+                                    ScannerCheckpointPersistResult::Saved | ScannerCheckpointPersistResult::Skipped => {
                                         if cache_guard.is_lock_lost() || ctx_clone.is_cancelled() {
                                             scan_ctx.cancel();
                                             await_scanner_disk_shutdown(scan.as_mut()).await;
@@ -1215,19 +1242,10 @@ impl ScannerIOCache for SetDisks {
                                         await_scanner_disk_shutdown(scan.as_mut()).await;
                                         break Err(Error::other("scanner bucket cache fence changed during checkpoint save"));
                                     }
-                                    ScannerCheckpointPersistResult::Failed(error) => {
-                                        error!(
-                                            target: "rustfs::scanner::io",
-                                            event = EVENT_SCANNER_CACHE_PERSIST_STATE,
-                                            component = LOG_COMPONENT_SCANNER,
-                                            subsystem = LOG_SUBSYSTEM_IO,
-                                            bucket = %bucket.name,
-                                            cache_name = %cache_name,
-                                            state = "periodic_checkpoint_save_failed",
-                                            error = %error,
-                                            "Scanner periodic checkpoint save failed"
-                                        );
-                                        checkpoint_channel_closed = true;
+                                    ScannerCheckpointPersistResult::RetryBucket(error) => {
+                                        scan_ctx.cancel();
+                                        await_scanner_disk_shutdown(scan.as_mut()).await;
+                                        break Err(error);
                                     }
                                 }
                             }
@@ -1568,7 +1586,8 @@ impl ScannerIOCache for SetDisks {
                 cache.info.next_cycle = want_cycle;
                 cache.info.last_update.get_or_insert_with(SystemTime::now);
                 cache.info.snapshot_complete = true;
-                cache.info.scan_execution_digest = Some(execution_digest);
+                let replication_execution = super::cache::scanner_replication_execution_digest(execution_digest, &cache);
+                cache.info.scan_execution_digest = Some(replication_execution);
                 cache.info.segment_invalidation_proof = completed_segment_invalidation_proof;
                 cache.info.lkg_snapshot_complete = false;
                 cache.info.lkg_next_cycle = None;

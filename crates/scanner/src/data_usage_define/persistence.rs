@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use bytes::Bytes;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -369,6 +370,17 @@ impl DataUsageCache {
             }
         };
 
+        #[cfg(feature = "diagnostic-read-version-caller")]
+        let load_fut = crate::storage_api::ecstore_diagnostic::with_read_version_entry(
+            crate::storage_api::ecstore_diagnostic::ReadVersionEntrySource::DataUsageCacheRead,
+            async {
+                crate::storage_api::ecstore_diagnostic::observe_read_version_context_boundary(
+                    crate::storage_api::ecstore_diagnostic::ReadVersionContextBoundary::ScannerCacheLoad,
+                );
+                load_fut.await
+            },
+        );
+
         match timeout(timeout_duration, load_fut).await {
             Ok(Ok((Some(cache), revision, _))) => Ok(DataUsageCacheLoadAttempt::Loaded {
                 cache: Box::new(cache),
@@ -417,6 +429,9 @@ impl DataUsageCache {
             return false;
         }
         if is_cache_publication_epoch_changed(err) {
+            return false;
+        }
+        if matches!(err, StorageError::Io(error) if error.kind() == std::io::ErrorKind::Interrupted) {
             return false;
         }
         !matches!(
@@ -477,7 +492,7 @@ impl DataUsageCache {
     async fn save_path_with_retry<S: ScannerObjectIO + ScannerConfigObjectDelete>(
         store: Arc<S>,
         path: &str,
-        buf: &[u8],
+        buf: &Bytes,
         timeout_duration: Duration,
         max_retries: u32,
         revision: Option<DataUsageCacheRevision>,
@@ -486,11 +501,15 @@ impl DataUsageCache {
         Self::ensure_cache_save_metrics_registered();
         let path_type = Self::cache_path_type(path);
         let path = path.to_string();
+        let sha256hex = (revision.is_some() && !buf.is_empty())
+            .then(|| hex_simd::encode_to_string(Sha256::digest(buf), hex_simd::AsciiCase::Lower));
 
+        let persist_started = Instant::now();
         let save_result = Self::retry_save_op(path_type, timeout_duration, max_retries, || {
             let store_clone = store.clone();
             let path_clone = path.clone();
-            let buf_clone = buf.to_vec();
+            let buf_clone = buf.clone();
+            let sha256hex = sha256hex.clone();
             let revision = revision.clone();
             async move {
                 let publication_admission = match expected_epoch {
@@ -505,14 +524,25 @@ impl DataUsageCache {
                     });
                 };
                 if let Some(revision) = revision {
-                    save_config_with_preconditions(store_clone, &path_clone, buf_clone, revision.preconditions()).await?;
+                    crate::save_config_shared_with_preconditions_and_lease_fence_and_scope(
+                        store_clone,
+                        &path_clone,
+                        buf_clone,
+                        sha256hex,
+                        revision.preconditions(),
+                        None,
+                        None,
+                    )
+                    .await?;
                 } else {
-                    save_config(store_clone, &path_clone, buf_clone).await?;
+                    save_config(store_clone, &path_clone, buf_clone.to_vec()).await?;
                 }
                 Ok::<(), StorageError>(())
             }
         })
         .await;
+        histogram!("rustfs_scanner_cache_persist_attempt_seconds", "path_type" => path_type, "retry_result" => if save_result.is_ok() { "success" } else { "error" })
+            .record(persist_started.elapsed().as_secs_f64());
         let Err(save_err) = save_result else {
             return Ok(());
         };
@@ -539,7 +569,7 @@ impl DataUsageCache {
                         },
                     )
                     .await?;
-                Ok::<bool, StorageError>(reader.read_all().await? == buf)
+                Ok::<bool, StorageError>(reader.read_all().await?.as_slice() == buf.as_ref())
             })
             .await;
             if matches!(reconcile, Ok(Ok(true))) {
@@ -588,8 +618,13 @@ impl DataUsageCache {
         revisions: Option<&DataUsageCacheRevisions>,
         expected_epoch: Option<u64>,
     ) -> StorageResult<()> {
+        let serialize_started = Instant::now();
         let mut buf = Vec::new();
         self.serialize(&mut rmp_serde::Serializer::new(&mut buf))?;
+        // Primary, backup, and retries read the same immutable encoded body.
+        let buf = Bytes::from(buf);
+        counter!("rustfs_scanner_cache_serialized_bytes_total").increment(u64::try_from(buf.len()).unwrap_or(u64::MAX));
+        histogram!("rustfs_scanner_cache_serialize_seconds").record(serialize_started.elapsed().as_secs_f64());
         let timeout_duration = Self::cache_save_timeout();
 
         let path = path_join_buf(&[BUCKET_META_PREFIX, name]);
@@ -638,5 +673,19 @@ impl DataUsageCache {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interrupted_checkpoint_admission_is_not_retried() {
+        let error = StorageError::Io(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled while queued"));
+        assert!(
+            !DataUsageCache::should_retry_save_error(&error),
+            "a cancelled background admission must stop before retry backoff"
+        );
     }
 }

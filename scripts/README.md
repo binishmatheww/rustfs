@@ -37,7 +37,7 @@ their issue closes.
 | `check_no_tokio_io_uring.sh` | ci-gate | Keeps tokio's io-uring backend disabled | ci.yml Quick Checks |
 | `check_s3s_footprint.sh` | ci-gate | Lower-only ratchet freezing the direct s3s surface ahead of the s3gate migration | ci.yml Quick Checks; `make pre-commit` |
 | `check_unsafe_code_allowances.sh` | ci-gate | Unsafe-code allowance ledger guard | ci.yml Quick Checks |
-| `layer-dependency-baseline.txt` | ci-gate (data) | Committed baseline consumed by `check_layer_dependencies.sh` | arch-checks skill |
+| `layer-dependency-baseline.txt` | ci-gate (data) | Committed baseline consumed by `check_layer_dependencies.sh` | [Architecture guard troubleshooting](../docs/operations/architecture-guard-troubleshooting.md) |
 | `static.sh` | ci-gate | Static-build helper executed inside image builds | `Dockerfile.source`, `Dockerfile.decommission-local` |
 | `helm_chart_version.sh` | ci-gate | Keeps the Helm chart version in sync with the release | helm-package.yml |
 | `test_helm_templates.sh` | ci-gate | Helm template rendering test | helm-package.yml |
@@ -50,6 +50,7 @@ their issue closes.
 | `prepare_replacement_migration.py` | dev-tool | Prepares digest-bound schema 5/6 replacement maintenance approvals | [Replacement recovery](../docs/operations/replacement-generation-recovery.md) |
 | `test_prepare_replacement_migration.py` | dev-tool | Verifies maintenance approval scope, publication, and stopped-writer assertion | Python unittest; same runbook |
 | `test_diagnose_scanner_enumeration_restart.py` | dev-tool | Driver report validation and positive convergence oracle tests | Python unittest; same guide |
+| `test_object_generation_protocol_model.py` | dev-tool | Bounded single-slot, four-voter promise/accept design model and recovery/retirement examples; no production runtime evidence | `python3 scripts/test_object_generation_protocol_model.py`; [Generation contract](../docs/architecture/unified-object-generation.md#executable-design-model-and-acceptance-mapping) |
 | `e2e-run.sh` | ci-gate | Boots a rustfs server and runs the `s3s-e2e` black-box conformance tool against it | ci.yml `e2e-tests` jobs; `docs/testing/README.md` |
 | `run_ecstore_validation_suite.sh` | dev-tool | ecstore black-box validation suite (`quick`/`full`/`destructive`/`fuzz` profiles) | `docs/testing/README.md`, `docs/testing/ecstore-validation-suite-design.md` |
 | `run_e2e_tests.sh` | dev-tool | Local `e2e_test` crate runner (starts a server, applies filters, cleans up) | `crates/e2e_test/README.md` |
@@ -107,6 +108,9 @@ their issue closes.
 | `run_object_batch_bench.sh` | dev-tool | Batch object benchmark runner (warp/s3bench) | internode + scanner runbooks |
 | `run_object_batch_bench_enhanced.sh` | dev-tool | Enhanced batch benchmark runner; hub used by the smoke rigs | hotpath runbook |
 | `run_pinned_paired_abba_bench.sh` | dev-tool | Pinned RustFS/MinIO paired ABBA benchmark orchestrator for backlog#1432 | `test_pinned_paired_abba_bench.sh` |
+| `prepare_conditional_read_baseline.py` | dev-tool | Installs only the matching conditional-read benchmark harness in a clean detached baseline | `docs/testing/conditional-read-benchmark.md` |
+| `run_conditional_read_abba.py` | dev-tool | Serial ordinary/hit/miss GET ABBA with cache/slow-disk controls and drift/regression gates | `docs/testing/conditional-read-benchmark.md` |
+| `test_conditional_read_abba.py` | dev-tool | Parser, drift rejection, and throughput/lock regression tests for conditional-read evidence | `run_conditional_read_abba.py` |
 | `run_get_codec_streaming_smoke.sh` | dev-tool | Local GET benchmark harness for the codec streaming read path | `docs/testing/ecstore-validation-suite-design.md` |
 | `run_get_1mib_abba_stage_metrics.sh` | dev-tool | Exact-1MiB isolated-host GET ABBA/stage-metrics harness for backlog#1434 | `test_get_1mib_abba_stage_metrics.sh` |
 | `issue_2007_coalescer_prometheus_report.py` | dev-tool | Read-only Prometheus report for GET metadata coalescer delay cost validation; usage in the module docstring | `test_issue_2007_coalescer_prometheus_report.sh` |

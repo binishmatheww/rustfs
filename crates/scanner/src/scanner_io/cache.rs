@@ -28,7 +28,8 @@ pub(crate) fn scanner_cache_lock_timeout() -> Duration {
 pub(crate) enum ScannerCheckpointPersistResult {
     Saved,
     FenceChanged,
-    Failed(StorageError),
+    Skipped,
+    RetryBucket(StorageError),
 }
 
 pub(crate) struct ScannerCheckpointPersistContext<'a> {
@@ -38,41 +39,16 @@ pub(crate) struct ScannerCheckpointPersistContext<'a> {
     pub(crate) leader_epoch: u64,
 }
 
-const CHECKPOINT_FOREGROUND_QUIET_WAIT: Duration = Duration::from_secs(1);
-
-async fn wait_for_checkpoint_foreground_quiet(ctx: &CancellationToken) -> bool {
-    let deadline = tokio::time::Instant::now() + CHECKPOINT_FOREGROUND_QUIET_WAIT;
-    loop {
-        if crate::workload_admission::foreground_workload_activity() == 0 {
-            return true;
-        }
-
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return false;
-        }
-
-        let backoff = Duration::from_millis(
-            crate::workload_admission::foreground_workload_activity()
-                .saturating_mul(10)
-                .min(250),
-        )
-        .max(Duration::from_millis(10))
-        .min(remaining);
-        tokio::select! {
-            _ = ctx.cancelled() => return false,
-            _ = tokio::time::sleep(backoff) => {}
-        }
-    }
-}
-
 /// Persist one bounded checkpoint and refresh its CAS revisions.
 ///
 /// Local and remote workers share the same publication/leader fencing and
-/// revision-refresh contract; only their lock/cancellation handling remains
+/// revision-refresh contract. Cycle/leader state belongs to the global store,
+/// while cache revisions and publication admission belong to the set store.
+/// Only their lock/cancellation handling remains
 /// at the caller because those guards have different concrete types.
-pub(crate) async fn persist_scanner_checkpoint<S>(
+pub(crate) async fn persist_scanner_checkpoint<S, F>(
     store: Arc<S>,
+    fence_store: Arc<F>,
     context: ScannerCheckpointPersistContext<'_>,
     cache_name: &str,
     checkpoint: &DataUsageCache,
@@ -80,26 +56,15 @@ pub(crate) async fn persist_scanner_checkpoint<S>(
 ) -> ScannerCheckpointPersistResult
 where
     S: ScannerObjectIO + ScannerConfigObjectDelete,
+    F: ScannerObjectIO,
 {
-    let foreground_quiet = wait_for_checkpoint_foreground_quiet(context.ctx).await;
-    if !foreground_quiet && context.ctx.is_cancelled() {
-        return ScannerCheckpointPersistResult::FenceChanged;
-    }
-    if !foreground_quiet {
-        debug!(
-            target: "rustfs::scanner::io",
-            event = EVENT_SCANNER_CACHE_PERSIST_STATE,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_IO,
-            cache_name,
-            state = "checkpoint_foreground_wait_expired",
-            "Scanner checkpoint foreground quiet wait expired; preserving bounded progress"
-        );
-    }
-
-    if crate::remote_scanner::validate_remote_scanner_request_fence_with_store(context.cycle, context.leader_epoch, store.clone())
-        .await
-        .is_err()
+    if crate::remote_scanner::validate_remote_scanner_request_fence_with_store(
+        context.cycle,
+        context.leader_epoch,
+        fence_store.clone(),
+    )
+    .await
+    .is_err()
     {
         return ScannerCheckpointPersistResult::FenceChanged;
     }
@@ -110,14 +75,21 @@ where
         return ScannerCheckpointPersistResult::FenceChanged;
     }
 
-    if let Err(error) = checkpoint
-        .save_with_revisions_for_epoch(store.clone(), cache_name, revisions, context.expected_publication_epoch)
-        .await
-    {
-        return ScannerCheckpointPersistResult::Failed(error);
+    let checkpoint_save = crate::storage_api::ecstore_with_background_disk_io(
+        context.ctx.clone(),
+        checkpoint.save_with_revisions_for_epoch(store.clone(), cache_name, revisions, context.expected_publication_epoch),
+    )
+    .await;
+    if let Err(error) = checkpoint_save {
+        record_checkpoint_save_failure(cache_name, checkpoint, &error);
+        return if matches!(error, StorageError::PreconditionFailed) {
+            ScannerCheckpointPersistResult::RetryBucket(error)
+        } else {
+            ScannerCheckpointPersistResult::Skipped
+        };
     }
 
-    if crate::remote_scanner::validate_remote_scanner_request_fence_with_store(context.cycle, context.leader_epoch, store.clone())
+    if crate::remote_scanner::validate_remote_scanner_request_fence_with_store(context.cycle, context.leader_epoch, fence_store)
         .await
         .is_err()
         || scanner_publication_admission_for_epoch(store.clone(), context.expected_publication_epoch)
@@ -127,13 +99,54 @@ where
         return ScannerCheckpointPersistResult::FenceChanged;
     }
 
-    match DataUsageCache::read_revisions(store, cache_name).await {
+    match crate::storage_api::ecstore_with_background_disk_io(
+        context.ctx.clone(),
+        DataUsageCache::read_revisions(store, cache_name),
+    )
+    .await
+    {
         Ok(next_revisions) => {
             *revisions = next_revisions;
+            if let Some(source) = checkpoint.info.source {
+                let saved = checkpoint.info.scan_checkpoint.as_ref().map(|cursor| {
+                    rustfs_scanner_metrics::metrics::ScannerCheckpointReport {
+                        version: cursor.version,
+                        resume_after: cursor.resume_after.clone(),
+                        reason: cursor.reason.as_str().to_string(),
+                        last_event: "saved".to_string(),
+                    }
+                });
+                global_metrics().record_scanner_checkpoint_saved(
+                    source.pool_index,
+                    source.set_index,
+                    &checkpoint.info.name,
+                    saved,
+                );
+            }
             ScannerCheckpointPersistResult::Saved
         }
-        Err(error) => ScannerCheckpointPersistResult::Failed(error),
+        Err(error) => {
+            // A successful PUT consumed the old CAS revision. Reload the bucket
+            // before another write instead of rebasing this scan over a newer writer.
+            record_checkpoint_save_failure(cache_name, checkpoint, &error);
+            ScannerCheckpointPersistResult::RetryBucket(error)
+        }
     }
+}
+
+fn record_checkpoint_save_failure(cache_name: &str, checkpoint: &DataUsageCache, error: &StorageError) {
+    global_metrics().record_scanner_checkpoint_save_failed();
+    error!(
+        target: "rustfs::scanner::io",
+        event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+        component = LOG_COMPONENT_SCANNER,
+        subsystem = LOG_SUBSYSTEM_IO,
+        state = "periodic_checkpoint_save_failed",
+        bucket = %checkpoint.info.name,
+        cache_name = %cache_name,
+        error = %error,
+        "Scanner periodic checkpoint save failed"
+    );
 }
 
 #[derive(Debug)]
@@ -306,6 +319,24 @@ pub(crate) fn current_cache_root_or_prepare_with_generation(
         // an older registry cannot be reused under the new cycle generation.
         cache.info.scan_plan_digest = None;
     }
+    if cache.info.name == name
+        && cache.info.next_cycle <= next_cycle
+        && cache.info.leader_epoch <= leader_epoch
+        && cache.info.snapshot_complete
+        && cache
+            .info
+            .replication
+            .as_ref()
+            .is_some_and(|config| config.has_active_rules("", true))
+    {
+        // Replication writebacks leave namespace generations unchanged. A
+        // completed cache must start a fresh coverage sweep, even on retry.
+        cache.info.scan_progress = Some(crate::DataUsageScanProgress {
+            started_plan: scan_plan_digest,
+            requested_plan: scan_plan_digest,
+        });
+        cache.info.scan_plan_digest = None;
+    }
     match current_cache_root_entry_with_generation(
         cache,
         name,
@@ -341,6 +372,72 @@ pub(super) fn cache_snapshot_is_current(
         current_cache_root_entry_with_generation(cache, name, source, next_cycle, leader_epoch, scan_plan_digest, None),
         Ok(Some(_))
     )
+}
+
+/// Replication statistics are observational and may change within one
+/// namespace execution. Bind them without relaxing same-execution reuse.
+pub(super) fn scanner_replication_execution_digest(
+    execution_digest: DataUsageScanPlanDigest,
+    cache: &DataUsageCache,
+) -> DataUsageScanPlanDigest {
+    let mut entries = cache
+        .cache
+        .iter()
+        .filter_map(|(key, entry)| {
+            entry
+                .replication_stats
+                .as_ref()
+                .filter(|stats| stats.replica_size != 0 || stats.replica_count != 0 || !stats.targets.is_empty())
+                .map(|stats| (key, stats))
+        })
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return execution_digest;
+    }
+    entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    let mut hasher = Sha256::new();
+    hasher.update(b"scanner-replication-execution-v1");
+    hasher.update(execution_digest.0);
+    for (key, stats) in entries {
+        hasher.update(u64::try_from(key.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(key.as_bytes());
+        hasher.update(stats.replica_size.to_be_bytes());
+        hasher.update(stats.replica_count.to_be_bytes());
+        let mut targets = stats.targets.iter().collect::<Vec<_>>();
+        targets.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        hasher.update(u64::try_from(targets.len()).unwrap_or(u64::MAX).to_be_bytes());
+        for (arn, target) in targets {
+            hasher.update(u64::try_from(arn.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(arn.as_bytes());
+            let rustfs_data_usage::ReplicationTargetUsage {
+                pending_size,
+                replicated_size,
+                failed_size,
+                failed_count,
+                pending_count,
+                missed_threshold_size,
+                after_threshold_size,
+                missed_threshold_count,
+                after_threshold_count,
+                replicated_count,
+            } = target;
+            for value in [
+                pending_size,
+                replicated_size,
+                failed_size,
+                failed_count,
+                pending_count,
+                missed_threshold_size,
+                after_threshold_size,
+                missed_threshold_count,
+                after_threshold_count,
+                replicated_count,
+            ] {
+                hasher.update(value.to_be_bytes());
+            }
+        }
+    }
+    DataUsageScanPlanDigest(hasher.finalize().into())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

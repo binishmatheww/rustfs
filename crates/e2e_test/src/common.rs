@@ -35,7 +35,7 @@ use s3s::Body;
 use serde_json;
 use std::fs as stdfs;
 use std::io::ErrorKind;
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Once;
@@ -1442,7 +1442,11 @@ impl RustFSTestClusterEnvironment {
             return Err(format!("a volume proxy is already configured for node {node_idx}").into());
         }
         let target = self.nodes[node_idx].address.parse::<SocketAddr>()?;
-        let proxy = crate::fault_proxy::FaultProxy::start(target).await?;
+        // Endpoint locality and RPC audience both use the advertised authority.
+        // Keep the node's port while the second loopback IP separates the proxy
+        // listener from the direct IPv4 server and S3 client address.
+        let listen = SocketAddr::from((Ipv6Addr::LOCALHOST, target.port()));
+        let proxy = crate::fault_proxy::FaultProxy::start_on(listen, target).await?;
         self.volume_proxy_addresses[node_idx] = Some(proxy.local_addr());
         Ok(proxy)
     }
@@ -1536,6 +1540,15 @@ impl RustFSTestClusterEnvironment {
     pub async fn start_node(&mut self, node_idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let binary_path = rustfs_binary_path();
         self.start_node_from_binary(node_idx, &binary_path).await
+    }
+
+    /// Start a process and wait only for TCP, allowing tests to bring up a
+    /// quorum one node at a time before the S3 service can become ready.
+    pub async fn start_node_process(&mut self, node_idx: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let binary_path = rustfs_binary_path();
+        let volumes_arg = self.build_volumes_arg();
+        self.spawn_node(node_idx, &binary_path, &volumes_arg)?;
+        self.wait_for_node_ready(&self.nodes[node_idx].address, node_idx).await
     }
 
     /// Start one stopped cluster node with a specific RustFS binary while
@@ -2467,6 +2480,20 @@ mod tests {
 
         assert!(volumes.contains(&proxied), "volumes must use the proxy address: {volumes}");
         assert!(!volumes.contains(&direct), "volumes must not retain the direct address: {volumes}");
+        assert_eq!(proxy.local_addr().port(), proxy.target_addr().port());
+        assert_ne!(proxy.local_addr().ip(), proxy.target_addr().ip());
+        assert_eq!(env.nodes[0].address, direct, "S3 clients must retain the direct address");
+        let mut endpoint =
+            crate::storage_api::Endpoint::try_from(volumes.as_str()).expect("proxied volume should be a valid endpoint");
+        endpoint
+            .update_is_local(proxy.target_addr().port())
+            .expect("proxied endpoint locality should resolve");
+        assert!(endpoint.is_local, "the proxied node must keep its local disk and first-disk authority");
+        assert_eq!(
+            endpoint.host_port(),
+            proxied,
+            "the local RPC audience must be the advertised proxy authority"
+        );
 
         proxy.shutdown().await;
     }

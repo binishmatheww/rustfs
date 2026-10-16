@@ -99,6 +99,40 @@ impl HealTask {
             // recreated bucket after the replay anchor was captured.
             return self.heal_mrf_partial_write_object(bucket, object, version_id).await;
         }
+        let heal_opts = HealOpts {
+            recursive: self.options.recursive,
+            dry_run: self.options.dry_run,
+            remove: self.options.remove_corrupted,
+            recreate: self.options.recreate_missing,
+            scan_mode: self.options.scan_mode,
+            update_parity: self.options.update_parity,
+            no_lock: self.options.no_lock,
+            read_repair: self.source == HealRequestSource::ReadRepair,
+            pool: self.options.pool_index,
+            set: self.options.set_index,
+        };
+        let mut recovery_handled = false;
+        if matches!(self.source, HealRequestSource::Admin | HealRequestSource::Internal) {
+            let recovery_opts = HealOpts {
+                remove: heal_opts.remove && version_id.is_none_or(str::is_empty),
+                ..heal_opts
+            };
+            if let Some(result) = self
+                .await_with_control(self.storage.recover_delete_transactions(
+                    bucket,
+                    Some(object),
+                    self.bucket_incarnation_id,
+                    &recovery_opts,
+                ))
+                .await?
+            {
+                recovery_handled = true;
+                self.record_result_item(result).await;
+                if self.options.dry_run {
+                    return Ok(());
+                }
+            }
+        }
         let mut object_exists = match self.await_with_control(self.storage.object_exists(bucket, object)).await {
             Ok(exists) => exists,
             Err(err @ Error::TransientSkip { .. }) => {
@@ -129,7 +163,7 @@ impl HealTask {
             object
         };
 
-        if !object_exists {
+        if !object_exists && !recovery_handled {
             // Background loops (scanner/MRF/autoheal/read-repair) routinely
             // race object deletion, so a missing target is per-object noise
             // for them; only foreground admin/internal requests keep the warn.
@@ -197,18 +231,6 @@ impl HealTask {
             update_parity = self.options.update_parity,
             "Heal object stage entered"
         );
-        let heal_opts = HealOpts {
-            recursive: self.options.recursive,
-            dry_run: self.options.dry_run,
-            remove: self.options.remove_corrupted,
-            recreate: self.options.recreate_missing,
-            scan_mode: self.options.scan_mode,
-            update_parity: self.options.update_parity,
-            no_lock: self.options.no_lock,
-            read_repair: self.source == HealRequestSource::ReadRepair,
-            pool: self.options.pool_index,
-            set: self.options.set_index,
-        };
         let mut expected_identity =
             self.outcome_identity(bucket, object, version_id, self.options.pool_index, self.options.set_index);
         expected_identity.bucket_incarnation_id = self.outcome_bucket_incarnation_id(bucket, self.options.dry_run).await?;
@@ -468,7 +490,9 @@ impl HealTask {
         {
             Ok((result, error)) => {
                 if let Some(e) = error {
-                    if self.skip_scanner_synthetic_object_dir_missing(bucket, object, &e).await {
+                    if self.skip_missing_usage_observation(bucket, object, version_id, &e).await
+                        || self.skip_scanner_synthetic_object_dir_missing(bucket, object, &e).await
+                    {
                         return Ok(());
                     }
 
@@ -513,7 +537,9 @@ impl HealTask {
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
             Err(e) => {
-                if self.skip_scanner_synthetic_object_dir_missing(bucket, object, &e).await {
+                if self.skip_missing_usage_observation(bucket, object, version_id, &e).await
+                    || self.skip_scanner_synthetic_object_dir_missing(bucket, object, &e).await
+                {
                     return Ok(());
                 }
 
@@ -534,6 +560,45 @@ impl HealTask {
                 })
             }
         }
+    }
+
+    async fn skip_missing_usage_observation(&self, bucket: &str, object: &str, version_id: Option<&str>, err: &Error) -> bool {
+        // Usage publication may delete an obsolete observation after a degraded
+        // GET has queued read repair. Its absence is not lost user data. Keep
+        // durable MRF completion on its separate, proof-bearing storage path.
+        if self.source != HealRequestSource::ReadRepair
+            || version_id.is_some()
+            || bucket != RUSTFS_META_BUCKET
+            || object
+                .strip_prefix(BUCKET_META_PREFIX)
+                .and_then(|suffix| suffix.strip_prefix('/'))
+                != Some(rustfs_data_usage::DATA_USAGE_OBSERVED_OBJECT_NAME)
+            || !matches!(
+                err,
+                Error::Disk(DiskError::FileNotFound)
+                    | Error::Storage(EcstoreError::FileNotFound | EcstoreError::ObjectNotFound(_, _))
+            )
+        {
+            return false;
+        }
+
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_OBJECT_RESULT,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_OBJECT,
+            task_id = %self.id,
+            bucket,
+            object,
+            source = self.source.as_str(),
+            result = "usage_observation_missing",
+            "Heal skipped an absent usage observation"
+        );
+        let mut progress = self.progress.write().await;
+        progress.set_current_object(Some(format!("skipped: {bucket}/{object}")));
+        progress.update_object_progress(1, 0, 0, 1, 0);
+        progress.update_stage(4, 4);
+        true
     }
 
     /// Durable MRF partial writes may complete only with an incarnation-fenced storage proof.

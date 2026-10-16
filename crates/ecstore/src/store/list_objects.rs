@@ -56,7 +56,7 @@ use rustfs_filemeta::{
 };
 use rustfs_io_metrics::{
     LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED, LIST_OBJECTS_GATHER_OUTCOME_LIMIT_REACHED, LIST_OBJECTS_SOURCE_WALKER,
-    ListObjectsGatherObservation, ListObjectsIndexPageObservation,
+    ListObjectsGatherCaller, ListObjectsGatherObservation, ListObjectsIndexPageObservation,
 };
 use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
 use std::cmp::Reverse;
@@ -69,11 +69,11 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::duplex;
-use tokio::sync::broadcast::{self};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::{OnceCell, RwLock};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{Instrument, debug, error, info, warn};
 use uuid::Uuid;
 
@@ -109,6 +109,7 @@ fn recursive_walk_list_path_options(bucket: String, prefix: &str, opts: &WalkOpt
         incl_deleted: true,
         recursive: true,
         versioned: true,
+        caller: ListObjectsGatherCaller::S3ListVersions,
         walkdir_timeout: opts.walkdir_timeout,
         walkdir_stall_timeout: opts.walkdir_stall_timeout,
         ..Default::default()
@@ -274,6 +275,7 @@ fn log_list_path_finished(
 
 #[derive(Debug, Default, Clone)]
 pub struct ListPathOptions {
+    pub caller: ListObjectsGatherCaller,
     pub id: Option<String>,
 
     // Bucket of the listing.
@@ -352,6 +354,15 @@ fn ensure_producer_limit_state(options: &mut ListPathOptions) -> Arc<AtomicBool>
         .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     options.producer_limit_reached = Some(state.clone());
     state
+}
+
+fn list_path_folds_common_prefixes(options: &ListPathOptions) -> bool {
+    !options.versioned
+        && (options.include_directories
+            || options
+                .separator
+                .as_deref()
+                .is_some_and(|separator| !separator.is_empty() && separator != SLASH_SEPARATOR))
 }
 
 async fn can_skip_hidden_prefix_check(options: &ListPathOptions) -> bool {
@@ -439,8 +450,8 @@ const MAX_LIST_OBJECTS_METADATA_FAST_STALENESS_MS: u64 = 60_000;
 const LIST_OBJECTS_INDEX_PROVIDER_WALKER_KEY_ONLY: &str = "walker_key_only";
 const LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY: &str = "persistent_key_only";
 const LIST_OBJECTS_INDEX_PROVIDER_PERSISTENT_KEY_ONLY_DEFAULT_GENERATION: &str = "persistent-key-only";
-const PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION: u8 = 2;
-const PERSISTENT_KEY_ONLY_INDEX_HEADER: &str = "# rustfs-listobjects-key-only-v2";
+const PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION: u8 = 3;
+const PERSISTENT_KEY_ONLY_INDEX_HEADER: &str = "# rustfs-listobjects-key-only-v3";
 const PERSISTENT_KEY_ONLY_INDEX_BUCKET_HEADER: &str = "# bucket=";
 const PERSISTENT_KEY_ONLY_INDEX_GENERATION_HEADER: &str = "# generation=";
 const PERSISTENT_KEY_ONLY_INDEX_CHECKPOINT_HEADER: &str = "# checkpoint_high_water_mark=";
@@ -647,7 +658,10 @@ impl PersistentListMetadataObject {
             name: object.name.clone(),
             size: object.size,
             mod_time: object.mod_time,
-            etag: object.etag.clone(),
+            etag: object
+                .etag
+                .clone()
+                .filter(|_| rustfs_utils::http::etag_can_be_listed(&object.user_defined)),
             storage_class: object.storage_class.clone(),
         }
     }
@@ -2185,6 +2199,41 @@ fn last_scanned_entry_name(entries: Option<&MetaCacheEntriesSorted>) -> Option<S
     entries.and_then(|entries| entries.entries().last().map(|entry| entry.name.clone()))
 }
 
+fn filter_versions_common_prefixes_after_marker(objects: &mut Vec<ObjectInfo>, delimiter: Option<&str>, marker: Option<&str>) {
+    if delimiter.is_some()
+        && let Some(marker) = marker
+    {
+        // S3 excludes CommonPrefixes that are not lexicographically greater than KeyMarker.
+        // Filter before applying max-keys so a resumed prefix cannot consume the page budget.
+        objects.retain(|object| !(object.is_dir && object.mod_time.is_none()) || object.name.as_str() > marker);
+    }
+}
+
+fn last_raw_key_for_prefix<'a>(raw_keys: impl Iterator<Item = &'a str>, prefix: &str) -> Option<&'a str> {
+    raw_keys.filter(|key| key.starts_with(prefix)).last()
+}
+
+fn versioned_prefix_page_boundary_key<'a>(
+    objects: &[ObjectInfo],
+    raw_keys: impl Iterator<Item = &'a str>,
+    delimiter: Option<&str>,
+    max_keys: i32,
+    disk_has_more: bool,
+) -> Option<String> {
+    if delimiter.is_none() || !disk_has_more || max_keys <= 0 || objects.len() < max_keys as usize {
+        return None;
+    }
+
+    let last_visible = objects.get(max_keys as usize - 1)?;
+    if !last_visible.is_dir || last_visible.mod_time.is_some() {
+        return None;
+    }
+
+    // A folded prefix cannot advance the raw versioned walker. Continue at the last
+    // raw key represented by the final returned prefix, not at the next prefix's key.
+    last_raw_key_for_prefix(raw_keys, &last_visible.name).map(str::to_owned)
+}
+
 fn build_list_next_marker(objects: &[ObjectInfo], prefixes: &[String], cache_id: Option<&str>) -> Option<String> {
     if let Some(last) = objects.last() {
         Some(append_list_cache_id_to_marker(last.name.clone(), cache_id))
@@ -2271,14 +2320,20 @@ fn list_objects_paginate(
         }
     }
 
-    if !is_truncated && disk_has_more && !include_version_id {
+    if !is_truncated && disk_has_more {
         let visible_count = objects.len() + prefixes.len();
         let should_truncate = if delimiter.is_none() {
             visible_count > 0
         } else {
             visible_count >= max_keys as usize
         };
-        if should_truncate {
+        if delimiter.is_some()
+            && include_version_id
+            && let Some(last_scanned) = last_scanned_key
+        {
+            is_truncated = true;
+            next_marker = Some(append_list_cache_id_to_marker(last_scanned.to_owned(), cache_id));
+        } else if should_truncate {
             is_truncated = true;
             if include_version_id {
                 (next_marker, next_version_idmarker) = build_list_versions_next_marker(&objects, &prefixes, cache_id);
@@ -2306,6 +2361,49 @@ fn list_objects_paginate(
             // A bare key marker with no version id makes `forward_past` skip the whole
             // scanned window on the next page; its folded prefixes are already emitted.
         }
+    }
+
+    (objects, prefixes, is_truncated, next_marker, next_version_idmarker)
+}
+
+struct VersionedListPagination<'a, I> {
+    delimiter: &'a Option<String>,
+    max_keys: i32,
+    disk_has_more: bool,
+    cache_id: Option<&'a str>,
+    marker: Option<&'a str>,
+    last_scanned_key: Option<&'a str>,
+    raw_keys: I,
+}
+
+fn list_objects_paginate_versions<'a, I>(
+    mut get_objects: Vec<ObjectInfo>,
+    pagination: VersionedListPagination<'a, I>,
+) -> (Vec<ObjectInfo>, Vec<String>, bool, Option<String>, Option<String>)
+where
+    I: Iterator<Item = &'a str>,
+{
+    filter_versions_common_prefixes_after_marker(&mut get_objects, pagination.delimiter.as_deref(), pagination.marker);
+    let prefix_at_page_boundary = versioned_prefix_page_boundary_key(
+        &get_objects,
+        pagination.raw_keys,
+        pagination.delimiter.as_deref(),
+        pagination.max_keys,
+        pagination.disk_has_more,
+    );
+
+    let (objects, prefixes, is_truncated, mut next_marker, mut next_version_idmarker) = list_objects_paginate(
+        get_objects,
+        pagination.delimiter,
+        pagination.max_keys,
+        pagination.disk_has_more,
+        pagination.cache_id,
+        true,
+        pagination.last_scanned_key,
+    );
+    if is_truncated && let Some(raw_key) = prefix_at_page_boundary {
+        next_marker = Some(append_list_cache_id_to_marker(raw_key, pagination.cache_id));
+        next_version_idmarker = None;
     }
 
     (objects, prefixes, is_truncated, next_marker, next_version_idmarker)
@@ -2440,6 +2538,12 @@ where
             let suffix = key.trim_start_matches(prefix);
             if let Some((common_prefix, _)) = suffix.split_once(separator) {
                 let common_prefix = format!("{prefix}{common_prefix}{separator}");
+                if marker.is_some_and(|marker| common_prefix.as_str() <= marker) {
+                    if collect_stats {
+                        stats.skipped_keys += 1;
+                    }
+                    continue;
+                }
                 if prefix_set.insert(common_prefix.clone()) {
                     if collect_stats {
                         stats.common_prefixes += 1;
@@ -2542,6 +2646,10 @@ fn list_objects_from_metadata_snapshot_candidates(
             let suffix = object.name.trim_start_matches(prefix);
             if let Some((common_prefix, _)) = suffix.split_once(separator) {
                 let common_prefix = format!("{prefix}{common_prefix}{separator}");
+                if marker.is_some_and(|marker| common_prefix.as_str() <= marker) {
+                    stats.skipped_keys += 1;
+                    continue;
+                }
                 if prefix_set.insert(common_prefix.clone()) {
                     stats.common_prefixes += 1;
                     visible_entries.push(VerifiedIndexVisibleEntry::Prefix(common_prefix));
@@ -4010,6 +4118,7 @@ impl ECStore {
         let effective_max_keys = if max_keys <= 0 { 0 } else { max_keys_plus_one(max_keys, true) };
         let mut opts = ListPathOptions {
             bucket: bucket.to_owned(),
+            caller: ListObjectsGatherCaller::S3List,
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
             // Always request max_keys + 1 to detect if there are more results
@@ -4155,6 +4264,79 @@ impl ECStore {
         .await
     }
 
+    /// Capture one logical key's version group for write-triggered expiry.
+    pub(crate) async fn get_object_versions_for_lifecycle(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        bucket_incarnation_id: Uuid,
+    ) -> Result<Vec<ObjectInfo>> {
+        crate::bucket::utils::check_object_args(bucket, object)?;
+        let mut opts = opts.clone();
+        // Lock order matches writes: bucket lifecycle, metadata validation,
+        // then object namespace. Borrow fences supplied by an outer operation.
+        let bucket_guard = if opts.bucket_lifecycle_lock_fence.is_none() {
+            let guard = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
+            opts.add_bucket_lifecycle_lock_guard(&guard);
+            Some(guard)
+        } else {
+            None
+        };
+        let incarnation = crate::bucket::metadata_sys::get_bucket_incarnation_id_for_options_in(&self.ctx, bucket, &opts).await?;
+        if incarnation != bucket_incarnation_id {
+            return Err(Error::BucketNotFound(bucket.to_owned()));
+        }
+        let metadata_sys = crate::bucket::metadata_sys::bucket_metadata_sys_of(&self.ctx)?;
+        let metadata_sys = metadata_sys.read().await.clone();
+        let (versioning, _) = metadata_sys.get_versioning_config(bucket).await?;
+        let disk_object = path::encode_dir_object(object);
+        let object_guard = self
+            .acquire_object_read_lock_if_needed("lifecycle_versions", bucket, &disk_object, &mut opts)
+            .await?;
+
+        // As with version listings, include every physical set: migration can
+        // leave a key's history in more than its current hash destination.
+        let reads = self
+            .pools
+            .iter()
+            .flat_map(|pool| &pool.disk_set)
+            .map(|set| set.read_object_versions_for_lifecycle(bucket, object));
+        let mut entries = Vec::new();
+        for result in join_all(reads).await {
+            if let Some(entry) = result.map_err(|error| to_object_err(error.into(), vec![bucket, object]))? {
+                entries.push(entry);
+            }
+        }
+        if self.pools.is_empty()
+            || bucket_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+            || opts
+                .bucket_lifecycle_lock_fence
+                .as_ref()
+                .is_some_and(|fence| fence.is_lock_lost())
+            || opts.namespace_lock_fence.as_ref().is_some_and(|fence| fence.is_lock_lost())
+            || object_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+        {
+            return Err(Error::PreconditionFailed);
+        }
+        let mut entries = entries.into_iter();
+        let Some(mut entry) = entries.next() else {
+            return Ok(Vec::new());
+        };
+        if entries.len() > 0 {
+            merge_object_entry_versions(&mut entry, entries)?;
+        }
+        // This projection excludes tier free-version bookkeeping but retains
+        // pending version purges for the evaluator's replication safeguards.
+        let versions = entry.file_info_versions(bucket)?;
+        let versioned = versioning.versioned(object);
+        Ok(versions
+            .versions
+            .iter()
+            .map(|version| ObjectInfo::from_file_info(version, bucket, object, versioned))
+            .collect())
+    }
+
     async fn inner_list_object_versions_with_projection(
         self: Arc<Self>,
         input: ListObjectVersionsInput<'_>,
@@ -4183,6 +4365,11 @@ impl ECStore {
         let effective_max_keys = list_versions_scan_limit(max_keys, has_version_marker);
         let mut opts = ListPathOptions {
             bucket: bucket.to_owned(),
+            caller: if include_version_purge {
+                ListObjectsGatherCaller::Lifecycle
+            } else {
+                ListObjectsGatherCaller::S3ListVersions
+            },
             prefix: prefix.to_owned(),
             separator: delimiter.clone(),
             limit: effective_max_keys,
@@ -4240,14 +4427,17 @@ impl ECStore {
             ObjectInfo::from_meta_cache_entries_sorted_versions(&entries, bucket, prefix, delimiter.clone(), version_marker).await
         };
 
-        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate_versions(
             get_objects,
-            &delimiter,
-            max_keys,
-            disk_has_more,
-            next_cache_id.as_deref(),
-            true,
-            last_scanned_key.as_deref(),
+            VersionedListPagination {
+                delimiter: &delimiter,
+                max_keys,
+                disk_has_more,
+                cache_id: next_cache_id.as_deref(),
+                marker: opts.marker.as_deref(),
+                last_scanned_key: last_scanned_key.as_deref(),
+                raw_keys: entries.entries().iter().map(|entry| entry.name.as_str()),
+            },
         );
 
         Ok(ListObjectVersionsInfo {
@@ -4315,96 +4505,15 @@ impl ECStore {
 
         // cancel channel
         let cancel = CancellationToken::new();
-        let _cancel_guard = cancel.clone().drop_guard();
         ensure_producer_limit_state(&mut o);
 
-        let (err_tx, mut err_rx) = broadcast::channel::<Arc<Error>>(1);
-
         let (sender, recv) = mpsc::channel(o.limit as usize);
-
         let store = self.clone();
-        let opts = o.clone();
-        let cancel_rx1 = cancel.clone();
-        let cancel_rx1_for_err = cancel_rx1.clone();
-        let err_tx1 = err_tx.clone();
-        let job1_context = log_context.clone();
-        let job1 = tokio::spawn(
-            async move {
-                let mut opts = opts;
-                opts.stop_disk_at_limit = true;
-                if let Err(err) = store.list_merged(cancel_rx1, opts, sender).await
-                    && !cancel_rx1_for_err.is_cancelled()
-                {
-                    log_list_path_worker_error("store", "list_merged", &job1_context, &err);
-                    let _ = err_tx1.send(Arc::new(err));
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
-
-        let cancel_rx2 = cancel.clone();
-
-        let (result_tx, mut result_rx) = mpsc::channel(1);
-        let err_tx2 = err_tx.clone();
-        let opts = o.clone();
-        let job2_context = log_context.clone();
-        let job2 = tokio::spawn(
-            async move {
-                match gather_results(cancel_rx2, opts, recv, result_tx).await {
-                    Ok(GatherResultsState::LimitReached) => cancel.cancel(),
-                    Ok(GatherResultsState::InputClosed) => {}
-                    // Consumer disconnect (e.g. client cancelled the request)
-                    // is a benign completion: no error log, no err_tx send.
-                    // The explicit cancel is idempotent and avoids relying on
-                    // the wrapper's drop-guard ordering to stop the producer.
-                    Ok(GatherResultsState::ConsumerGone) => cancel.cancel(),
-                    // Invariant (rustfs/backlog#1306): gather_results maps a
-                    // consumer disconnect to Ok(ConsumerGone) and has no
-                    // fallible pre-send path, so this arm is currently
-                    // unreachable. It is kept as a guard: it stays correct only
-                    // while a *real* gather_results error would still surface as
-                    // an error here. Real producer/listing errors take the
-                    // separate job1 -> err_tx -> err_rx path below, unaffected.
-                    Err(err) => {
-                        log_list_path_worker_error("store", "gather_results", &job2_context, &err);
-                        let _ = err_tx2.send(Arc::new(err));
-                        cancel.cancel();
-                    }
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
-
-        let mut result = {
-            // receiver result
-            tokio::select! {
-               res = err_rx.recv() =>{
-
-                match res{
-                    Ok(err) => {
-                        log_list_path_worker_error("store", "worker_error", &log_context, err.as_ref());
-                        MetaCacheEntriesSortedResult{ entries: None, err: Some(to_filemeta_err(err.as_ref().clone())) }
-                    },
-                    Err(err) => {
-                        log_list_path_worker_error("store", "error_channel_closed", &log_context, &err);
-
-                        MetaCacheEntriesSortedResult{ entries: None, err: Some(rustfs_filemeta::Error::other(err)) }
-                    },
-                }
-               },
-               Some(result) = result_rx.recv()=>{
-                result
-               }
-            }
-        };
-
-        // wait spawns exit
-        join_all(vec![job1, job2]).await;
-
-        if let Ok(err) = err_rx.try_recv() {
-            log_list_path_worker_error("store", "trailing_worker_error", &log_context, err.as_ref());
-            result.err = Some(to_filemeta_err(err.as_ref().clone()));
-        }
+        let mut opts = o.clone();
+        opts.stop_disk_at_limit = true;
+        let producer_cancel = cancel.clone();
+        let producer = async move { store.list_merged(producer_cancel, opts, sender).await.map(|_| ()) };
+        let mut result = collect_list_path_results("store", &log_context, cancel, o.clone(), recv, producer).await;
 
         if result.err.is_some() {
             log_list_path_finished("store", &log_context, list_path_started.elapsed().as_secs_f64() * 1000.0, 0, true);
@@ -4950,6 +5059,102 @@ impl ECStore {
     }
 }
 
+/// Own every page worker until completion, including when the request is dropped.
+async fn collect_list_path_results<P>(
+    component: &'static str,
+    context: &ListPathLogContext,
+    cancel: CancellationToken,
+    opts: ListPathOptions,
+    recv: Receiver<MetaCacheEntry>,
+    producer: P,
+) -> MetaCacheEntriesSortedResult
+where
+    P: Future<Output = Result<()>> + Send + 'static,
+{
+    let _cancel_guard = cancel.clone().drop_guard();
+    let (result_tx, mut result_rx) = mpsc::channel(1);
+    let mut workers = JoinSet::new();
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let mut diagnostic_context = crate::cluster::rpc::runtime_sources::ReadVersionDiagnosticContext::capture_entry(
+        rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::ListObjects,
+    );
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let request_caller = diagnostic_context.caller.or_else(|| {
+        use rustfs_io_metrics::ListObjectsGatherCaller;
+        use rustfs_io_metrics::internode_metrics::ReadVersionRequestCaller;
+
+        match opts.caller {
+            ListObjectsGatherCaller::S3List | ListObjectsGatherCaller::S3ListVersions => {
+                Some(ReadVersionRequestCaller::ListObjects)
+            }
+            ListObjectsGatherCaller::Lifecycle => Some(ReadVersionRequestCaller::Lifecycle),
+            ListObjectsGatherCaller::Other => Some(ReadVersionRequestCaller::Other),
+            ListObjectsGatherCaller::Unattributed => None,
+        }
+    });
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    {
+        diagnostic_context.caller = request_caller;
+    }
+    let producer = async move { producer.await.map(|()| None) };
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let producer = crate::cluster::rpc::runtime_sources::with_read_version_diagnostic_context(
+        diagnostic_context,
+        rustfs_io_metrics::internode_metrics::ReadVersionContextBoundary::ListProducer,
+        producer,
+    );
+    workers.spawn(producer.instrument(tracing::Span::current()));
+    let gather_cancel = cancel.clone();
+    let gather = async move { gather_results(gather_cancel, opts, recv, result_tx).await.map(Some) };
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let gather = crate::cluster::rpc::runtime_sources::with_read_version_diagnostic_context(
+        diagnostic_context,
+        rustfs_io_metrics::internode_metrics::ReadVersionContextBoundary::ListGather,
+        gather,
+    );
+    workers.spawn(gather.instrument(tracing::Span::current()));
+
+    let mut failure = None;
+    let mut stopping = false;
+    while let Some(completion) = workers.join_next().await {
+        let error = match completion {
+            Ok(Ok(Some(GatherResultsState::LimitReached | GatherResultsState::ConsumerGone))) => {
+                stopping = true;
+                None
+            }
+            // EOF is only authoritative after the producer also succeeds.
+            Ok(Ok(None | Some(GatherResultsState::InputClosed))) => None,
+            Ok(Err(err)) => Some(err),
+            Err(err) if stopping && err.is_cancelled() => None,
+            // Do not expose a panic payload through the S3 error or logs.
+            Err(err) if err.is_panic() => Some(Error::other("listing worker panicked")),
+            Err(_) => Some(Error::other("listing worker unexpectedly cancelled")),
+        };
+        if let Some(error) = error {
+            failure.get_or_insert(error);
+            stopping = true;
+        }
+        if stopping {
+            cancel.cancel();
+            workers.abort_all();
+        }
+        // Drain even after abort: a completed error/panic must not be hidden
+        // by a page limit becoming ready at the same time.
+    }
+
+    // gather_results sends at most one page into a capacity-1 channel, so it
+    // never needs this receiver to make progress. Read only after both joins.
+    let mut result = result_rx.try_recv().unwrap_or_else(|_| MetaCacheEntriesSortedResult {
+        entries: None,
+        err: Some(rustfs_filemeta::Error::other("listing worker exited without a page")),
+    });
+    if let Some(error) = failure {
+        log_list_path_worker_error(component, "worker_error", context, &error);
+        result.err = Some(to_filemeta_err(error));
+    }
+    result
+}
+
 async fn gather_results(
     rx: CancellationToken,
     opts: ListPathOptions,
@@ -4962,6 +5167,8 @@ async fn gather_results(
     let gather_started = list_metrics_enabled.then(std::time::Instant::now);
     let mut scanned_entries = 0usize;
     let mut candidate_entries = 0usize;
+    let mut previous_prefix = String::new();
+    let folds_prefixes = list_path_folds_common_prefixes(&opts);
 
     while let Some(mut entry) = recv.recv().await {
         scanned_entries += 1;
@@ -5001,6 +5208,34 @@ async fn gather_results(
             continue;
         }
 
+        // Version LIST projections omit cleanup-only free versions. They must
+        // not consume the lookahead budget before a later visible version.
+        // Cleanup walks consume the raw set stream without this collector.
+        if opts.versioned
+            && is_object
+            && entry
+                .xl_meta()
+                .is_ok_and(|meta| !meta.versions.is_empty() && meta.versions.iter().all(|version| version.header.free_version()))
+        {
+            continue;
+        }
+
+        if folds_prefixes
+            && let Some(separator) = opts.separator.as_deref().filter(|separator| !separator.is_empty())
+            && let Some(offset) = entry.name[opts.prefix.len()..].find(separator)
+        {
+            let common_prefix = &entry.name[..opts.prefix.len() + offset + separator.len()];
+            if common_prefix == previous_prefix
+                || opts.marker.as_deref().is_some_and(|marker| {
+                    (!opts.include_marker && common_prefix <= marker) || (opts.include_marker && common_prefix < marker)
+                })
+            {
+                continue;
+            }
+            previous_prefix.clear();
+            previous_prefix.push_str(common_prefix);
+        }
+
         // TODO(backlog): integrate lifecycle evaluation during object listing
 
         entries.push(Some(entry));
@@ -5013,6 +5248,7 @@ async fn gather_results(
                 let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
                 rustfs_io_metrics::record_list_objects_gather(ListObjectsGatherObservation {
                     source: LIST_OBJECTS_SOURCE_WALKER,
+                    caller: opts.caller,
                     outcome: LIST_OBJECTS_GATHER_OUTCOME_LIMIT_REACHED,
                     limit: opts.limit,
                     scanned_entries,
@@ -5075,6 +5311,7 @@ async fn gather_results(
         let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
         rustfs_io_metrics::record_list_objects_gather(ListObjectsGatherObservation {
             source: LIST_OBJECTS_SOURCE_WALKER,
+            caller: opts.caller,
             outcome: LIST_OBJECTS_GATHER_OUTCOME_INPUT_CLOSED,
             limit: opts.limit,
             scanned_entries,
@@ -5206,6 +5443,23 @@ async fn send_or_cancel(rx: &CancellationToken, out_channel: &Sender<MetaCacheEn
     }
 }
 
+fn listing_merge_corruption(object: &str, version_id: Option<Uuid>, validation: &'static str) -> Error {
+    const EVENT_LISTING_MERGE_REJECTED: &str = "listing_merge_rejected";
+    const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+    const LOG_SUBSYSTEM_LISTING: &str = "listing";
+    error!(
+        event = EVENT_LISTING_MERGE_REJECTED,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_LISTING,
+        result = "rejected",
+        object,
+        version_id = ?version_id,
+        validation,
+        "Listing version merge rejected metadata"
+    );
+    Error::FileCorrupt
+}
+
 /// Each input has already been resolved inside its own erasure set. This is a
 /// union of version histories, never a quorum vote between unrelated pools.
 fn merge_object_entry_versions(first: &mut MetaCacheEntry, others: impl Iterator<Item = MetaCacheEntry>) -> Result<()> {
@@ -5214,23 +5468,26 @@ fn merge_object_entry_versions(first: &mut MetaCacheEntry, others: impl Iterator
     for mut entry in std::iter::once(std::mem::take(first)).chain(others) {
         let meta = match entry.cached.take() {
             Some(meta) => meta,
-            None => FileMeta::load(&entry.metadata).map_err(|_| Error::FileCorrupt)?,
+            None => FileMeta::load(&entry.metadata).map_err(|_| listing_merge_corruption(&name, None, "metadata_decode"))?,
         };
         if meta.versions.is_empty() {
-            return Err(Error::FileCorrupt);
+            return Err(listing_merge_corruption(&name, None, "empty_version_stack"));
         }
         for version in meta.versions {
-            let parsed = version.parse_version_meta().map_err(|_| Error::FileCorrupt)?;
+            let corrupt = |validation| listing_merge_corruption(&name, version.header.version_id, validation);
+            let parsed = version.parse_version_meta().map_err(|_| corrupt("version_decode"))?;
             if !parsed.valid() || parsed.version_type != version.header.version_type {
-                return Err(Error::FileCorrupt);
+                return Err(corrupt("version_type_or_validity"));
             }
-            let fi = parsed.into_fileinfo("", &name, true).map_err(|_| Error::FileCorrupt)?;
+            let fi = parsed
+                .into_fileinfo("", &name, true)
+                .map_err(|_| corrupt("file_info_decode"))?;
             let version_id = fi.version_id.filter(|id| !id.is_nil());
             if version_id != version.header.version_id.filter(|id| !id.is_nil())
                 || fi.mod_time != version.header.mod_time
                 || fi.tier_free_version() != version.header.free_version()
             {
-                return Err(Error::FileCorrupt);
+                return Err(corrupt("version_header_mismatch"));
             }
             let info = ObjectInfo::from_file_info(&fi, "", &name, true);
             let identity = (version_id, version.header.free_version());
@@ -5254,7 +5511,7 @@ fn merge_object_entry_versions(first: &mut MetaCacheEntry, others: impl Iterator
                         crate::data_movement::is_equivalent_data_movement_object_identity(&info, previous_info, true, true)
                     };
                     if !equivalent {
-                        return Err(Error::FileCorrupt);
+                        return Err(corrupt("version_identity_conflict"));
                     }
                     // Equivalent migrated copies can have different coding or
                     // data directories. Choose a stable representation without
@@ -5317,8 +5574,8 @@ fn spawn_listing_merge(
     rx: CancellationToken,
     inputs: Vec<Receiver<MetaCacheEntry>>,
     sender: Sender<MetaCacheEntry>,
-) -> JoinHandle<Result<()>> {
-    tokio::spawn(
+) -> AbortOnDropHandle<Result<()>> {
+    AbortOnDropHandle::new(tokio::spawn(
         async move {
             let result = merge_entry_channels(rx.clone(), inputs, sender, 1).await;
             if result.is_err() {
@@ -5327,7 +5584,7 @@ fn spawn_listing_merge(
             result
         }
         .instrument(tracing::Span::current()),
-    )
+    ))
 }
 
 async fn merge_entry_channels(
@@ -5651,23 +5908,22 @@ impl Sets {
         // Last RAW scanned key, captured before folding (ECA-03 / #944).
         let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
 
-        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
-            &list_result.entries.unwrap_or_default(),
-            bucket,
-            prefix,
-            delimiter.clone(),
-            version_marker,
-        )
-        .await;
+        let entries = list_result.entries.unwrap_or_default();
+        let get_objects =
+            ObjectInfo::from_meta_cache_entries_sorted_versions(&entries, bucket, prefix, delimiter.clone(), version_marker)
+                .await;
 
-        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate_versions(
             get_objects,
-            &delimiter,
-            max_keys,
-            disk_has_more,
-            next_cache_id.as_deref(),
-            true,
-            last_scanned_key.as_deref(),
+            VersionedListPagination {
+                delimiter: &delimiter,
+                max_keys,
+                disk_has_more,
+                cache_id: next_cache_id.as_deref(),
+                marker: opts.marker.as_deref(),
+                last_scanned_key: last_scanned_key.as_deref(),
+                raw_keys: entries.entries().iter().map(|entry| entry.name.as_str()),
+            },
         );
 
         Ok(ListObjectVersionsInfo {
@@ -5727,85 +5983,14 @@ impl Sets {
         let log_context = ListPathLogContext::from_options(&o);
 
         let cancel = CancellationToken::new();
-        let _cancel_guard = cancel.clone().drop_guard();
-        let (err_tx, mut err_rx) = broadcast::channel::<Arc<Error>>(1);
-        let (sender, recv) = mpsc::channel(o.limit as usize);
-
         ensure_producer_limit_state(&mut o);
+        let (sender, recv) = mpsc::channel(o.limit as usize);
         let sets = self.clone();
-        let opts = o.clone();
-        let cancel_rx1 = cancel.clone();
-        let cancel_rx1_for_err = cancel_rx1.clone();
-        let err_tx1 = err_tx.clone();
-        let job1_context = log_context.clone();
-        let job1 = tokio::spawn(
-            async move {
-                let mut opts = opts;
-                opts.stop_disk_at_limit = true;
-                if let Err(err) = sets.list_merged(cancel_rx1, opts, sender).await
-                    && !cancel_rx1_for_err.is_cancelled()
-                {
-                    log_list_path_worker_error("sets", "list_merged", &job1_context, &err);
-                    let _ = err_tx1.send(Arc::new(err));
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
-
-        let cancel_rx2 = cancel.clone();
-        let (result_tx, mut result_rx) = mpsc::channel(1);
-        let err_tx2 = err_tx.clone();
-        let opts = o.clone();
-        let job2_context = log_context.clone();
-        let job2 = tokio::spawn(
-            async move {
-                match gather_results(cancel_rx2, opts, recv, result_tx).await {
-                    Ok(GatherResultsState::LimitReached) => cancel.cancel(),
-                    Ok(GatherResultsState::InputClosed) => {}
-                    // Consumer disconnect (e.g. client cancelled the request)
-                    // is a benign completion: no error log, no err_tx send.
-                    // The explicit cancel is idempotent and avoids relying on
-                    // the wrapper's drop-guard ordering to stop the producer.
-                    Ok(GatherResultsState::ConsumerGone) => cancel.cancel(),
-                    // Invariant (rustfs/backlog#1306): gather_results maps a
-                    // consumer disconnect to Ok(ConsumerGone) and has no
-                    // fallible pre-send path, so this arm is currently
-                    // unreachable. It is kept as a guard: it stays correct only
-                    // while a *real* gather_results error would still surface as
-                    // an error here. Real producer/listing errors take the
-                    // separate job1 -> err_tx -> err_rx path below, unaffected.
-                    Err(err) => {
-                        log_list_path_worker_error("sets", "gather_results", &job2_context, &err);
-                        let _ = err_tx2.send(Arc::new(err));
-                        cancel.cancel();
-                    }
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
-
-        let mut result = tokio::select! {
-            res = err_rx.recv() => {
-                match res {
-                    Ok(err) => {
-                        log_list_path_worker_error("sets", "worker_error", &log_context, err.as_ref());
-                        MetaCacheEntriesSortedResult { entries: None, err: Some(to_filemeta_err(err.as_ref().clone())) }
-                    },
-                    Err(err) => {
-                        log_list_path_worker_error("sets", "error_channel_closed", &log_context, &err);
-                        MetaCacheEntriesSortedResult { entries: None, err: Some(rustfs_filemeta::Error::other(err)) }
-                    },
-                }
-            }
-            Some(result) = result_rx.recv() => result,
-        };
-
-        join_all(vec![job1, job2]).await;
-
-        if let Ok(err) = err_rx.try_recv() {
-            log_list_path_worker_error("sets", "trailing_worker_error", &log_context, err.as_ref());
-            result.err = Some(to_filemeta_err(err.as_ref().clone()));
-        }
+        let mut opts = o.clone();
+        opts.stop_disk_at_limit = true;
+        let producer_cancel = cancel.clone();
+        let producer = async move { sets.list_merged(producer_cancel, opts, sender).await.map(|_| ()) };
+        let mut result = collect_list_path_results("sets", &log_context, cancel, o.clone(), recv, producer).await;
 
         if result.err.is_some() {
             log_list_path_finished("sets", &log_context, list_path_started.elapsed().as_secs_f64() * 1000.0, 0, true);
@@ -6539,23 +6724,22 @@ impl SetDisks {
         // Last RAW scanned key, captured before folding (ECA-03 / #944).
         let last_scanned_key = last_scanned_entry_name(list_result.entries.as_ref());
 
-        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
-            &list_result.entries.unwrap_or_default(),
-            bucket,
-            prefix,
-            delimiter.clone(),
-            version_marker,
-        )
-        .await;
+        let entries = list_result.entries.unwrap_or_default();
+        let get_objects =
+            ObjectInfo::from_meta_cache_entries_sorted_versions(&entries, bucket, prefix, delimiter.clone(), version_marker)
+                .await;
 
-        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate_versions(
             get_objects,
-            &delimiter,
-            max_keys,
-            disk_has_more,
-            next_cache_id.as_deref(),
-            true,
-            last_scanned_key.as_deref(),
+            VersionedListPagination {
+                delimiter: &delimiter,
+                max_keys,
+                disk_has_more,
+                cache_id: next_cache_id.as_deref(),
+                marker: opts.marker.as_deref(),
+                last_scanned_key: last_scanned_key.as_deref(),
+                raw_keys: entries.entries().iter().map(|entry| entry.name.as_str()),
+            },
         );
 
         Ok(ListObjectVersionsInfo {
@@ -6744,85 +6928,14 @@ impl SetDisks {
         let log_context = ListPathLogContext::from_options(&o);
 
         let cancel = CancellationToken::new();
-        let _cancel_guard = cancel.clone().drop_guard();
-        let (err_tx, mut err_rx) = broadcast::channel::<Arc<Error>>(1);
-        let (sender, recv) = mpsc::channel(o.limit as usize);
-
         ensure_producer_limit_state(&mut o);
+        let (sender, recv) = mpsc::channel(o.limit as usize);
         let set = self.clone();
-        let opts = o.clone();
-        let cancel_rx1 = cancel.clone();
-        let cancel_rx1_for_err = cancel_rx1.clone();
-        let err_tx1 = err_tx.clone();
-        let job1_context = log_context.clone();
-        let job1 = tokio::spawn(
-            async move {
-                let mut opts = opts;
-                opts.stop_disk_at_limit = true;
-                if let Err(err) = set.list_path(cancel_rx1, opts, sender).await
-                    && !cancel_rx1_for_err.is_cancelled()
-                {
-                    log_list_path_worker_error("set_disks", "list_path", &job1_context, &err);
-                    let _ = err_tx1.send(Arc::new(err));
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
-
-        let cancel_rx2 = cancel.clone();
-        let (result_tx, mut result_rx) = mpsc::channel(1);
-        let err_tx2 = err_tx.clone();
-        let opts = o.clone();
-        let job2_context = log_context.clone();
-        let job2 = tokio::spawn(
-            async move {
-                match gather_results(cancel_rx2, opts, recv, result_tx).await {
-                    Ok(GatherResultsState::LimitReached) => cancel.cancel(),
-                    Ok(GatherResultsState::InputClosed) => {}
-                    // Consumer disconnect (e.g. client cancelled the request)
-                    // is a benign completion: no error log, no err_tx send.
-                    // The explicit cancel is idempotent and avoids relying on
-                    // the wrapper's drop-guard ordering to stop the producer.
-                    Ok(GatherResultsState::ConsumerGone) => cancel.cancel(),
-                    // Invariant (rustfs/backlog#1306): gather_results maps a
-                    // consumer disconnect to Ok(ConsumerGone) and has no
-                    // fallible pre-send path, so this arm is currently
-                    // unreachable. It is kept as a guard: it stays correct only
-                    // while a *real* gather_results error would still surface as
-                    // an error here. Real producer/listing errors take the
-                    // separate job1 -> err_tx -> err_rx path below, unaffected.
-                    Err(err) => {
-                        log_list_path_worker_error("set_disks", "gather_results", &job2_context, &err);
-                        let _ = err_tx2.send(Arc::new(err));
-                        cancel.cancel();
-                    }
-                }
-            }
-            .instrument(tracing::Span::current()),
-        );
-
-        let mut result = tokio::select! {
-            res = err_rx.recv() => {
-                match res {
-                    Ok(err) => {
-                        log_list_path_worker_error("set_disks", "worker_error", &log_context, err.as_ref());
-                        MetaCacheEntriesSortedResult { entries: None, err: Some(to_filemeta_err(err.as_ref().clone())) }
-                    },
-                    Err(err) => {
-                        log_list_path_worker_error("set_disks", "error_channel_closed", &log_context, &err);
-                        MetaCacheEntriesSortedResult { entries: None, err: Some(rustfs_filemeta::Error::other(err)) }
-                    },
-                }
-            }
-            Some(result) = result_rx.recv() => result,
-        };
-
-        join_all(vec![job1, job2]).await;
-
-        if let Ok(err) = err_rx.try_recv() {
-            log_list_path_worker_error("set_disks", "trailing_worker_error", &log_context, err.as_ref());
-            result.err = Some(to_filemeta_err(err.as_ref().clone()));
-        }
+        let mut opts = o.clone();
+        opts.stop_disk_at_limit = true;
+        let producer_cancel = cancel.clone();
+        let producer = async move { set.list_path(producer_cancel, opts, sender).await.map(|_| ()) };
+        let mut result = collect_list_path_results("set_disks", &log_context, cancel, o.clone(), recv, producer).await;
 
         if result.err.is_some() {
             log_list_path_finished("set_disks", &log_context, list_path_started.elapsed().as_secs_f64() * 1000.0, 0, true);
@@ -7023,7 +7136,9 @@ impl SetDisks {
         );
 
         let limit = {
-            if opts.limit > 0 && opts.stop_disk_at_limit {
+            // A raw scan budget can be consumed entirely by keys folding into
+            // one common prefix. Let the logical collector stop these walks.
+            if opts.limit > 0 && opts.stop_disk_at_limit && !list_path_folds_common_prefixes(&opts) {
                 opts.limit + 4 + (opts.limit / 16)
             } else {
                 0
@@ -7247,6 +7362,12 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 }
 
 // list_path_raw
+
+#[cfg(test)]
+mod differential_tests;
+
+#[cfg(test)]
+mod lifecycle_exact_tests;
 
 #[cfg(test)]
 mod test {
@@ -7477,7 +7598,7 @@ mod test {
         }
     }
 
-    fn test_pending_version_purge_meta_entry(bucket: &str, name: &str) -> (MetaCacheEntry, Uuid) {
+    pub(super) fn test_pending_version_purge_meta_entry(bucket: &str, name: &str) -> (MetaCacheEntry, Uuid) {
         let version_id = Uuid::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0);
         let data_dir = Uuid::from_u128(0xabcd_ef12_3456_7890_abcd_ef12_3456_7890);
         let mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
@@ -7924,6 +8045,117 @@ mod test {
             .expect("gather_results should succeed");
         assert_eq!(state, GatherResultsState::LimitReached);
         assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn list_path_gather_results_counts_common_prefixes_before_page_limit() {
+        for separator in ["/", "-"] {
+            for extra_object in [false, true] {
+                let prefix_name = format!("a{separator}");
+                let first = if separator == "/" {
+                    prefix_name.clone()
+                } else {
+                    format!("{prefix_name}first")
+                };
+                let mut input = vec![test_object_meta_entry(&first)];
+                if separator == "/" {
+                    input.push(test_dir_meta_entry(&prefix_name));
+                } else {
+                    input.push(test_object_meta_entry(&format!("{prefix_name}second")));
+                }
+                input.push(test_object_meta_entry("b"));
+                if extra_object {
+                    input.push(test_object_meta_entry("c"));
+                }
+                let (entry_tx, entry_rx) = mpsc::channel(input.len());
+                let (result_tx, mut result_rx) = mpsc::channel(1);
+                for entry in input {
+                    entry_tx.send(entry).await.expect("delimiter candidates should queue");
+                }
+                drop(entry_tx);
+                let state = gather_results(
+                    CancellationToken::new(),
+                    ListPathOptions {
+                        bucket: "bucket".to_owned(),
+                        separator: Some(separator.to_owned()),
+                        recursive: separator != "/",
+                        include_directories: separator == "/",
+                        limit: 3,
+                        ..Default::default()
+                    },
+                    entry_rx,
+                    result_tx,
+                )
+                .await
+                .expect("delimiter collection should succeed");
+                let result = result_rx.recv().await.expect("delimiter page should arrive");
+                let mut expected = vec![first, "b".to_owned()];
+                if extra_object {
+                    expected.push("c".to_owned());
+                }
+                assert_eq!(
+                    result
+                        .entries
+                        .expect("delimiter entries should exist")
+                        .entries()
+                        .into_iter()
+                        .map(|entry| entry.name.clone())
+                        .collect::<Vec<_>>(),
+                    expected,
+                    "delimiter={separator}, extra={extra_object}"
+                );
+                assert_eq!(result.err.is_none(), extra_object, "n=max must reach EOF; max+1 must retain lookahead");
+                assert_eq!(
+                    state,
+                    if extra_object {
+                        GatherResultsState::LimitReached
+                    } else {
+                        GatherResultsState::InputClosed
+                    }
+                );
+            }
+        }
+        for include_marker in [false, true] {
+            let (entry_tx, entry_rx) = mpsc::channel(2);
+            let (result_tx, mut result_rx) = mpsc::channel(1);
+            for name in ["a/child", "b"] {
+                entry_tx
+                    .send(test_object_meta_entry(name))
+                    .await
+                    .expect("marker candidates should queue");
+            }
+            drop(entry_tx);
+            gather_results(
+                CancellationToken::new(),
+                ListPathOptions {
+                    bucket: "bucket".to_owned(),
+                    separator: Some("/".to_owned()),
+                    recursive: true,
+                    include_directories: true,
+                    marker: Some("a/".to_owned()),
+                    include_marker,
+                    limit: 3,
+                    ..Default::default()
+                },
+                entry_rx,
+                result_tx,
+            )
+            .await
+            .expect("logical marker collection should succeed");
+            let entries = result_rx
+                .recv()
+                .await
+                .expect("logical marker page should arrive")
+                .entries
+                .expect("logical marker entries should exist");
+            let projected = ObjectInfo::from_meta_cache_entries_sorted_infos(&entries, "bucket", "", Some("/".to_owned())).await;
+            let names: Vec<_> = projected.into_iter().map(|object| object.name).collect();
+            assert_eq!(
+                names,
+                if include_marker { vec!["a/", "b"] } else { vec!["b"] },
+                "a folded prefix equal to the marker must follow include_marker={include_marker}"
+            );
+        }
     }
 
     #[test]
@@ -8693,6 +8925,223 @@ mod test {
         assert_eq!(next_marker.as_deref(), Some("obj-0002"));
     }
 
+    // ECA-03 / #944 (versioned variant): a versions listing whose raw keys fully
+    // collapse into fewer than max_keys common prefixes must still report
+    // truncation and carry a continuation marker, otherwise every key and every
+    // version past the scan window is silently dropped.
+    #[test]
+    fn list_objects_paginate_versioned_delimiter_refold_reports_truncation() {
+        let delimiter = Some("-".to_string());
+        let get_objects = vec![folded_prefix_object("data-")];
+
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) = list_objects_paginate(
+            get_objects,
+            &delimiter,
+            1000,
+            true, // disk_has_more: walker filled its raw candidate limit
+            None,
+            true,
+            Some("data-1001"), // last RAW scanned key
+        );
+
+        assert!(objects.is_empty());
+        assert_eq!(prefixes, vec!["data-".to_string()]);
+        assert!(is_truncated, "versioned re-folded page with more on disk must be truncated");
+        // The marker must be the last RAW key, NOT the folded prefix "data-":
+        // versioned walks are excluded from the gather-level common-prefix
+        // collector, so a prefix marker could never advance `forward_past`.
+        assert_eq!(next_marker.as_deref(), Some("data-1001"));
+        assert!(next_version_idmarker.is_none(), "a folded prefix page carries no version marker");
+    }
+
+    // Same contract when the page is FILLED by folded common prefixes
+    // (`visible_count >= max_keys`): the versioned path must still prefer the
+    // raw scanned key over `prefixes.last()`, which would loop forever.
+    #[test]
+    fn list_objects_paginate_versioned_delimiter_full_prefix_page_uses_raw_marker() {
+        let delimiter = Some("-".to_string());
+        let get_objects = vec![folded_prefix_object("data-")];
+
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) =
+            list_objects_paginate(get_objects, &delimiter, 1, true, None, true, Some("data-0002"));
+
+        assert!(objects.is_empty());
+        assert_eq!(prefixes, vec!["data-".to_string()]);
+        assert!(is_truncated, "a prefix-filled versioned page with more on disk must be truncated");
+        assert_eq!(next_marker.as_deref(), Some("data-0002"));
+        assert!(next_version_idmarker.is_none());
+    }
+
+    // End-to-end simulation of versioned pagination with `max_keys=1`, where the
+    // next page resumes via a bare key marker (`forward_past` keeps `name > marker`
+    // only, matching `inner_list_object_versions_with_projection` without a version
+    // marker). Before the raw-key marker the same window replayed forever, so
+    // `other-`/`zzz` were never listed.
+    #[test]
+    fn list_objects_paginate_versioned_delimiter_prefix_filled_pages_terminate() {
+        let all: Vec<String> = [
+            "data-0001",
+            "data-0002",
+            "data-0003",
+            "data-0004",
+            "data-0005",
+            "other-0001",
+            "zzz",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let delimiter = Some("-".to_string());
+        let max_keys = 1i32;
+        let limit = max_keys_plus_one(max_keys, true) as usize;
+
+        let mut marker: Option<String> = None;
+        let mut seen_prefixes = Vec::new();
+        let mut seen_objects = Vec::new();
+        let mut page_prefixes = Vec::new();
+        let mut pages = 0;
+
+        loop {
+            pages += 1;
+            assert!(pages <= 16, "versioned pagination did not terminate (possible infinite loop)");
+
+            let start = match &marker {
+                Some(m) => all.partition_point(|k| k.as_str() <= m.as_str()),
+                None => 0,
+            };
+            let window: Vec<String> = all[start..].iter().take(limit).cloned().collect();
+            let disk_has_more = window.len() == limit;
+            let last_scanned = window.last().cloned();
+
+            let get_objects = fold_delimiter_page(&window, "", "-");
+            let (objects, prefixes, is_truncated, next_marker, _v) = super::list_objects_paginate_versions(
+                get_objects,
+                super::VersionedListPagination {
+                    delimiter: &delimiter,
+                    max_keys,
+                    disk_has_more,
+                    cache_id: None,
+                    marker: marker.as_deref(),
+                    last_scanned_key: last_scanned.as_deref(),
+                    raw_keys: window.iter().map(String::as_str),
+                },
+            );
+
+            assert!(
+                prefixes.windows(2).all(|pair| pair[0] != pair[1]),
+                "a page must not contain duplicate common prefixes"
+            );
+            assert!(
+                prefixes
+                    .iter()
+                    .all(|prefix| marker.as_deref().is_none_or(|marker| prefix.as_str() > marker)),
+                "a resumed page must not repeat a prefix at or before its key marker"
+            );
+            page_prefixes.push(prefixes.clone());
+            seen_objects.extend(objects.into_iter().map(|object| object.name));
+            seen_prefixes.extend(prefixes);
+
+            if !is_truncated {
+                assert!(next_marker.is_none());
+                break;
+            }
+
+            let next = next_marker.expect("truncated versioned page must carry a continuation marker");
+            if let Some(prev) = &marker {
+                assert!(
+                    next.as_str() > prev.as_str(),
+                    "next_marker must strictly advance to stay finite, got {next} after {prev}"
+                );
+            }
+            marker = Some(next);
+        }
+
+        assert_eq!(
+            page_prefixes,
+            vec![vec!["data-".to_string()], vec![], vec!["other-".to_string()], vec![]],
+            "versioned pagination must not repeat a folded prefix while scanning later raw keys"
+        );
+        assert_eq!(
+            seen_prefixes,
+            vec!["data-".to_string(), "other-".to_string()],
+            "versioned pagination must preserve the ordered visible result sequence"
+        );
+        assert_eq!(seen_objects, vec!["zzz".to_string()]);
+    }
+
+    #[test]
+    fn list_objects_paginate_versioned_prefix_boundary_uses_last_raw_key_in_returned_prefix() {
+        let all: Vec<String> = ["alpha-0001", "beta-0001", "charlie-0001"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let delimiter = Some("-".to_string());
+        let max_keys = 1;
+        let limit = max_keys_plus_one(max_keys, true) as usize;
+        let mut marker: Option<String> = None;
+        let mut page_prefixes = Vec::new();
+        let mut pages = 0;
+
+        loop {
+            pages += 1;
+            assert!(pages <= 8, "versioned prefix pagination did not terminate");
+
+            let start = marker
+                .as_deref()
+                .map(|marker| all.partition_point(|key| key.as_str() <= marker))
+                .unwrap_or(0);
+            let window: Vec<String> = all[start..].iter().take(limit).cloned().collect();
+            let disk_has_more = window.len() == limit;
+            let last_scanned = window.last().cloned();
+
+            let get_objects = fold_delimiter_page(&window, "", "-");
+            let (objects, prefixes, is_truncated, next_marker, _) = super::list_objects_paginate_versions(
+                get_objects,
+                super::VersionedListPagination {
+                    delimiter: &delimiter,
+                    max_keys,
+                    disk_has_more,
+                    cache_id: None,
+                    marker: marker.as_deref(),
+                    last_scanned_key: last_scanned.as_deref(),
+                    raw_keys: window.iter().map(String::as_str),
+                },
+            );
+
+            assert_eq!(objects.len() + prefixes.len(), 1, "a page must respect max-keys");
+            page_prefixes.push(prefixes);
+
+            if !is_truncated {
+                assert!(next_marker.is_none());
+                break;
+            }
+
+            let next = next_marker.expect("truncated page must carry a continuation key marker");
+            if let Some(previous) = &marker {
+                assert!(next > *previous, "the continuation marker must strictly advance");
+            }
+            marker = Some(next);
+        }
+
+        assert_eq!(
+            page_prefixes,
+            vec![
+                vec!["alpha-".to_string()],
+                vec!["beta-".to_string()],
+                vec!["charlie-".to_string()]
+            ]
+        );
+    }
+
+    #[test]
+    fn versioned_marker_filter_does_not_change_no_delimiter_directories() {
+        let mut objects = vec![folded_prefix_object("data-")];
+        super::filter_versions_common_prefixes_after_marker(&mut objects, None, Some("z"));
+
+        assert_eq!(objects.len(), 1);
+        assert!(super::versioned_prefix_page_boundary_key(&objects, std::iter::once("data-"), None, 1, true).is_none());
+    }
+
     // End-to-end pagination over 5000 `data-*` + 100 `other-*` with delimiter '-'.
     // Every full page re-folds to a single common prefix (< max_keys), the exact
     // trigger for ECA-03 / #944. Asserts pagination terminates in a bounded number
@@ -8900,6 +9349,38 @@ mod test {
     }
 
     #[test]
+    fn persistent_listing_snapshots_cannot_restore_legacy_encrypted_fingerprints() {
+        let mut object = ObjectInfo {
+            name: "encrypted".to_owned(),
+            etag: Some("fbfcbcc6d2f035411e6268c8b119593e".to_owned()),
+            user_defined: Arc::new(HashMap::from([(
+                "x-amz-server-side-encryption-customer-algorithm".to_owned(),
+                "AES256".to_owned(),
+            )])),
+            ..Default::default()
+        };
+        let snapshot = PersistentListMetadataObject::from_object_info(&object);
+        assert!(snapshot.to_object_info("bucket").etag.is_none());
+        let mut old_snapshot = snapshot;
+        old_snapshot.etag = object.etag.clone();
+        let old_contents = format!(
+            "# rustfs-listobjects-key-only-v2\n{}\n",
+            encode_persistent_list_metadata_object(&old_snapshot)
+        );
+        let old_index = parse_persistent_key_only_index(&old_contents);
+        assert_ne!(old_index.format_version, PERSISTENT_KEY_ONLY_INDEX_FORMAT_VERSION);
+
+        rustfs_utils::http::metadata_compat::insert_str(
+            Arc::make_mut(&mut object.user_defined),
+            rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG,
+            "v1".to_owned(),
+        );
+        assert_eq!(PersistentListMetadataObject::from_object_info(&object).etag, object.etag);
+        object.user_defined = Arc::new(HashMap::new());
+        assert_eq!(PersistentListMetadataObject::from_object_info(&object).etag, object.etag);
+    }
+
+    #[test]
     fn persistent_key_only_index_parses_legacy_keys_and_metadata_snapshots() {
         let object = PersistentListMetadataObject {
             name: "object-b".to_string(),
@@ -8977,6 +9458,29 @@ mod test {
         assert_eq!(result.info.objects[0].etag.as_deref(), Some("etag-z"));
         assert_eq!(result.info.prefixes, vec!["photos/2026/nested/".to_string()]);
         assert!(!result.info.is_truncated);
+
+        let resumed = list_objects_from_metadata_snapshot_candidates(
+            "bucket",
+            "photos/2026/",
+            Some("photos/2026/nested/"),
+            &Some("/".to_string()),
+            1,
+            &objects,
+        );
+        assert!(
+            resumed.info.prefixes.is_empty(),
+            "metadata-fast cursors must not replay an emitted prefix"
+        );
+        assert_eq!(
+            resumed
+                .info
+                .objects
+                .iter()
+                .map(|object| object.name.as_str())
+                .collect::<Vec<_>>(),
+            ["photos/2026/z.jpg"]
+        );
+        assert!(!resumed.info.is_truncated);
     }
 
     #[test]
@@ -9617,6 +10121,67 @@ mod test {
         }
     }
 
+    // #6898: what an abandoned DeleteObjects left on every disk (rollback
+    // backup plus marked data dir) no longer blocks DeleteBucket after an empty
+    // recursive listing of the bucket.
+    #[tokio::test]
+    async fn empty_recursive_listing_purges_stranded_delete_rollback_backups() {
+        use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+        use crate::storage_api_contracts::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
+
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        let bucket = "listing-purge-rollback-backup";
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created with authoritative metadata");
+        let transaction = uuid::Uuid::new_v4();
+        for object in ["repro/obj-00001.bin", "repro/obj-00002.bin"] {
+            let data_dir = uuid::Uuid::new_v4();
+            for dir in &dirs {
+                let object_dir = dir.path().join(bucket).join(object);
+                let residue = object_dir.join(data_dir.to_string());
+                tokio::fs::create_dir_all(&residue)
+                    .await
+                    .expect("committed data dir should be created");
+                tokio::fs::write(residue.join("part.1"), b"stale")
+                    .await
+                    .expect("stale part should be written");
+                tokio::fs::write(
+                    residue.join(format!("{}{}", crate::disk::local::DELETE_DATA_DIR_MARKER_PREFIX, transaction)),
+                    [],
+                )
+                .await
+                .expect("committed delete marker should be written");
+                let backup = object_dir.join(transaction.to_string());
+                tokio::fs::create_dir_all(&backup)
+                    .await
+                    .expect("rollback dir should be created");
+                tokio::fs::write(backup.join(crate::disk::STORAGE_FORMAT_FILE_BACKUP), b"rollback metadata")
+                    .await
+                    .expect("rollback backup should be written");
+            }
+        }
+
+        let result = store
+            .clone()
+            .list_objects_generic(bucket, "", None, None, 1000, false)
+            .await
+            .expect("recursive bucket listing should succeed");
+        assert!(result.objects.is_empty());
+        for dir in &dirs {
+            assert!(
+                !dir.path().join(bucket).join("repro").exists(),
+                "the empty listing should reclaim the stranded delete residue"
+            );
+        }
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("the bucket is empty once the residue is reclaimed");
+    }
+
     #[tokio::test]
     async fn empty_recursive_bucket_listing_purges_orphan_directory_prefixes() {
         use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
@@ -9937,6 +10502,7 @@ mod test {
             .expect("bucket should be created with authoritative metadata");
         let committed_dir = uuid::Uuid::new_v4();
         let unmarked_dir = uuid::Uuid::new_v4();
+        let backup_dir = uuid::Uuid::new_v4();
         let transaction = uuid::Uuid::new_v4();
         for dir in &dirs {
             let committed = dir
@@ -9947,6 +10513,9 @@ mod test {
             tokio::fs::create_dir_all(&committed)
                 .await
                 .expect("committed delete residue should be created");
+            tokio::fs::write(committed.join(crate::disk::STORAGE_FORMAT_FILE_BACKUP), b"rollback metadata")
+                .await
+                .expect("committed rollback backup should be written");
             tokio::fs::write(committed.join("part.1"), b"stale")
                 .await
                 .expect("stale part should be written");
@@ -9970,6 +10539,18 @@ mod test {
             tokio::fs::write(unmarked.join("part.1"), b"stale")
                 .await
                 .expect("stale part should be written");
+
+            let backup = dir
+                .path()
+                .join(bucket)
+                .join("metrics/statefulset/2026/08/26/18/object.parquet")
+                .join(backup_dir.to_string());
+            tokio::fs::create_dir_all(&backup)
+                .await
+                .expect("rollback backup directory should be created");
+            tokio::fs::write(backup.join(crate::disk::STORAGE_FORMAT_FILE_BACKUP), b"rollback metadata")
+                .await
+                .expect("rollback backup should be written");
         }
 
         let result = store
@@ -9978,7 +10559,7 @@ mod test {
             .await
             .expect("delimiter listing should succeed");
         assert!(result.objects.is_empty());
-        assert!(result.prefixes.is_empty(), "neither residue subtree may surface as a prefix");
+        assert!(result.prefixes.is_empty(), "residue subtrees may not surface as prefixes");
         for dir in &dirs {
             let metrics = dir.path().join(bucket).join("metrics");
             assert!(
@@ -9992,6 +10573,17 @@ mod test {
                     .join("part.1")
                     .exists(),
                 "residue without a committed marker must survive the purge"
+            );
+            assert_eq!(
+                tokio::fs::read(
+                    metrics
+                        .join("statefulset/2026/08/26/18/object.parquet")
+                        .join(backup_dir.to_string())
+                        .join(crate::disk::STORAGE_FORMAT_FILE_BACKUP)
+                )
+                .await
+                .expect("uncommitted rollback backup must survive the listing"),
+                b"rollback metadata"
             );
         }
     }
@@ -10089,6 +10681,23 @@ mod test {
         assert_eq!(result.prefixes, vec!["photos/2026/archive/".to_string()]);
         assert!(result.is_truncated);
         assert_eq!(result.next_marker.as_deref(), Some("photos/2026/archive/"));
+
+        let resumed = list_objects_from_verified_index_candidates(
+            "photos/2026/",
+            result.next_marker.as_deref(),
+            &Some("/".to_string()),
+            1,
+            &candidates,
+            |key| async move { Ok(Some(test_live_object_info(&key, "live-etag"))) },
+        )
+        .await
+        .expect("verified prefix continuation should succeed");
+        assert!(resumed.prefixes.is_empty(), "verified cursors must not replay an emitted prefix");
+        assert_eq!(
+            resumed.objects.iter().map(|object| object.name.as_str()).collect::<Vec<_>>(),
+            ["photos/2026/d.jpg"]
+        );
+        assert!(!resumed.is_truncated);
     }
 
     #[tokio::test]
@@ -11649,6 +12258,82 @@ mod test {
     }
 
     #[tokio::test]
+    async fn merge_entry_channels_data_movement_accepts_inline_layout_changes() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let external = test_object_meta_entry_with_erasure_versions("key", &[(time, "same-etag", 2, 1)]);
+        let inline = rewrite_test_version(
+            test_object_meta_entry_with_erasure_versions("key", &[(time, "same-etag", 5, 4)]),
+            |version| {
+                rustfs_utils::http::insert_bytes(
+                    &mut version.object.as_mut().expect("object version").meta_sys,
+                    rustfs_utils::http::SUFFIX_INLINE_DATA,
+                    b"true".to_vec(),
+                );
+            },
+        );
+        let legacy_inline = rewrite_test_version(inline.clone(), |version| {
+            version
+                .object
+                .as_mut()
+                .expect("object version")
+                .meta_sys
+                .remove(&rustfs_utils::http::internal_key_rustfs(rustfs_utils::http::SUFFIX_INLINE_DATA));
+        });
+        let copies = [external, legacy_inline, inline];
+        let mut expected = None;
+        for order in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+            let merged = merge_test_object_entries(order.map(|index| copies[index].clone()).to_vec())
+                .await
+                .expect("physical inline placement and legacy aliases must not change object identity");
+            assert_eq!(
+                merged
+                    .file_info_versions("bucket")
+                    .expect("decode merged history")
+                    .versions
+                    .len(),
+                1
+            );
+            if let Some(expected) = &expected {
+                assert_eq!(&merged.metadata, expected, "representation must not depend on pool order");
+            } else {
+                expected = Some(merged.metadata);
+            }
+        }
+    }
+
+    #[test]
+    fn data_movement_listing_conflict_logs_identity_without_metadata_values() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let mut original = test_object_meta_entry_with_erasure_versions("failing-key", &[(time, "same-etag", 2, 1)]);
+        let conflicting = rewrite_test_version(original.clone(), |version| {
+            version
+                .object
+                .as_mut()
+                .expect("object version")
+                .meta_user
+                .insert("x-amz-meta-private".to_string(), "sensitive-value-must-not-be-logged".to_string());
+        });
+        assert_eq!(
+            super::merge_object_entry_versions(&mut original, std::iter::once(conflicting))
+                .expect_err("conflicting user metadata must still fail closed"),
+            StorageError::FileCorrupt
+        );
+        let output = logs.contents();
+        assert!(output.contains("listing_merge_rejected"));
+        assert!(output.contains("failing-key"));
+        assert!(output.contains("00000000-0000-0000-0000-000000000001"));
+        assert!(output.contains("version_identity_conflict"));
+        assert!(!output.contains("sensitive-value-must-not-be-logged"));
+    }
+
+    #[tokio::test]
     async fn merge_entry_channels_defers_free_version_while_same_remote_source_is_live() {
         let live = test_transitioned_meta_entry("key", "remote/shared", false);
         let free = test_transitioned_meta_entry("key", "remote/shared", true);
@@ -11789,6 +12474,204 @@ mod test {
             "three marker copies across two EC domains do not form a quorum"
         );
         assert!(!versions.versions[0].deleted);
+    }
+
+    async fn collect_list_path_results<P>(
+        cancel: CancellationToken,
+        opts: ListPathOptions,
+        recv: mpsc::Receiver<MetaCacheEntry>,
+        producer: P,
+    ) -> rustfs_filemeta::MetaCacheEntriesSortedResult
+    where
+        P: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        let context = super::ListPathLogContext::from_options(&opts);
+        super::collect_list_path_results("test", &context, cancel, opts, recv, producer).await
+    }
+
+    #[tokio::test]
+    async fn list_path_workers_report_producer_panic_instead_of_empty_eof() {
+        let (sender, recv) = mpsc::channel(1);
+        let result = timeout(
+            Duration::from_secs(1),
+            collect_list_path_results(CancellationToken::new(), ListPathOptions::default(), recv, async move {
+                let _sender = sender;
+                panic!("test listing producer panic");
+            }),
+        )
+        .await
+        .expect("producer panic must not strand the collector");
+        assert!(
+            result
+                .err
+                .expect("panic must be reported")
+                .to_string()
+                .contains("listing worker panicked")
+        );
+    }
+
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    #[tokio::test]
+    async fn list_path_producer_worker_preserves_s3_and_caller_context() {
+        let mut request = rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard::new("GET");
+        let api_operation = request
+            .in_scope(|| {
+                rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::ListObjectsV2);
+                rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context()
+            })
+            .expect("dispatched list operation should be captured");
+        request.response(200);
+
+        let (sender, recv) = mpsc::channel(1);
+        let opts = ListPathOptions {
+            caller: rustfs_io_metrics::ListObjectsGatherCaller::S3List,
+            ..Default::default()
+        };
+        let result = rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(Some(api_operation), async move {
+            collect_list_path_results(CancellationToken::new(), opts, recv, async move {
+                assert_eq!(
+                    rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name(),
+                    Some("s3:ListObjectsV2")
+                );
+                assert_eq!(
+                    crate::cluster::rpc::runtime_sources::current_read_version_request_caller(),
+                    Some(rustfs_io_metrics::internode_metrics::ReadVersionRequestCaller::ListObjects)
+                );
+                drop(sender);
+                Ok(())
+            })
+            .await
+        })
+        .await;
+
+        assert!(result.err.is_some(), "the empty page channel remains an error");
+        assert_eq!(rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name(), None);
+    }
+
+    #[tokio::test]
+    async fn list_path_workers_preserve_error_after_input_closes() {
+        let (sender, recv) = mpsc::channel(1);
+        let result = collect_list_path_results(CancellationToken::new(), ListPathOptions::default(), recv, async move {
+            drop(sender);
+            tokio::task::yield_now().await;
+            Err(StorageError::FileCorrupt)
+        })
+        .await;
+        assert_eq!(result.err, Some(rustfs_filemeta::Error::FileCorrupt));
+    }
+
+    #[tokio::test]
+    async fn list_path_workers_drain_buffer_before_successful_eof() {
+        let (sender, recv) = mpsc::channel(3);
+        let result = collect_list_path_results(
+            CancellationToken::new(),
+            ListPathOptions {
+                limit: 4,
+                incl_deleted: true,
+                ..Default::default()
+            },
+            recv,
+            async move {
+                for name in ["a", "b", "c"] {
+                    sender.try_send(test_meta_entry(name)).expect("queue page");
+                }
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(result.err, Some(rustfs_filemeta::Error::Unexpected));
+        let entries = result.entries.expect("EOF retains entries");
+        assert_eq!(
+            entries.entries().iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_path_workers_abort_stalled_producer_at_page_limit() {
+        let (sender, recv) = mpsc::channel(1);
+        let dropped = CancellationToken::new();
+        let producer_dropped = dropped.clone();
+        let result = timeout(
+            Duration::from_secs(1),
+            collect_list_path_results(
+                CancellationToken::new(),
+                ListPathOptions {
+                    limit: 1,
+                    incl_deleted: true,
+                    ..Default::default()
+                },
+                recv,
+                async move {
+                    let _drop_guard = producer_dropped.drop_guard();
+                    sender.send(test_meta_entry("a")).await.expect("send page");
+                    std::future::pending::<Result<()>>().await
+                },
+            ),
+        )
+        .await
+        .expect("page limit must not wait for a producer that ignores cancellation");
+        assert!(result.err.is_none());
+        assert_eq!(result.entries.expect("page").entries().len(), 1);
+        assert!(dropped.is_cancelled(), "producer must be dropped before the page is returned");
+    }
+
+    #[tokio::test]
+    async fn list_path_workers_parent_abort_drops_both_children() {
+        let (sender, recv) = mpsc::channel(1);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let cancel = CancellationToken::new();
+        let dropped = CancellationToken::new();
+        let producer_dropped = dropped.clone();
+        let parent = tokio::spawn(collect_list_path_results(cancel.clone(), ListPathOptions::default(), recv, async move {
+            let _drop_guard = producer_dropped.drop_guard();
+            started_tx.send(()).expect("notify parent");
+            std::future::pending::<Result<()>>().await
+        }));
+        started_rx.await.expect("producer started");
+        parent.abort();
+        assert!(parent.await.expect_err("parent aborted").is_cancelled());
+        timeout(Duration::from_secs(1), dropped.cancelled())
+            .await
+            .expect("producer dropped");
+        timeout(Duration::from_secs(1), sender.closed())
+            .await
+            .expect("collector dropped");
+        assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn list_path_workers_preserve_ready_error_at_page_limit() {
+        for _ in 0..128 {
+            let (sender, recv) = mpsc::channel(1);
+            let result = collect_list_path_results(
+                CancellationToken::new(),
+                ListPathOptions {
+                    limit: 1,
+                    incl_deleted: true,
+                    ..Default::default()
+                },
+                recv,
+                async move {
+                    sender.try_send(test_meta_entry("a")).expect("queue page");
+                    Err(StorageError::FileCorrupt)
+                },
+            )
+            .await;
+            assert_eq!(result.err, Some(rustfs_filemeta::Error::FileCorrupt));
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_merge_drop_stops_blocked_inputs() {
+        let (input_tx, input_rx) = mpsc::channel(1);
+        let (output_tx, _output_rx) = mpsc::channel(1);
+        let task = super::spawn_listing_merge(CancellationToken::new(), vec![input_rx], output_tx);
+        drop(task);
+
+        timeout(Duration::from_secs(1), input_tx.closed())
+            .await
+            .expect("dropping the merge owner must release an idle producer");
     }
 
     #[tokio::test]

@@ -15,6 +15,9 @@
 //! DeleteObject / DeleteObjects path.
 
 use super::*;
+use crate::app::storage_api::object_usecase::DeleteObjectCondition;
+use s3s::dto::ObjectIdentifier;
+use std::collections::HashSet;
 
 async fn authorize_recursive_delete<T>(
     req: &mut S3Request<T>,
@@ -110,6 +113,48 @@ fn normalize_delete_objects_version_id(
     }
 }
 
+fn parse_delete_objects_condition(object: &ObjectIdentifier) -> Result<Option<DeleteObjectCondition>, s3s::dto::Error> {
+    let Some(etag) = object.e_tag.as_ref() else {
+        return Ok(None);
+    };
+    let (code, message) = if object.version_id.is_some() {
+        (
+            S3ErrorCode::InvalidRequest,
+            "An ETag condition cannot be combined with an explicit VersionId".to_string(),
+        )
+    } else if let Some(etag) = etag.as_strong() {
+        match DeleteObjectCondition::parse(etag) {
+            Ok(condition) => return Ok(Some(condition)),
+            Err(error) => (S3ErrorCode::InvalidArgument, error.to_string()),
+        }
+    } else {
+        (S3ErrorCode::InvalidArgument, "A delete ETag condition must use a strong ETag".to_string())
+    };
+    Err(s3s::dto::Error {
+        code: Some(code.as_str().to_string()),
+        key: Some(object.key.clone()),
+        message: Some(message),
+        version_id: object.version_id.clone(),
+    })
+}
+
+fn delete_objects_action_identity(
+    deleted: &StorageDeletedObject,
+    requested_version_id: Option<Uuid>,
+) -> (String, Option<Uuid>, bool) {
+    let creates_delete_marker = deleted.delete_marker && requested_version_id.is_none();
+    let target_version = if creates_delete_marker {
+        deleted.delete_marker_version_id
+    } else {
+        deleted.version_id.or(requested_version_id)
+    };
+    (
+        deleted.object_name.clone(),
+        target_version.filter(|version| !version.is_nil()),
+        creates_delete_marker,
+    )
+}
+
 #[cfg(test)]
 type DeleteSnapshotTestHook = (String, Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>);
 
@@ -120,7 +165,7 @@ static DELETE_SNAPSHOT_TEST_HOOK: OnceLock<Mutex<Option<DeleteSnapshotTestHook>>
 static DELETE_SOURCE_TEST_HOOK: OnceLock<Mutex<Option<DeleteSnapshotTestHook>>> = OnceLock::new();
 
 #[cfg(test)]
-static DELETE_OBJECTS_AUTH_TEST_HOOK: OnceLock<Mutex<Option<DeleteSnapshotTestHook>>> = OnceLock::new();
+static DELETE_OBJECTS_GENERATION_TEST_HOOK: OnceLock<Mutex<Option<DeleteSnapshotTestHook>>> = OnceLock::new();
 
 #[cfg(test)]
 pub(crate) fn install_delete_snapshot_test_hook(
@@ -185,24 +230,24 @@ async fn wait_for_delete_source_test_hook(bucket: &str) {
 }
 
 #[cfg(test)]
-pub(crate) fn install_delete_objects_auth_test_hook(
+pub(crate) fn install_delete_objects_generation_test_hook(
     bucket: String,
     loaded: Arc<tokio::sync::Barrier>,
     resume: Arc<tokio::sync::Barrier>,
 ) {
-    *DELETE_OBJECTS_AUTH_TEST_HOOK
+    *DELETE_OBJECTS_GENERATION_TEST_HOOK
         .get_or_init(|| Mutex::new(None))
         .lock()
-        .expect("delete objects auth test hook lock should not be poisoned") = Some((bucket, loaded, resume));
+        .expect("delete objects generation test hook lock should not be poisoned") = Some((bucket, loaded, resume));
 }
 
 #[cfg(test)]
-async fn wait_for_delete_objects_auth_test_hook(bucket: &str) {
+async fn wait_for_delete_objects_generation_test_hook(bucket: &str) {
     let hook = {
-        let mut slot = DELETE_OBJECTS_AUTH_TEST_HOOK
+        let mut slot = DELETE_OBJECTS_GENERATION_TEST_HOOK
             .get_or_init(|| Mutex::new(None))
             .lock()
-            .expect("delete objects auth test hook lock should not be poisoned");
+            .expect("delete objects generation test hook lock should not be poisoned");
         if slot.as_ref().is_some_and(|(expected_bucket, _, _)| expected_bucket == bucket) {
             slot.take()
         } else {
@@ -391,6 +436,17 @@ fn delete_response_version_id(version_id: Option<Uuid>, synthetic_version_id: bo
     }
 }
 
+fn delete_marker_response_version_id(
+    committed_version_id: Option<Uuid>,
+    creates_null_delete_marker: bool,
+    synthetic_version_id: bool,
+) -> Option<String> {
+    // The suspended-marker write shape uses None on disk. Only its response
+    // identity is null; changing the write shape would change delete semantics.
+    let version_id = committed_version_id.or_else(|| creates_null_delete_marker.then(Uuid::nil));
+    delete_response_version_id(version_id, synthetic_version_id)
+}
+
 fn project_delete_objects_pre_stat_error(
     object: ObjectToDelete,
     synthetic_version_id: bool,
@@ -437,7 +493,7 @@ fn reduce_delete_objects_result<'a>(
 ) -> Result<&'a StorageDeletedObject, s3s::dto::Error> {
     match error {
         None => Ok(deleted),
-        Some(error) if is_delete_objects_not_found(error) => Ok(deleted),
+        Some(error) if object.delete_condition.is_none() && is_delete_objects_not_found(error) => Ok(deleted),
         Some(error) => {
             let api_error = ApiError::from(error.clone());
             Err(s3s::dto::Error {
@@ -481,6 +537,8 @@ impl DefaultObjectUsecase {
         // Capture the bucket generation before per-object authorization, but
         // do not expose a bucket-state error unless at least one object is authorized.
         let bucket_generation = load_bucket_generation_from_store(store.as_ref(), &req, &bucket).await;
+        #[cfg(test)]
+        wait_for_delete_objects_generation_test_hook(&bucket).await;
 
         let bypass_governance = has_bypass_governance_header(&req.headers);
 
@@ -488,7 +546,9 @@ impl DefaultObjectUsecase {
         struct DeleteResult {
             delete_object: Option<StorageDeletedObject>,
             error: Option<s3s::dto::Error>,
+            emit_side_effects: bool,
             synthetic_version_id: bool,
+            version_suspended: bool,
             // The version identity the request addressed, before any
             // synthetic-directory synthesis. `None` means the request carried
             // no version id, i.e. a committed delete marker was created, not
@@ -509,6 +569,22 @@ impl DefaultObjectUsecase {
         // cannot flood the log.
         let mut bulk_denial_logged = false;
         for (idx, obj_id) in delete.objects.iter().enumerate() {
+            if let Err(err) = validate_object_key(&obj_id.key, "DeleteObjects") {
+                delete_results[idx].error = Some(s3s::dto::Error {
+                    code: Some(err.code().as_str().to_string()),
+                    key: Some(obj_id.key.clone()),
+                    message: Some(err.to_string()),
+                    version_id: obj_id.version_id.clone(),
+                });
+                continue;
+            }
+            let delete_condition = match parse_delete_objects_condition(obj_id) {
+                Ok(condition) => condition,
+                Err(error) => {
+                    delete_results[idx].error = Some(error);
+                    continue;
+                }
+            };
             let raw_version_id = obj_id.version_id.clone();
             let (version_id, version_uuid) = match normalize_delete_objects_version_id(raw_version_id.clone()) {
                 Ok(parsed) => parsed,
@@ -530,7 +606,14 @@ impl DefaultObjectUsecase {
                 req_info.version_id = version_id.clone();
             }
 
-            let auth_res = authorize_request(&mut req, delete_object_authorize_action(version_id.as_deref())).await;
+            let mut auth_res = authorize_request(&mut req, delete_object_authorize_action(version_id.as_deref())).await;
+            if auth_res.is_ok()
+                && delete_condition
+                    .as_ref()
+                    .is_some_and(DeleteObjectCondition::requires_read_permission)
+            {
+                auth_res = authorize_request(&mut req, Action::S3Action(S3Action::GetObjectAction)).await;
+            }
             if auth_res.is_err() {
                 if !bulk_denial_logged {
                     bulk_denial_logged = true;
@@ -572,10 +655,11 @@ impl DefaultObjectUsecase {
                 continue;
             }
 
-            let synthetic_version_id = version_id.is_none() && is_dir_object(&obj_id.key);
+            let synthetic_version_id = delete_condition.is_none() && version_id.is_none() && is_dir_object(&obj_id.key);
             let object = ObjectToDelete {
                 object_name: obj_id.key.clone(),
                 version_id: version_uuid,
+                delete_condition,
                 synthetic_version_id,
                 ..Default::default()
             };
@@ -587,7 +671,7 @@ impl DefaultObjectUsecase {
 
         if authorized_deletes.is_empty() {
             let output = DeleteObjectsOutput {
-                deleted: Some(Vec::new()),
+                deleted: (!delete.quiet.unwrap_or_default()).then(Vec::new),
                 errors: Some(delete_results.into_iter().filter_map(|result| result.error).collect()),
                 ..Default::default()
             };
@@ -595,8 +679,6 @@ impl DefaultObjectUsecase {
             let _ = helper.complete(&result);
             return result;
         }
-        #[cfg(test)]
-        wait_for_delete_objects_auth_test_hook(&bucket).await;
         req.extensions.insert(bucket_generation?);
         let bucket_lock_enabled = object_lock_checks_required(&bucket).await;
 
@@ -678,7 +760,7 @@ impl DefaultObjectUsecase {
                     opts,
                     skip_stat,
                 } = prepared;
-                let synthetic_version_id = object.version_id.is_none() && is_dir_object(&object.object_name);
+                let synthetic_version_id = object.synthetic_version_id;
                 let error = if skip_stat {
                     None
                 } else {
@@ -754,6 +836,7 @@ impl DefaultObjectUsecase {
             return result;
         }
 
+        let mut committed_actions = HashSet::new();
         for (i, err) in errs.iter().enumerate() {
             let didx = object_to_delete_idx[i];
 
@@ -764,8 +847,15 @@ impl DefaultObjectUsecase {
                 delete_results[didx].synthetic_version_id,
             ) {
                 Ok(deleted_object) => {
-                    delete_results[didx].delete_object = Some(deleted_object.clone());
                     let (versioned, version_suspended) = object_versioning[i];
+                    delete_results[didx].delete_object = Some(deleted_object.clone());
+                    delete_results[didx].version_suspended = version_suspended;
+                    if !committed_actions
+                        .insert(delete_objects_action_identity(deleted_object, delete_results[didx].requested_version_id))
+                    {
+                        continue;
+                    }
+                    delete_results[didx].emit_side_effects = true;
                     let creates_delete_marker = object_to_delete[i].version_id.is_none() && versioned && !version_suspended;
                     let committed_delete_marker = dobjs[i].delete_marker;
                     let delete_accounting = accounting.get(i).and_then(Option::as_ref);
@@ -795,8 +885,9 @@ impl DefaultObjectUsecase {
             .filter_map(|result| result.delete_object.as_ref().map(|object| (result, object)))
             .map(|(result, object)| DeletedObject {
                 delete_marker: { if object.delete_marker { Some(true) } else { None } },
-                delete_marker_version_id: delete_response_version_id(
+                delete_marker_version_id: delete_marker_response_version_id(
                     object.delete_marker_version_id,
+                    object.delete_marker && result.version_suspended && result.requested_version_id.is_none(),
                     result.synthetic_version_id,
                 ),
                 key: Some(object.object_name.clone()),
@@ -819,7 +910,7 @@ impl DefaultObjectUsecase {
             .filter_map(|v| v.error.clone())
             .collect::<Vec<s3s::dto::Error>>();
         let output = DeleteObjectsOutput {
-            deleted: Some(deleted),
+            deleted: (!delete.quiet.unwrap_or_default()).then_some(deleted),
             errors: Some(errors),
             ..Default::default()
         };
@@ -834,6 +925,7 @@ impl DefaultObjectUsecase {
         let replication_deletes = if replicate_deletes {
             delete_results
                 .iter()
+                .filter(|result| result.emit_side_effects)
                 .filter_map(|result| result.delete_object.as_ref())
                 .filter(|dobj| deleted_object_has_pending_replication_delete(dobj))
                 .cloned()
@@ -861,6 +953,7 @@ impl DefaultObjectUsecase {
         let deleted_any = delete_results.iter().any(|result| result.delete_object.is_some());
         let delete_producers = delete_results
             .iter()
+            .filter(|result| result.emit_side_effects)
             .filter_map(|result| {
                 result.delete_object.as_ref().map(|deleted_object| {
                     if deleted_object.delete_marker && result.requested_version_id.is_none() {
@@ -875,6 +968,9 @@ impl DefaultObjectUsecase {
         spawn_background_with_context(Some(request_context), async move {
             let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Notify);
             for res in delete_results {
+                if !res.emit_side_effects {
+                    continue;
+                }
                 if let Some(dobj) = res.delete_object {
                     // `DeleteMarkerCreated` is a creation event; a delete
                     // marker removed by an explicit version id is a plain
@@ -915,8 +1011,10 @@ impl DefaultObjectUsecase {
             rustfs_scanner::record_dirty_usage_bucket_from_producers(&bucket, delete_producers);
         }
         // Record write operation for capacity management (inline to avoid per-request tokio::spawn overhead)
-        let manager = get_capacity_manager();
-        manager.record_write_operation().await;
+        if deleted_any {
+            let manager = get_capacity_manager();
+            manager.record_write_operation().await;
+        }
         result
     }
 
@@ -976,6 +1074,8 @@ impl DefaultObjectUsecase {
         // Lock order is bucket lifecycle, then object/commit locks in storage.
         // Keep this guard alive through the physical delete: a preflight without
         // writer exclusion could authorize one subtree and delete a newer one.
+        // The delete takes ownership of it and releases it only when it has
+        // finished, even if this request is dropped first.
         let recursive_delete_guard = if force_header {
             Some(
                 store
@@ -1076,7 +1176,7 @@ impl DefaultObjectUsecase {
 
         let obj_info = {
             match store
-                .delete_object_with_tier_delete_journal(&bucket, &key, opts.clone())
+                .delete_object_with_tier_delete_journal_and_guards(&bucket, &key, opts.clone(), recursive_delete_guard)
                 .await
             {
                 Ok(obj) => obj,
@@ -1118,7 +1218,6 @@ impl DefaultObjectUsecase {
                 }
             }
         };
-        drop(recursive_delete_guard);
 
         if force_delete {
             let _ = invalidate_object_data_cache_prefix_after_delete(&cache_adapter, &bucket, &key).await;
@@ -1942,6 +2041,26 @@ mod tests {
     }
 
     #[test]
+    fn delete_objects_created_null_marker_response_uses_the_committed_marker_identity() {
+        let uuid = Uuid::new_v4();
+        assert_eq!(delete_marker_response_version_id(None, true, false), Some("null".to_string()));
+        assert_eq!(delete_marker_response_version_id(None, false, false), None);
+        assert_eq!(delete_marker_response_version_id(None, true, true), None);
+        assert_eq!(delete_marker_response_version_id(Some(uuid), false, false), Some(uuid.to_string()));
+        assert_eq!(
+            delete_marker_response_version_id(Some(uuid), true, false),
+            Some(uuid.to_string()),
+            "the committed identity takes precedence over any null fallback"
+        );
+        assert_eq!(
+            delete_marker_response_version_id(Some(Uuid::nil()), false, false),
+            Some("null".to_string()),
+            "explicit null-marker removal keeps its existing response identity"
+        );
+        assert_eq!(delete_marker_response_version_id(Some(Uuid::nil()), true, true), None);
+    }
+
+    #[test]
     fn delete_entry_response_version_id_echoes_requested_identity_for_marker_removal() {
         let version_id = Uuid::new_v4();
 
@@ -2098,7 +2217,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn execute_delete_objects_rejects_bucket_recreated_after_authorization() {
+    async fn execute_delete_objects_rejects_bucket_recreated_before_publication_admission() {
         use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
 
         let store = crate::app::gating_test_env::shared_gating_ecstore().await;
@@ -2125,7 +2244,7 @@ mod tests {
             .expect("authorized bucket metadata should be cached"))
         .clone();
         metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("test policy should parse"));
-        metadata.policy_config_json = policy_json.into_bytes();
+        metadata.policy_config_json = policy_json.clone().into_bytes();
         crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
             .await
             .expect("publish test bucket policy");
@@ -2146,7 +2265,7 @@ mod tests {
         req.extensions.insert(crate::storage::access::ReqInfo::default());
         let loaded = Arc::new(tokio::sync::Barrier::new(2));
         let resume = Arc::new(tokio::sync::Barrier::new(2));
-        install_delete_objects_auth_test_hook(bucket.clone(), Arc::clone(&loaded), Arc::clone(&resume));
+        install_delete_objects_generation_test_hook(bucket.clone(), Arc::clone(&loaded), Arc::clone(&resume));
 
         let usecase = DefaultObjectUsecase::with_context(Some(context));
         let delete = tokio::spawn(async move { usecase.execute_delete_objects(req).await });
@@ -2166,6 +2285,15 @@ mod tests {
             .make_bucket(&bucket, &MakeBucketOptions::default())
             .await
             .expect("recreate same bucket name");
+        let mut metadata = (*crate::storage::get_bucket_metadata(&bucket)
+            .await
+            .expect("recreated bucket metadata should be cached"))
+        .clone();
+        metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("test policy should parse"));
+        metadata.policy_config_json = policy_json.into_bytes();
+        crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
+            .await
+            .expect("republish the same policy for admission");
         let mut reader = PutObjReader::from_vec(b"new generation".to_vec());
         store
             .put_object(&bucket, "object", &mut reader, &ObjectOptions::default())
@@ -2176,7 +2304,7 @@ mod tests {
         let err = delete
             .await
             .expect("delete objects task should join")
-            .expect_err("old authorization must not delete from the recreated bucket");
+            .expect_err("the captured generation must not delete from the recreated bucket");
         assert_eq!(err.code(), &S3ErrorCode::NoSuchBucket);
         store
             .get_object_info(&bucket, "object", &ObjectOptions::default())
@@ -2272,6 +2400,84 @@ mod tests {
     }
 
     #[test]
+    fn delete_objects_condition_parser_preserves_presence_and_rejects_version_combinations() {
+        let object = ObjectIdentifier {
+            key: "key".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(parse_delete_objects_condition(&object).expect("missing ETag is unconditional"), None);
+        for etag in ["", "\"\"", " \t "] {
+            let error = parse_delete_objects_condition(&ObjectIdentifier {
+                e_tag: Some(ETag::Strong(etag.to_string())),
+                ..object.clone()
+            })
+            .expect_err("an explicit empty ETag must never become an unconditional delete");
+            assert_eq!(error.code.as_deref(), Some("InvalidArgument"));
+            assert_eq!(error.key.as_deref(), Some("key"));
+        }
+        for version in ["null", "", "bad-version"] {
+            let error = parse_delete_objects_condition(&ObjectIdentifier {
+                e_tag: Some(ETag::Strong("*".to_string())),
+                version_id: Some(version.to_string()),
+                ..object.clone()
+            })
+            .expect_err("any explicit VersionId is unsupported with a condition");
+            assert_eq!(error.code.as_deref(), Some("InvalidRequest"));
+            assert_eq!(error.version_id.as_deref(), Some(version));
+        }
+    }
+
+    #[test]
+    fn delete_objects_action_identity_deduplicates_actions_without_losing_historical_targets() {
+        let current = StorageDeletedObject {
+            object_name: "key".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            delete_objects_action_identity(&current, None),
+            delete_objects_action_identity(&current, Some(Uuid::nil()))
+        );
+        let historical = Uuid::new_v4();
+        assert_ne!(
+            delete_objects_action_identity(&current, None),
+            delete_objects_action_identity(&current, Some(historical))
+        );
+        let marker = StorageDeletedObject {
+            delete_marker: true,
+            delete_marker_version_id: Some(historical),
+            ..current
+        };
+        assert_ne!(
+            delete_objects_action_identity(&marker, None),
+            delete_objects_action_identity(&marker, Some(historical))
+        );
+    }
+
+    #[test]
+    fn delete_objects_condition_parser_rejects_weak_validators_without_dropping_the_condition() {
+        for value in ["current-etag", "*", ""] {
+            let object = ObjectIdentifier {
+                key: "key".to_string(),
+                e_tag: Some(ETag::Weak(value.to_string())),
+                ..Default::default()
+            };
+            let error = parse_delete_objects_condition(&object)
+                .expect_err("a weak validator must fail instead of falling back to an unconditional delete");
+            assert_eq!(error.code.as_deref(), Some("InvalidArgument"));
+            assert_eq!(error.key.as_deref(), Some("key"));
+        }
+        let object = ObjectIdentifier {
+            key: "key".to_string(),
+            e_tag: Some(ETag::Strong("current-etag".to_string())),
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_delete_objects_condition(&object).expect("strong validator retains its condition"),
+            Some(DeleteObjectCondition::MatchEtag("current-etag".to_string()))
+        );
+    }
+
+    #[test]
     fn delete_objects_treats_raw_io_not_found_as_idempotent() {
         assert!(is_delete_objects_not_found(&StorageError::FileNotFound));
         assert!(is_delete_objects_not_found(&StorageError::Io(std::io::Error::from(
@@ -2298,6 +2504,230 @@ mod tests {
         let deleted = reduce_delete_objects_result(&object, &deleted, Some(&error), false)
             .expect("raw not-found must produce a deleted result");
         assert_eq!(deleted.object_name, "missing-key");
+    }
+
+    #[test]
+    fn delete_objects_result_reducer_preserves_conditional_not_found_errors() {
+        let object = ObjectToDelete {
+            object_name: "missing-key".to_string(),
+            delete_condition: Some(DeleteObjectCondition::Exists),
+            ..Default::default()
+        };
+        let deleted = StorageDeletedObject {
+            object_name: object.object_name.clone(),
+            ..Default::default()
+        };
+        let error = reduce_delete_objects_result(&object, &deleted, Some(&StorageError::FileNotFound), false)
+            .expect_err("a failed existence condition is not an idempotent successful delete");
+        assert_eq!(error.key.as_deref(), Some("missing-key"));
+        assert_eq!(error.code.as_deref(), Some("NoSuchKey"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn execute_delete_objects_conditions_authorize_per_entry_and_keep_quiet_errors() {
+        crate::app::gating_test_env::run_large_stack_test("conditional-bulk-delete-api", || async {
+            use crate::app::storage_api::test::contract::bucket::{
+                BucketOperations as _, DeleteBucketOptions, MakeBucketOptions,
+            };
+
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            if current_app_context().is_none() {
+                crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+            }
+            let bucket = format!("conditional-bulk-api-{}", Uuid::new_v4().simple());
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create conditional bulk-delete bucket");
+            let mut readable_etag = String::new();
+            let mut denied_etag = String::new();
+            let mut total_size = 0;
+            for key in [
+                "readable",
+                "denied",
+                "wildcard",
+                "unconditional",
+                "invalid",
+                "version-combination",
+            ] {
+                let object = store
+                    .put_object(
+                        &bucket,
+                        key,
+                        &mut PutObjReader::from_vec(format!("payload-{key}").into_bytes()),
+                        &ObjectOptions::default(),
+                    )
+                    .await
+                    .expect("seed object before request authorization");
+                if key == "readable" {
+                    readable_etag = object.etag.expect("readable fixture has an ETag");
+                } else if key == "denied" {
+                    denied_etag = object.etag.expect("denied fixture has an ETag");
+                }
+                total_size += u64::try_from(object.size).expect("fixture size is nonnegative");
+            }
+            crate::app::storage_api::test::data_usage::seed_bucket_usage_memory_for_test(&bucket, total_size).await;
+            let policy_json = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:DeleteObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}},{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:GetObject"],"Resource":["arn:aws:s3:::{bucket}/readable"]}},{{"Effect":"Deny","Principal":{{"AWS":"*"}},"Action":["s3:GetObject"],"Resource":["arn:aws:s3:::{bucket}/denied","arn:aws:s3:::{bucket}/wildcard"]}}]}}"#
+            );
+            let mut metadata = (*crate::storage::get_bucket_metadata(&bucket)
+                .await
+                .expect("test bucket metadata"))
+            .clone();
+            metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("parse conditional delete policy"));
+            metadata.policy_config_json = policy_json.into_bytes();
+            crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
+                .await
+                .expect("publish conditional delete authorization policy");
+            let requests = vec![
+                ObjectIdentifier {
+                    key: "readable".to_string(),
+                    e_tag: Some(ETag::Strong(readable_etag.clone())),
+                    ..Default::default()
+                },
+                ObjectIdentifier {
+                    key: "readable".to_string(),
+                    e_tag: Some(ETag::Strong("stale-etag".to_string())),
+                    ..Default::default()
+                },
+                ObjectIdentifier {
+                    key: "readable".to_string(),
+                    e_tag: Some(ETag::Strong(readable_etag)),
+                    ..Default::default()
+                },
+                ObjectIdentifier {
+                    key: "denied".to_string(),
+                    e_tag: Some(ETag::Strong(denied_etag)),
+                    ..Default::default()
+                },
+                ObjectIdentifier {
+                    key: "wildcard".to_string(),
+                    e_tag: Some(ETag::Strong("*".to_string())),
+                    ..Default::default()
+                },
+                ObjectIdentifier {
+                    key: "missing".to_string(),
+                    e_tag: Some(ETag::Strong("*".to_string())),
+                    ..Default::default()
+                },
+                ObjectIdentifier {
+                    key: "invalid".to_string(),
+                    e_tag: Some(ETag::Strong("".to_string())),
+                    ..Default::default()
+                },
+                ObjectIdentifier {
+                    key: "version-combination".to_string(),
+                    e_tag: Some(ETag::Strong("*".to_string())),
+                    version_id: Some("null".to_string()),
+                    ..Default::default()
+                },
+                ObjectIdentifier {
+                    key: "unconditional".to_string(),
+                    ..Default::default()
+                },
+            ];
+            let input = DeleteObjectsInput::builder()
+                .bucket(bucket.clone())
+                .delete(Delete {
+                    objects: requests,
+                    quiet: Some(false),
+                })
+                .build()
+                .expect("build mixed conditional batch");
+            let mut req = build_request(input, Method::POST);
+            req.extensions.insert(crate::storage::access::ReqInfo::default());
+            let usecase = DefaultObjectUsecase::from_global();
+            let response = usecase
+                .execute_delete_objects(req)
+                .await
+                .expect("mixed batch returns per-entry outcomes");
+            let deleted = response
+                .output
+                .deleted
+                .expect("non-quiet batch reports every successful input entry");
+            assert_eq!(
+                deleted.iter().map(|object| object.key.as_deref()).collect::<Vec<_>>(),
+                vec![Some("readable"), Some("readable"), Some("wildcard"), Some("unconditional")],
+                "duplicate actions preserve both original input results"
+            );
+            let errors = response.output.errors.expect("failed entries remain visible in Quiet mode");
+            let actual = errors
+                .iter()
+                .map(|error| (error.key.as_deref(), error.code.as_deref()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual,
+                vec![
+                    (Some("readable"), Some("PreconditionFailed")),
+                    (Some("denied"), Some("AccessDenied")),
+                    (Some("missing"), Some("NoSuchKey")),
+                    (Some("invalid"), Some("InvalidArgument")),
+                    (Some("version-combination"), Some("InvalidRequest")),
+                ]
+            );
+            for key in ["denied", "invalid", "version-combination"] {
+                store
+                    .get_object_info(&bucket, key, &ObjectOptions::default())
+                    .await
+                    .expect("rejected entry preserves data");
+            }
+            for key in ["readable", "wildcard", "unconditional"] {
+                let error = store
+                    .get_object_info(&bucket, key, &ObjectOptions::default())
+                    .await
+                    .expect_err("successful entry deletes data");
+                assert!(is_err_object_not_found(&error));
+            }
+            let mut usage = rustfs_data_usage::DataUsageInfo::default();
+            crate::app::storage_api::test::data_usage::apply_bucket_usage_memory_overlay(&mut usage).await;
+            let retained_size = ["denied", "invalid", "version-combination"]
+                .into_iter()
+                .map(|key| u64::try_from(format!("payload-{key}").len()).expect("fixture sizes fit u64"))
+                .sum::<u64>();
+            assert_eq!(
+                usage.buckets_usage.get(&bucket).map(|value| value.size),
+                Some(retained_size),
+                "duplicate success and failed conditions must not subtract additional object bytes"
+            );
+
+            let quiet_input = DeleteObjectsInput::builder()
+                .bucket(bucket.clone())
+                .delete(Delete {
+                    objects: vec![
+                        ObjectIdentifier {
+                            key: "unconditional".to_string(),
+                            ..Default::default()
+                        },
+                        ObjectIdentifier {
+                            key: "missing".to_string(),
+                            e_tag: Some(ETag::Strong("*".to_string())),
+                            ..Default::default()
+                        },
+                    ],
+                    quiet: Some(true),
+                })
+                .build()
+                .expect("build quiet mixed batch");
+            let mut quiet_req = build_request(quiet_input, Method::POST);
+            quiet_req.extensions.insert(crate::storage::access::ReqInfo::default());
+            let quiet_response = usecase.execute_delete_objects(quiet_req).await.expect("quiet batch succeeds");
+            assert!(quiet_response.output.deleted.is_none(), "Quiet hides only successful entries");
+            let quiet_errors = quiet_response.output.errors.expect("Quiet preserves errors");
+            assert_eq!(quiet_errors.len(), 1);
+            assert_eq!(quiet_errors[0].key.as_deref(), Some("missing"));
+            assert_eq!(quiet_errors[0].code.as_deref(), Some("NoSuchKey"));
+            store
+                .delete_bucket(
+                    &bucket,
+                    &DeleteBucketOptions {
+                        force: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("remove fixture bucket");
+        });
     }
 
     #[test]

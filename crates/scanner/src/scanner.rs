@@ -51,9 +51,9 @@ use rustfs_data_usage::observed_data_usage_is_newer;
 use rustfs_heal_contracts::heal_channel::HealScanMode;
 use rustfs_lock::{NamespaceLockGuard, error::LockError};
 use rustfs_scanner_metrics::metrics::{
-    CurrentCycle, Metric, Metrics, ScanCyclePartialReason, ScanCycleWorkSnapshot, ScannerUsageSaveResult, ScannerWorkSource,
-    emit_scan_cycle_complete, emit_scan_cycle_deferred, emit_scan_cycle_partial_with_source, emit_scan_cycle_superseded,
-    global_metrics,
+    CurrentCycle, Metric, Metrics, RemoteScanProgress, ScanCyclePartialReason, ScanCycleWorkSnapshot, ScannerUsageSaveResult,
+    ScannerWorkSource, emit_scan_cycle_complete, emit_scan_cycle_deferred, emit_scan_cycle_partial_with_source,
+    emit_scan_cycle_superseded, global_metrics,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -1157,10 +1157,17 @@ impl ScannerMaintenanceFeatures {
         self.lifecycle || self.replication || self.inspection_failed
     }
 
-    fn requires_full_scan(self, observed_generation: Option<u64>, current_generation: u64, wake: ScannerCycleWakeReason) -> bool {
+    fn requires_full_scan(
+        self,
+        observed_generation: Option<u64>,
+        current_generation: u64,
+        wake: ScannerCycleWakeReason,
+        superseded_retry: bool,
+    ) -> bool {
         self.needs_regular_cycle()
             || observed_generation != Some(current_generation)
-            || !matches!(wake, ScannerCycleWakeReason::DirtyUsage | ScannerCycleWakeReason::ClusterActivity)
+            || !(matches!(wake, ScannerCycleWakeReason::DirtyUsage | ScannerCycleWakeReason::ClusterActivity)
+                || (wake == ScannerCycleWakeReason::Timer && superseded_retry))
     }
 }
 
@@ -1189,16 +1196,6 @@ impl ScannerUsageBootstrapRebuild {
 
     fn clean_idle_backoff_enabled(self, enabled: bool) -> bool {
         enabled && !self.pending
-    }
-
-    fn requires_full_scan(
-        self,
-        maintenance_features: ScannerMaintenanceFeatures,
-        observed_generation: Option<u64>,
-        current_generation: u64,
-        wake: ScannerCycleWakeReason,
-    ) -> bool {
-        self.pending || maintenance_features.requires_full_scan(observed_generation, current_generation, wake)
     }
 
     fn record_cycle(&mut self, outcome: ScannerCycleOutcome) -> bool {
@@ -1777,7 +1774,7 @@ where
     let now = Instant::now();
     cycle_info.started = Utc::now();
 
-    let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone()).await;
+    let mut cycle_metrics_guard = ScannerCycleMetricsGuard::new(cycle_info.clone(), cycle_budget.remote_scan_progress()).await;
 
     // Refresh the storage-owned movement snapshot before reading background
     // heal state. A missing heal object yields an in-memory default; do not
@@ -1910,6 +1907,10 @@ where
         },
     )
     .await;
+    let publication_plan = scan_result
+        .as_ref()
+        .map(ScannerCyclePublicationPlan::for_result)
+        .unwrap_or(ScannerCyclePublicationPlan::ProgressOnly);
     let publication_defer_reason = match &scan_result {
         Ok(result)
             if result
@@ -1924,7 +1925,7 @@ where
         // fence remains enforced by the usage store and the cycle is advanced
         // as partial without acknowledging dirty usage.
         Ok(result)
-            if result.has_observational_snapshot()
+            if publication_plan.is_observational()
                 && matches!(
                     result.status,
                     ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
@@ -1932,9 +1933,12 @@ where
         {
             None
         }
-        Ok(result) => final_data_usage_publication_defer_reason(storeapi.as_ref(), result.status).await,
+        Ok(result) => {
+            final_data_usage_publication_defer_reason(storeapi.as_ref(), result.status, publication_plan.is_observational()).await
+        }
         Err(_) => Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
     };
+    let observational_only = publication_plan.is_observational();
     let publication_epoch = scan_result.as_ref().ok().and_then(ScannerCycleResult::publication_epoch);
     let remote_publication_lease_targets = if publication_defer_reason.is_none() {
         scan_result
@@ -1949,15 +1953,21 @@ where
     let remote_lease_defer_reason = if remote_publication_lease_targets.is_empty() {
         None
     } else if let Some(notification_system) = storeapi.scanner_notification_system() {
-        let publication_proof_ctx = cycle_budget.token();
-        let lease_result = await_scanner_publication_proof(
-            &publication_proof_ctx,
-            cycle_info.current,
-            "lease_acquire",
-            || notification_system.acquire_scanner_publication_leases(remote_publication_lease_targets.clone()),
-            |err| scanner_publication_lease_error_is_retryable(&err.to_string()),
-        )
-        .await;
+        let lease_result = publication_plan
+            .await_leases(ctx, &cycle_budget, cycle_info.current, |observational_lease| {
+                let targets = remote_publication_lease_targets.clone();
+                let notification_system = Arc::clone(&notification_system);
+                async move {
+                    if observational_lease {
+                        notification_system
+                            .acquire_observational_scanner_publication_leases(targets)
+                            .await
+                    } else {
+                        notification_system.acquire_scanner_publication_leases(targets).await
+                    }
+                }
+            })
+            .await;
         match lease_result {
             ScannerPublicationProofWait::Ready(grants) => {
                 remote_publication_leases = Some((notification_system, grants));
@@ -1977,34 +1987,40 @@ where
     // it is never inserted into FileInfo metadata.  Keep the representation
     // bounded and require one authenticated token per remote target so a
     // partial grant can never silently fall back to an unfenced rename.
-    let remote_lease_fence = remote_publication_leases.as_ref().and_then(|(_, grants)| {
-        if grants.len() != remote_publication_lease_targets.len() || grants.len() > SCANNER_PUBLICATION_LEASE_FENCE_MAX_ENTRIES {
-            return None;
-        }
-        let mut fence = BTreeMap::new();
-        for grant in grants {
-            if grant.host.is_empty() || grant.host.len() > 1024 {
+    let remote_lease_fence = remote_publication_leases
+        .as_ref()
+        .filter(|_| publication_plan.has_usage_update())
+        .and_then(|(_, grants)| {
+            if grants.len() != remote_publication_lease_targets.len()
+                || grants.len() > SCANNER_PUBLICATION_LEASE_FENCE_MAX_ENTRIES
+            {
                 return None;
             }
-            if fence.insert(grant.host.clone(), grant.lease.token.to_string()).is_some() {
+            let mut fence = BTreeMap::new();
+            for grant in grants {
+                if grant.host.is_empty() || grant.host.len() > 1024 {
+                    return None;
+                }
+                if fence.insert(grant.host.clone(), grant.lease.token.to_string()).is_some() {
+                    return None;
+                }
+            }
+            if remote_publication_lease_targets
+                .iter()
+                .any(|(host, _, _)| !fence.contains_key(host))
+            {
                 return None;
             }
-        }
-        if remote_publication_lease_targets
-            .iter()
-            .any(|(host, _, _)| !fence.contains_key(host))
-        {
-            return None;
-        }
-        serde_json::to_string(&fence)
-            .ok()
-            .filter(|encoded| encoded.len() <= SCANNER_PUBLICATION_LEASE_FENCE_MAX_BYTES)
-    });
-    let remote_lease_fence_defer_reason = (remote_publication_lease_fence_targets_are_required(
-        remote_publication_lease_targets.len(),
-        remote_publication_leases.is_some(),
-        remote_lease_fence.is_some(),
-    ))
+            serde_json::to_string(&fence)
+                .ok()
+                .filter(|encoded| encoded.len() <= SCANNER_PUBLICATION_LEASE_FENCE_MAX_BYTES)
+        });
+    let remote_lease_fence_defer_reason = (publication_plan.has_usage_update()
+        && remote_publication_lease_fence_targets_are_required(
+            remote_publication_lease_targets.len(),
+            remote_publication_leases.is_some(),
+            remote_lease_fence.is_some(),
+        ))
     .then_some(ScannerCycleDeferReason::ActivityBaselineUnavailable);
     let publication_defer_reason = publication_defer_reason
         .or(remote_lease_defer_reason)
@@ -2027,12 +2043,17 @@ where
     let budget_elapsed = cycle_budget.budget_elapsed() && !ctx.is_cancelled();
     let remote_lease_probe = remote_publication_leases
         .as_ref()
+        .filter(|_| publication_plan.has_usage_update())
         .map(|(notification_system, grants)| (Arc::clone(notification_system), grants.clone()));
     let remote_lease_release_safe = Arc::new(AtomicBool::new(true));
     let mut usage_publication_result = match publication_defer_reason {
         Some(reason) => {
             drop(receiver);
             DataUsagePublicationResult::from(DataUsagePersistOutcome::Deferred(reason))
+        }
+        None if !publication_plan.has_usage_update() => {
+            drop(receiver);
+            DataUsagePublicationResult::from(DataUsagePersistOutcome::NoUpdate)
         }
         None => {
             // ScannerIO emits its complete or observational update only after
@@ -2041,7 +2062,7 @@ where
             let storeapi_clone = storeapi.clone();
             let ctx_clone = ctx.clone();
             let route_probe_store = storeapi.clone();
-            let remote_lease_fence = remote_lease_fence.clone();
+            let route_probe_observational_only = observational_only;
             let remote_lease_release_safe_for_task = Arc::clone(&remote_lease_release_safe);
             let remote_lease_tokens = remote_publication_leases
                 .as_ref()
@@ -2070,6 +2091,7 @@ where
                     move || {
                         let storeapi = route_probe_store.clone();
                         let remote_lease_probe = remote_lease_probe.clone();
+                        let observational_only = route_probe_observational_only;
                         async move {
                             if let Some((notification_system, grants)) = remote_lease_probe.as_ref()
                                 && notification_system.validate_scanner_publication_leases(grants).await.is_err()
@@ -2091,7 +2113,7 @@ where
                                     probe_scanner_activity(storeapi.as_ref(), true).await,
                                 ));
                             }
-                            scanner_local_publication_defer_reason(storeapi.as_ref()).await
+                            scanner_local_publication_defer_reason(storeapi.as_ref(), observational_only).await
                         }
                     },
                 )
@@ -2230,6 +2252,7 @@ where
                 cycle = cycle_info.current,
                 required_cycle,
                 state = "cache_cycle_ahead",
+                partial_cause = "cache_cycle_ahead",
                 "Scanner cycle is recovering to a newer durable cache generation"
             );
             emit_scan_cycle_partial_with_source(cycle_start.elapsed(), ScanCyclePartialReason::Unknown, None);
@@ -2341,6 +2364,18 @@ where
     }
 
     usage_publication_result.restrict_outcome(usage_persist_outcome);
+    let partial_cause = if scan_cycle_result.has_partial_bucket_progress() && !scan_cycle_result.has_usage_update() {
+        "saved_bucket_progress"
+    } else if scan_cycle_result.has_usage_update()
+        && matches!(
+            scan_cycle_result.status,
+            ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+        )
+    {
+        "activity_unverified_observation"
+    } else {
+        "incomplete_coverage"
+    };
     let (completion_outcome, scanner_pending_maintenance_work, remote_dirty_usage_acknowledgements) =
         finalize_scanner_cycle_result(scan_cycle_result, usage_publication_result);
     let remote_dirty_usage_pending = if remote_dirty_usage_acknowledgements.is_empty() {
@@ -2405,6 +2440,7 @@ where
                     subsystem = LOG_SUBSYSTEM_RUNTIME,
                     cycle = cycle_info.current,
                     state = "incomplete",
+                    partial_cause,
                     "Scanner cycle ended without a complete usage snapshot"
                 );
             }
@@ -2563,9 +2599,13 @@ struct ScannerCycleMetricsGuard {
 }
 
 impl ScannerCycleMetricsGuard {
-    async fn new(cycle: CurrentCycle) -> Self {
+    async fn new(cycle: CurrentCycle, remote_progress: Arc<RemoteScanProgress>) -> Self {
         Self {
-            start: Some(global_metrics().start_scan_cycle_work_with_cycle(cycle).await),
+            start: Some(
+                global_metrics()
+                    .start_scan_cycle_work_with_cycle_and_remote_progress(cycle, remote_progress)
+                    .await,
+            ),
         }
     }
 
@@ -2704,6 +2744,7 @@ where
             Err(e) => {
                 match classify_scanner_leader_lock_failure(&e) {
                     ScannerLeaderLockFailure::Contended => {
+                        clear_scanner_transient_cycle_recovery_status();
                         record_scanner_cycle_schedule_role("follower");
                         record_scanner_leader_lock_state("contended");
                         global_metrics().record_scanner_leader_liveness("contended", false, "").await;
@@ -3145,7 +3186,8 @@ where
         ));
         let mut wait_plan =
             scanner_cycle_wait_plan(&runtime_config, clean_idle_backoff, backoff_enabled, randomized_cycle_delay_for);
-        let superseded_retry_interval = scanner_superseded_retry_interval(superseded_backoff, &runtime_config);
+        let superseded_retry_interval =
+            scanner_superseded_retry_interval(superseded_backoff, &runtime_config, maintenance_features);
         let deferred_retry_interval = deferred_backoff.retry_interval(runtime_config.cycle_interval);
         let mut convergence_retry_interval = superseded_retry_interval.or(deferred_retry_interval);
         if let Some(retry_interval) = convergence_retry_interval {
@@ -3323,11 +3365,13 @@ where
                 leader_epoch,
                 cycle_budget.clone(),
                 ScannerCycleScheduling {
-                    requires_full_scan: usage_bootstrap_rebuild.requires_full_scan(
-                        maintenance_features,
+                    // Cache reuse is admitted by the persisted coverage proof in ScannerIO.
+                    // Bootstrap remains pending until authoritative publication succeeds.
+                    requires_full_scan: maintenance_features.requires_full_scan(
                         maintenance_generation_seen,
                         scanner_maintenance_generation(),
                         wake_reason,
+                        superseded_retry_interval.is_some(),
                     ),
                     service_cohort: Some(service_cohort.clone()),
                 },
@@ -3486,13 +3530,17 @@ impl Drop for ScannerScanModeGuard {
     }
 }
 
-async fn final_data_usage_publication_defer_reason<S>(storeapi: &S, status: ScannerCycleStatus) -> Option<ScannerCycleDeferReason>
+async fn final_data_usage_publication_defer_reason<S>(
+    storeapi: &S,
+    status: ScannerCycleStatus,
+    observational_only: bool,
+) -> Option<ScannerCycleDeferReason>
 where
     S: ScannerStorage,
 {
     match status {
         ScannerCycleStatus::Complete | ScannerCycleStatus::Superseded => {
-            if let Some(reason) = scanner_local_publication_defer_reason(storeapi).await {
+            if let Some(reason) = scanner_local_publication_defer_reason(storeapi, observational_only).await {
                 return Some(reason);
             }
             if status == ScannerCycleStatus::Complete {
@@ -3516,19 +3564,114 @@ where
     }
 }
 
-async fn scanner_local_publication_defer_reason<S>(storeapi: &S) -> Option<ScannerCycleDeferReason>
+async fn scanner_local_publication_defer_reason<S>(storeapi: &S, observational_only: bool) -> Option<ScannerCycleDeferReason>
 where
     S: ScannerStorage,
 {
-    if !storeapi.scanner_data_usage_publication_blocked().await {
+    let blocked = if observational_only {
+        storeapi.scanner_data_movement_publication_blocked().await
+    } else {
+        storeapi.scanner_data_usage_publication_blocked().await
+    };
+    if !blocked {
         return None;
     }
     // Pending namespace commits invalidate this publication attempt, but only
     // storage movement creates durable, rate-limited catch-up debt.
-    if storeapi.scanner_data_movement_pause_status().await.paused {
+    if storeapi.scanner_data_movement_publication_blocked().await {
+        debug!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            stage = "local_barrier",
+            blocker = "data_movement",
+            "Scanner usage publication deferred"
+        );
         Some(ScannerCycleDeferReason::DataMovement)
     } else {
+        debug!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            stage = "local_barrier",
+            blocker = "pending_namespace_commit",
+            "Scanner usage publication deferred"
+        );
         Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScannerCyclePublicationPlan {
+    ProgressOnly,
+    Observational,
+    Authoritative,
+}
+
+impl ScannerCyclePublicationPlan {
+    fn for_result(result: &ScannerCycleResult) -> Self {
+        match (result.has_usage_update(), result.status) {
+            (false, _) => Self::ProgressOnly,
+            (
+                true,
+                ScannerCycleStatus::Superseded
+                | ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+                | ScannerCycleStatus::Incomplete,
+            ) => Self::Observational,
+            (true, _) => Self::Authoritative,
+        }
+    }
+
+    fn has_usage_update(self) -> bool {
+        self != Self::ProgressOnly
+    }
+
+    fn is_observational(self) -> bool {
+        self == Self::Observational
+    }
+
+    fn uses_observational_lease(self) -> bool {
+        self != Self::Authoritative
+    }
+
+    async fn await_leases<T, E, F, Fut>(
+        self,
+        parent: &CancellationToken,
+        budget: &ScannerCycleBudget,
+        cycle: u64,
+        mut acquire: F,
+    ) -> ScannerPublicationProofWait<T, E>
+    where
+        E: std::fmt::Display,
+        F: FnMut(bool) -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+    {
+        // Exhausting the walk budget must not cancel the movement proof needed
+        // to save partial progress. No usage update means namespace stability
+        // is unnecessary, but peer session/generation and movement checks stay.
+        let proof_ctx = if self == Self::ProgressOnly {
+            parent.clone()
+        } else {
+            budget.token()
+        };
+        let proof = await_scanner_publication_proof(
+            &proof_ctx,
+            cycle,
+            "lease_acquire",
+            || acquire(self.uses_observational_lease()),
+            |err| scanner_publication_lease_error_is_retryable(&err.to_string()),
+        );
+        if self == Self::ProgressOnly {
+            // Object/directory budgets can expire with no runtime deadline.
+            // Bound the control-plane drain independently of the walk budget.
+            tokio::time::timeout(SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, proof)
+                .await
+                .unwrap_or(ScannerPublicationProofWait::Cancelled)
+        } else {
+            proof.await
+        }
     }
 }
 
@@ -3543,7 +3686,24 @@ fn scanner_post_lease_activity_defer_reason(
         {
             None
         }
-        Ok(_) | Err(_) => Some(ScannerCycleDeferReason::ActivityBaselineUnavailable),
+        observed => {
+            let blocker = match &observed {
+                Err(_) => "probe_failed",
+                Ok(snapshot) if !scanner_activity_allows_usage_publication(snapshot) => "publication_blocked",
+                Ok(_) if expected_digest.is_none() => "baseline_missing",
+                Ok(_) => "activity_changed",
+            };
+            debug!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_PERSIST_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                stage = "post_lease_activity",
+                blocker,
+                "Scanner usage publication deferred"
+            );
+            Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
+        }
     }
 }
 
@@ -3711,7 +3871,17 @@ fn scanner_cycle_completion_outcome_for_result(
 ) -> ScannerCycleOutcome {
     let has_dirty_usage = scan_cycle_result.has_dirty_usage_to_acknowledge();
     let has_failed_dirty_usage = scan_cycle_result.has_failed_dirty_usage();
-    if scan_cycle_result.has_observational_snapshot()
+    if scan_cycle_result.status == ScannerCycleStatus::Incomplete
+        && scan_cycle_result.has_partial_bucket_progress()
+        && !scan_cycle_result.has_usage_update()
+        && !has_failed_dirty_usage
+        && usage_persist_outcome == DataUsagePersistOutcome::NoUpdate
+    {
+        // No root was submitted: retain dirty usage and advance only the
+        // fenced partial-cycle state. A fresh sweep still has to certify usage.
+        return ScannerCycleOutcome::Partial;
+    }
+    if scan_cycle_result.has_usage_update()
         && matches!(
             scan_cycle_result.status,
             ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable)
@@ -3800,6 +3970,7 @@ mod usage_store;
 
 use activity::*;
 use backlog::*;
+pub use backlog::{ScannerPauseBacklogReplicaId, ScannerPauseBacklogReplicaStatus, ScannerPauseBacklogReplicaStatusState};
 use cycle_state::*;
 use leadership::*;
 pub(crate) use usage_store::RootPublicationProof;

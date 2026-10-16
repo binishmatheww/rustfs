@@ -96,13 +96,17 @@ fn copy_namespace_lock_error(bucket: &str, object: &str, mode: &'static str, err
     }
 }
 
-async fn acquire_self_copy_namespace_lock<S>(store: &S, bucket: &str, object: &str) -> S3Result<NamespaceLockGuard>
+async fn acquire_self_copy_namespace_lock<S>(
+    store: &S,
+    bucket: &str,
+    object: &str,
+) -> S3Result<crate::app::storage_api::object_usecase::WriteCommitGuard>
 where
     S: NamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper> + ?Sized,
 {
     let object = encode_dir_object(object);
     let lock = store.new_ns_lock(bucket, &object).await.map_err(ApiError::from)?;
-    lock.get_write_lock(get_lock_acquire_timeout())
+    crate::app::storage_api::object_usecase::WriteCommitGuard::acquire(&lock, get_lock_acquire_timeout())
         .await
         .map_err(|err| ApiError::from(copy_namespace_lock_error(bucket, &object, "write", err)).into())
 }
@@ -420,7 +424,8 @@ impl DefaultObjectUsecase {
             None
         };
         if let Some(guard) = _self_copy_lock_guard.as_ref() {
-            dst_opts.add_namespace_lock_guard(guard);
+            dst_opts.add_write_commit_guard(guard);
+            dst_opts.write_completion = crate::app::storage_api::object_usecase::WriteCompletion::TailDrained;
         }
         dst_opts.expected_current_version_id = expected_current_version_id.clone();
 
@@ -782,6 +787,7 @@ impl DefaultObjectUsecase {
         let has_bucket_metadata = self.bucket_metadata_sys().is_some();
         let cache_adapter = self.object_data_cache();
         let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
+        let table_data_plane_publication_guards = retained_table_data_plane_publication_guards(&req);
 
         let copy_commit = spawn_traced_join({
             let store = Arc::clone(&store);
@@ -791,10 +797,12 @@ impl DefaultObjectUsecase {
             let key = key.clone();
             let src_opts = src_opts.clone();
             let dst_opts = dst_opts.clone();
+            let table_data_plane_publication_guards = table_data_plane_publication_guards;
             async move {
                 let _source_bucket_lifecycle_guard = source_bucket_lifecycle_guard;
                 let _destination_bucket_lifecycle_guard_storage = destination_bucket_lifecycle_guard_storage;
                 let _self_copy_lock_guard = _self_copy_lock_guard;
+                let _table_data_plane_publication_guards = table_data_plane_publication_guards;
 
                 let oi = store
                     .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
@@ -1098,7 +1106,7 @@ mod tests {
         let payload = b"object whose key equals its bucket".to_vec();
         let mut reader = PutObjReader::from_vec(payload.clone());
         let setup_opts = ObjectOptions {
-            no_lock: true,
+            write_completion: crate::app::storage_api::object_usecase::WriteCompletion::TailDrained,
             ..Default::default()
         };
         store

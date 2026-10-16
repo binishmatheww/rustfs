@@ -119,11 +119,19 @@ when restoring `/rustfs/console` for a custom OEM build.
 - `RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS` (canonical)
 - `RUSTFS_SCANNER_CYCLE_MAX_OBJECTS` (canonical)
 - `RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES` (canonical)
+- `RUSTFS_SCANNER_MAX_CONCURRENT_SET_SCANS` (canonical)
+- `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` (canonical)
+- `RUSTFS_SCANNER_WALKERS_PER_DISK` (canonical)
 
 Scanner cycle budget controls:
 
 - When `RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS` is unset, the finite default is 1800 seconds (30 minutes), matching the scanner benchmark guidance.
 - An explicit `0` preserves the compatibility behavior of an unbounded runtime budget. Object and directory budgets likewise remain unbounded when explicitly set to `0`.
+Scanner walker controls:
+
+- `RUSTFS_SCANNER_WALKERS_PER_DISK` sets how many bucket walkers each local disk of an erasure set runs; the default `1` walks one bucket per disk at a time, which is the right value for rotational media. On flash, `2` to `4` lets one disk walk several buckets concurrently, which matters most for single-disk deployments with many buckets, where the walk is otherwise fully serial. Values outside `1` through `16` are rejected by `admin config set`; an out-of-range or non-numeric environment value is logged as a scanner runtime config error (`state = "startup_apply_failed"`) and the scanner keeps the default. The walkers of one disk share that disk's scanner admission, so peers still see one scan session per physical disk, and `RUSTFS_SCANNER_MAX_CONCURRENT_DISK_SCANS` still caps the total.
+- The same value is available as the persistent `scanner.walkers_per_disk` key and is reported under `runtime_config.walkers_per_disk` in the admin scanner status; see [Scanner Runtime Controls](../../docs/operations/scanner-runtime-controls.md).
+
 - A timed-out cycle cancels cooperative scanner work, then fences its leader epoch before releasing the lease. An uncooperative I/O operation is dropped after the bounded shutdown window; its cursor is not claimed to be durable and the scanner reports `recovery-required` when the worker cannot stop cooperatively, the cycle state was not confirmed durable, or epoch fencing cannot be persisted.
 
 ## Mmap read environment aliases
@@ -168,9 +176,10 @@ Scanner cycle budget controls:
 
 ## Foreground write admission environment variables
 
-Large direct `PutObject` requests and multipart `UploadPart` requests share one
-per-process permit pool that bounds concurrent body ingest and storage writes.
-Small direct PUTs stay on the legacy path.
+Large direct `PutObject` requests, multipart `UploadPart` requests, and
+server-side multipart `UploadPartCopy` requests share one per-process permit
+pool that bounds concurrent body ingest and storage writes. Small direct PUTs
+stay on the legacy path.
 
 - `RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE`
   - enables the default-on pool; `false` keeps only the soft request counter.
@@ -190,11 +199,11 @@ Small direct PUTs stay on the legacy path.
   - smallest `UploadPart` that takes a permit; `0` gates every part.
   - default is `0`.
 - `RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS`
-  - how long an `UploadPart` waits in the bounded queue for a permit before returning S3 `SlowDown`; `0` rejects immediately when the pool is full.
-  - default is `10000`. Parts wait before body ingest, so SDK-default clients that send every part of an upload concurrently drain through the pool instead of failing on a full pool.
-  - RustFS does not read the request body while a part is queued, so the client's socket write stalls for the whole wait and whatever timeout the client or an intermediary has configured competes with this value. Keep it with margin below the shortest such timeout in use (botocore applies its 60 s `connect_timeout` to the body write; the AWS SDK for Java v2 has a 30 s socket write timeout; reverse proxies add their own body timeouts); a wait that outlives the client timeout surfaces as a dropped connection instead of `SlowDown`.
+  - how long an `UploadPart` or `UploadPartCopy` waits in the bounded queue for a permit before returning S3 `SlowDown`; `0` rejects immediately when the pool is full.
+  - default is `10000`. Parts wait before body ingest or source-object reads, so SDK-default clients that send every part of an upload concurrently drain through the pool instead of failing on a full pool.
+  - RustFS does not read the request body while a part is queued, so the client's socket write stalls for the whole wait and whatever timeout the client or an intermediary has configured competes with this value. `UploadPartCopy` waits before taking bucket lifecycle locks or opening source readers, and uses the unknown-size weight because the authoritative copy length is available only after source metadata and range validation. Keep the wait with margin below the shortest client/proxy timeout in use (botocore applies its 60 s `connect_timeout` to the body write; the AWS SDK for Java v2 has a 30 s socket write timeout; reverse proxies add their own body timeouts); a wait that outlives the client timeout surfaces as a dropped connection instead of `SlowDown`.
 - `RUSTFS_PUT_MULTIPART_FOREGROUND_ADMISSION_MAX_PENDING`
-  - maximum `UploadPart` requests waiting for a permit at once; parts beyond it return `SlowDown` without waiting.
+  - maximum `UploadPart` and `UploadPartCopy` requests waiting for a permit at once; parts beyond it return `SlowDown` without waiting.
   - default is `0`, which derives 16 times the large-write slot count, or the explicit request-count limit (512 at stock settings). Automatic subdivision does not enlarge this queue.
   - each queued HTTP/1 part holds whatever unread body the client already pushed into the connection's kernel receive buffer (an HTTP/2 part holds up to its flow-control window in process memory). Autotuned receive buffers can remain large on reused connections; queue depth does not imply a fixed per-connection memory cost.
 - `RUSTFS_PUT_FOREGROUND_ADMISSION_ENABLE`, `RUSTFS_PUT_FOREGROUND_ADMISSION_LIMIT`, `RUSTFS_PUT_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS`

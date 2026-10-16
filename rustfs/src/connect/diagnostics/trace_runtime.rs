@@ -1911,6 +1911,14 @@ mod tests {
         .expect("telemetry subscriber");
     }
 
+    async fn prepare_profile_test_provenance() {
+        // Cold hashing of the test executable is fixture setup, not IPC response time.
+        let provenance = super::super::job_delivery::executable_provenance()
+            .await
+            .expect("test executable provenance should be available");
+        assert!(provenance.is_valid(), "profile capture requires valid executable provenance");
+    }
+
     #[tokio::test]
     #[serial]
     async fn local_runtime_captures_server_process_events() {
@@ -2426,11 +2434,15 @@ mod tests {
             rustfs_credentials::set_global_rpc_secret("top-rpc-local-test-secret".to_owned()).unwrap();
             let runtime = spawn_local_trace_capture_runtime(std::path::Path::new(&state), &stop).unwrap();
             let emit = async {
-                // Executable hashing precedes subscription. The parent's bounded
-                // request and stdin cancellation govern this readiness wait.
-                while telemetry_trace_subscriber_count() == 0 {
-                    tokio::task::yield_now().await;
-                }
+                // Hashing the CI test executable must finish before timing subscriber readiness.
+                super::super::job_delivery::executable_provenance().await.unwrap();
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while telemetry_trace_subscriber_count() == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("top.rpc service subscriber");
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let addr = listener.local_addr().unwrap();
                 let server = tokio::spawn(async move {
@@ -2460,9 +2472,11 @@ mod tests {
                 signed_request
                     .headers_mut()
                     .extend(crate::storage_api::server::http::gen_signature_headers(&uri, &Method::GET).unwrap());
+                sender.ready().await.unwrap();
                 let success = sender.send_request(signed_request).await.unwrap();
                 assert_eq!(success.status(), StatusCode::OK);
                 success.into_body().collect().await.unwrap();
+                sender.ready().await.unwrap();
                 let rejected = sender
                     .send_request(
                         Request::builder()
@@ -2476,6 +2490,7 @@ mod tests {
                     .unwrap();
                 assert!(rejected.status().is_client_error());
                 rejected.into_body().collect().await.unwrap();
+                sender.ready().await.unwrap();
                 let unrelated = sender
                     .send_request(Request::builder().uri("/not-rpc").body(Empty::<Bytes>::new()).unwrap())
                     .await
@@ -2566,11 +2581,15 @@ mod tests {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let runtime = spawn_local_trace_capture_runtime(std::path::Path::new(&state), &stop).unwrap();
             let emit = async {
-                // Executable hashing precedes subscription. The parent's bounded
-                // request and stdin cancellation govern this readiness wait.
-                while telemetry_trace_subscriber_count() == 0 {
-                    tokio::task::yield_now().await;
-                }
+                // Hashing the CI test executable must finish before timing subscriber readiness.
+                super::super::job_delivery::executable_provenance().await.unwrap();
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while telemetry_trace_subscriber_count() == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("top.api service subscriber");
                 for (operation, status) in [
                     (S3Operation::GetObject, 200),
                     (S3Operation::GetObject, 503),
@@ -2859,11 +2878,77 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    const NATIVE_THREADS_PREPARED_FILE: &str = "native-threads-provenance-ready";
+
+    #[cfg(target_os = "linux")]
+    const NATIVE_THREADS_FIXTURE_STARTED_FILE: &str = "native-threads-fixture-started";
+
+    #[cfg(target_os = "linux")]
+    fn spawn_native_threads_test_child(state: &std::path::Path, mode: &str) -> std::io::Result<tokio::process::Child> {
+        tokio::process::Command::new(std::env::current_exe()?)
+            .args([
+                "connect::diagnostics::trace_runtime::tests::local_native_threads_service_child",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("RUSTFS_TEST_NATIVE_THREADS_STATE", state)
+            .env("RUSTFS_TEST_NATIVE_THREADS_FIXTURE_MODE", mode)
+            .stdin(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_profile_child_marker(
+        child: &mut tokio::process::Child,
+        path: &std::path::Path,
+        budget: Duration,
+    ) -> std::io::Result<()> {
+        tokio::time::timeout(budget, async {
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("profile fixture exited before readiness: {status}"),
+                    ));
+                }
+                if path.try_exists()? {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "profile fixture readiness timed out"))?
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn stop_profile_test_child(
+        child: &mut tokio::process::Child,
+        budget: Duration,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        drop(child.stdin.take());
+        match tokio::time::timeout(budget, child.wait()).await {
+            Ok(status) => status,
+            Err(_) => {
+                child.kill().await?;
+                child.wait().await
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn local_native_threads_service_child() {
         let Some(state) = std::env::var_os("RUSTFS_TEST_NATIVE_THREADS_STATE") else {
             return;
         };
+        let mode = std::env::var("RUSTFS_TEST_NATIVE_THREADS_FIXTURE_MODE").unwrap_or_else(|_| "capture".to_owned());
+        match mode.as_str() {
+            "exit-before-ready" => return,
+            "capture" | "wait-before-ready" | "ignore-stop" => {}
+            _ => panic!("unknown native threads fixture mode"),
+        }
         let stop = CancellationToken::new();
         let input_stop = stop.clone();
         std::thread::spawn(move || {
@@ -2871,6 +2956,14 @@ mod tests {
             let _ = std::io::stdin().read(&mut [0u8]);
             input_stop.cancel();
         });
+        if mode != "capture" {
+            std::fs::write(std::path::Path::new(&state).join(NATIVE_THREADS_FIXTURE_STARTED_FILE), b"started")
+                .expect("fixture started marker");
+            while mode == "ignore-stop" || !stop.is_cancelled() {
+                std::thread::park_timeout(Duration::from_millis(10));
+            }
+            return;
+        }
         let sleepers: Vec<_> = (0..16)
             .map(|_| {
                 let stop = stop.clone();
@@ -2882,6 +2975,9 @@ mod tests {
             })
             .collect();
         tokio::runtime::Runtime::new().unwrap().block_on(async {
+            prepare_profile_test_provenance().await;
+            std::fs::write(std::path::Path::new(&state).join(NATIVE_THREADS_PREPARED_FILE), b"ready")
+                .expect("profile provenance ready marker");
             let runtime = spawn_local_trace_capture_runtime(std::path::Path::new(&state), &stop).unwrap();
             stop.cancelled().await;
             runtime.shutdown().await;
@@ -2898,31 +2994,26 @@ mod tests {
         use std::io::Read as _;
         let state = tempfile::tempdir().unwrap();
         std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let (request, key) = runtime_request(state.path());
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "connect::diagnostics::trace_runtime::tests::local_native_threads_service_child",
-                "--exact",
-                "--nocapture",
-            ])
-            .env("RUSTFS_TEST_NATIVE_THREADS_STATE", state.path())
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let ready = tokio::time::timeout(Duration::from_secs(5), async {
-            while !state.path().join(super::SOCKET_FILE).exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+        let mut child = spawn_native_threads_test_child(state.path(), "capture").unwrap();
+        let capture = async {
+            // This setup budget does not extend the socket or production request deadlines.
+            wait_for_profile_child_marker(&mut child, &state.path().join(NATIVE_THREADS_PREPARED_FILE), Duration::from_secs(120))
+                .await
+                .map_err(LocalTraceCaptureError::Io)?;
+            wait_for_profile_child_marker(&mut child, &state.path().join(super::SOCKET_FILE), Duration::from_secs(5))
+                .await
+                .map_err(LocalTraceCaptureError::Io)?;
+            let (request, key) = runtime_request(state.path());
+            let export =
+                super::request_local_native_threads_profile(state.path(), request.clone(), &CancellationToken::new()).await?;
+            Ok::<_, LocalTraceCaptureError>((export, request, key))
+        }
         .await;
-        let export = if ready.is_ok() {
-            super::request_local_native_threads_profile(state.path(), request.clone(), &CancellationToken::new()).await
-        } else {
-            Err(LocalTraceCaptureError::Protocol)
-        };
-        drop(child.stdin.take());
-        assert!(child.wait().unwrap().success());
-        let export = export.unwrap();
+        let status = stop_profile_test_child(&mut child, Duration::from_secs(10))
+            .await
+            .expect("native threads fixture must be reaped");
+        assert!(status.success(), "fixture exit: {status}; capture error: {:?}", capture.as_ref().err());
+        let (export, request, key) = capture.unwrap();
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&export.archive_bytes)).unwrap();
         let result: serde_json::Value = serde_json::from_reader(zip.by_name("result.json").unwrap()).unwrap();
         assert_eq!(result["toolId"], "profile.threads");
@@ -2942,6 +3033,63 @@ mod tests {
         signed.extend_from_slice(&envelope);
         assert!(key.verifies_pending_registration_state(&signed, signature["value"].as_str().unwrap()));
         assert!(!state.path().join("identity").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn local_native_threads_preparation_detects_early_child_exit() {
+        let state = tempfile::tempdir().unwrap();
+        let mut child = spawn_native_threads_test_child(state.path(), "exit-before-ready").unwrap();
+        let ready =
+            wait_for_profile_child_marker(&mut child, &state.path().join(NATIVE_THREADS_PREPARED_FILE), Duration::from_secs(5))
+                .await;
+        let status = stop_profile_test_child(&mut child, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(ready.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(status.success());
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn local_native_threads_preparation_timeout_reaps_child() {
+        let state = tempfile::tempdir().unwrap();
+        let mut child = spawn_native_threads_test_child(state.path(), "wait-before-ready").unwrap();
+        let started = wait_for_profile_child_marker(
+            &mut child,
+            &state.path().join(NATIVE_THREADS_FIXTURE_STARTED_FILE),
+            Duration::from_secs(5),
+        )
+        .await;
+        let ready = wait_for_profile_child_marker(
+            &mut child,
+            &state.path().join(NATIVE_THREADS_PREPARED_FILE),
+            Duration::from_millis(20),
+        )
+        .await;
+        let status = stop_profile_test_child(&mut child, Duration::from_secs(1)).await.unwrap();
+        started.unwrap();
+        assert_eq!(ready.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(status.success());
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn local_native_threads_cleanup_kills_and_reaps_unresponsive_child() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let state = tempfile::tempdir().unwrap();
+        let mut child = spawn_native_threads_test_child(state.path(), "ignore-stop").unwrap();
+        let started = wait_for_profile_child_marker(
+            &mut child,
+            &state.path().join(NATIVE_THREADS_FIXTURE_STARTED_FILE),
+            Duration::from_secs(5),
+        )
+        .await;
+        let status = stop_profile_test_child(&mut child, Duration::from_millis(20)).await.unwrap();
+        started.unwrap();
+        assert_eq!(status.signal(), Some(9));
+        assert!(child.try_wait().unwrap().is_some());
     }
 
     #[tokio::test]
@@ -2985,14 +3133,14 @@ mod tests {
         use std::io::Read as _;
         let state = tempfile::tempdir().unwrap();
         std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        prepare_profile_test_provenance().await;
         let (mut request, key) = runtime_request(state.path());
         request.capability = super::super::profile_cpu::MEMORY_PROFILE_CAPABILITY.to_owned();
         let runtime = spawn_local_trace_capture_runtime(state.path(), &CancellationToken::new()).unwrap();
-        let export = super::request_local_runtime_profile(state.path(), request.clone(), &CancellationToken::new())
-            .await
-            .unwrap();
-        assert_eq!(export.tool, super::ProfileTool::Memory);
+        let export = super::request_local_runtime_profile(state.path(), request.clone(), &CancellationToken::new()).await;
         runtime.shutdown().await;
+        let export = export.unwrap();
+        assert_eq!(export.tool, super::ProfileTool::Memory);
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&export.archive_bytes)).unwrap();
         let result: serde_json::Value = serde_json::from_reader(zip.by_name("result.json").unwrap()).unwrap();
         assert_eq!(result["toolId"], "profile.memory");
@@ -3018,6 +3166,7 @@ mod tests {
         use std::io::Read as _;
         let state = tempfile::tempdir().unwrap();
         std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        prepare_profile_test_provenance().await;
         let (mut request, _key) = runtime_request(state.path());
         request.capability = super::super::profile_cpu::CPU_PROFILE_CAPABILITY.to_owned();
         request.duration_millis = 1_000;
@@ -3071,6 +3220,63 @@ mod tests {
             signed.extend_from_slice(&envelope);
             assert!(_key.verifies_pending_registration_state(&signed, signature["value"].as_str().unwrap()));
             assert!(!state.path().join("identity").exists());
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn local_runtime_profile_listener_checks_real_peer_credentials() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        for same_owner in [false, true] {
+            let state = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let (request, _) = runtime_request(state.path());
+            let owner = super::private_state_owner(state.path()).unwrap();
+            let socket = state.path().join(super::SOCKET_FILE);
+            let listener = super::bind_listener(&socket, owner).unwrap();
+            let mut client = tokio::net::UnixStream::connect(&socket).await.unwrap();
+            assert_eq!(client.peer_cred().unwrap().uid(), owner);
+            let mut bytes = serde_json::to_vec(&super::CaptureRequest::RuntimeProfile {
+                protocol_version: super::PROTOCOL_VERSION,
+                request,
+            })
+            .unwrap();
+            bytes.push(b'\n');
+            // Queue the same valid request before either listener checks its real peer UID.
+            client.write_all(&bytes).await.unwrap();
+            let shutdown = CancellationToken::new();
+            let expected_owner = if same_owner { owner } else { owner ^ 1 };
+            let server = tokio::spawn(super::run_listener(
+                listener,
+                expected_owner,
+                state.path().to_path_buf(),
+                shutdown.clone(),
+            ));
+            let mut response = Vec::new();
+            let read = tokio::time::timeout(Duration::from_secs(30), client.read_to_end(&mut response))
+                .await
+                .expect("listener must close the connection");
+            shutdown.cancel();
+            server.await.unwrap();
+            if same_owner {
+                read.unwrap();
+                assert!(matches!(
+                    serde_json::from_slice::<super::CaptureResponse>(&response).unwrap(),
+                    super::CaptureResponse::RuntimeOk { .. }
+                ));
+            } else {
+                // Unix platforms either report EOF or reset when unread request bytes are discarded.
+                if let Err(error) = read {
+                    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+                }
+                assert!(
+                    response.is_empty(),
+                    "a foreign peer must receive no signed archive or diagnostic response"
+                );
+            }
+            let lease = super::super::profile_cpu::CollectorLease::acquire().expect("listener leaves no collector lease");
+            drop(lease);
         }
     }
 
@@ -3144,17 +3350,43 @@ mod tests {
     async fn local_runtime_profile_cancellation_waits_for_lease_release() {
         let state = tempfile::tempdir().unwrap();
         std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        prepare_profile_test_provenance().await;
         let (mut request, _) = runtime_request(state.path());
         request.duration_millis = 5_000;
-        let runtime = spawn_local_trace_capture_runtime(state.path(), &CancellationToken::new()).unwrap();
+        let server_state_root = state.path().to_path_buf();
+        let (ready, wait) = tokio::sync::oneshot::channel();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let server_shutdown = CancellationToken::new();
+                    let runtime = spawn_local_trace_capture_runtime(&server_state_root, &server_shutdown).unwrap();
+                    ready.send(()).unwrap();
+                    let _ = stopped.await;
+                    runtime.shutdown().await;
+                });
+        });
+        wait.await.unwrap();
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
         let state_root = state.path().to_path_buf();
-        let task = tokio::spawn(async move { super::request_local_runtime_profile(&state_root, request, &task_cancel).await });
+        let mut task =
+            tokio::spawn(async move { super::request_local_runtime_profile(&state_root, request, &task_cancel).await });
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if super::super::profile_cpu::CollectorLease::acquire().is_err() {
                     break;
+                }
+                if task.is_finished() {
+                    let detail = match (&mut task).await.expect("request task should not panic") {
+                        Ok(_) => "request completed successfully".to_owned(),
+                        Err(error) => format!("request failed: {error}"),
+                    };
+                    panic!("runtime profile finished before acquiring its collector lease: {detail}");
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -3165,7 +3397,8 @@ mod tests {
         assert!(matches!(task.await.unwrap(), Err(LocalTraceCaptureError::RuntimeProfile(code)) if code == "CANCELLED"));
         let lease = super::super::profile_cpu::CollectorLease::acquire().expect("client cancellation joins collector");
         drop(lease);
-        runtime.shutdown().await;
+        stop.send(()).unwrap();
+        server.join().unwrap();
     }
     #[tokio::test]
     #[serial]

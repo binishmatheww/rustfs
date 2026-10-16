@@ -60,34 +60,46 @@ pub(crate) struct StorageSnapshotMetrics {
 
 impl StorageSnapshotMetrics {
     pub(crate) fn new(meter: Meter, scope: &'static str, observer: String, max_age: Duration) -> Self {
-        let snapshot = Arc::new(RwLock::new(Snapshot::default()));
         let labels = vec![KeyValue::new(COLLECTION_SCOPE, scope), KeyValue::new(OBSERVER, observer)];
-        let weak = Arc::downgrade(&snapshot);
-        let timestamp_labels = labels.clone();
-        meter
-            .f64_observable_gauge(LAST_SUCCESS)
-            .with_description("Unix timestamp of the last successful storage snapshot collection")
-            .with_callback(move |observer| {
-                let Some(snapshot) = weak.upgrade() else { return };
-                let Ok(snapshot) = snapshot.read() else { return };
-                if snapshot.collected_at.is_some() {
-                    observer.observe(snapshot.timestamp_seconds, &timestamp_labels);
-                }
-            })
-            .build();
-        let weak = Arc::downgrade(&snapshot);
-        let age_labels = labels.clone();
-        meter
-            .f64_observable_gauge(MAX_AGE)
-            .with_description("Validity budget in seconds remaining after storage snapshot collection completed")
-            .with_callback(move |observer| {
-                let Some(snapshot) = weak.upgrade() else { return };
-                let Ok(snapshot) = snapshot.read() else { return };
-                if snapshot.collected_at.is_some() {
-                    observer.observe(snapshot.remaining_age.as_secs_f64(), &age_labels);
-                }
-            })
-            .build();
+        Self::new_with_labels(meter, labels, max_age, true)
+    }
+
+    /// Creates an unscoped snapshot for dynamic metric series whose membership
+    /// must match the latest authoritative collection.
+    pub(crate) fn new_unscoped(meter: Meter, max_age: Duration) -> Self {
+        Self::new_with_labels(meter, Vec::new(), max_age, false)
+    }
+
+    fn new_with_labels(meter: Meter, labels: Vec<KeyValue>, max_age: Duration, publish_freshness: bool) -> Self {
+        let snapshot = Arc::new(RwLock::new(Snapshot::default()));
+        if publish_freshness {
+            let weak = Arc::downgrade(&snapshot);
+            let timestamp_labels = labels.clone();
+            meter
+                .f64_observable_gauge(LAST_SUCCESS)
+                .with_description("Unix timestamp of the last successful storage snapshot collection")
+                .with_callback(move |observer| {
+                    let Some(snapshot) = weak.upgrade() else { return };
+                    let Ok(snapshot) = snapshot.read() else { return };
+                    if snapshot.collected_at.is_some() {
+                        observer.observe(snapshot.timestamp_seconds, &timestamp_labels);
+                    }
+                })
+                .build();
+            let weak = Arc::downgrade(&snapshot);
+            let age_labels = labels.clone();
+            meter
+                .f64_observable_gauge(MAX_AGE)
+                .with_description("Validity budget in seconds remaining after storage snapshot collection completed")
+                .with_callback(move |observer| {
+                    let Some(snapshot) = weak.upgrade() else { return };
+                    let Ok(snapshot) = snapshot.read() else { return };
+                    if snapshot.collected_at.is_some() {
+                        observer.observe(snapshot.remaining_age.as_secs_f64(), &age_labels);
+                    }
+                })
+                .build();
+        }
         Self {
             meter,
             snapshot,
@@ -221,6 +233,7 @@ mod tests {
 
     #[derive(Clone, Debug)]
     struct ExportedPoint {
+        scope: String,
         name: String,
         value: f64,
         attributes: Vec<KeyValue>,
@@ -233,28 +246,33 @@ mod tests {
         async fn export(&self, metrics: &ResourceMetrics) -> OTelSdkResult {
             let mut exported = self.0.lock().unwrap();
             exported.clear();
-            for metric in metrics.scope_metrics().flat_map(|scope| scope.metrics()) {
-                match metric.data() {
-                    AggregatedMetrics::F64(MetricData::Gauge(gauge)) => {
-                        for point in gauge.data_points() {
-                            exported.push(ExportedPoint {
-                                name: metric.name().to_string(),
-                                value: point.value(),
-                                attributes: point.attributes().cloned().collect(),
-                            });
+            for scope in metrics.scope_metrics() {
+                let scope_name = scope.scope().name().to_string();
+                for metric in scope.metrics() {
+                    match metric.data() {
+                        AggregatedMetrics::F64(MetricData::Gauge(gauge)) => {
+                            for point in gauge.data_points() {
+                                exported.push(ExportedPoint {
+                                    scope: scope_name.clone(),
+                                    name: metric.name().to_string(),
+                                    value: point.value(),
+                                    attributes: point.attributes().cloned().collect(),
+                                });
+                            }
                         }
-                    }
-                    AggregatedMetrics::U64(MetricData::Sum(sum)) => {
-                        assert!(sum.is_monotonic());
-                        for point in sum.data_points() {
-                            exported.push(ExportedPoint {
-                                name: metric.name().to_string(),
-                                value: point.value() as f64,
-                                attributes: point.attributes().cloned().collect(),
-                            });
+                        AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                            assert!(sum.is_monotonic());
+                            for point in sum.data_points() {
+                                exported.push(ExportedPoint {
+                                    scope: scope_name.clone(),
+                                    name: metric.name().to_string(),
+                                    value: point.value() as f64,
+                                    attributes: point.attributes().cloned().collect(),
+                                });
+                            }
                         }
+                        data => panic!("unexpected storage aggregation: {data:?}"),
                     }
-                    data => panic!("unexpected storage aggregation: {data:?}"),
                 }
             }
             Ok(())
@@ -279,6 +297,16 @@ mod tests {
         let provider = SdkMeterProvider::builder().with_reader(reader).build();
         let snapshot =
             StorageSnapshotMetrics::new(provider.meter("storage-test"), "local", "node1:9000".into(), Duration::from_secs(30));
+        (provider, exporter, snapshot)
+    }
+
+    fn setup_unscoped() -> (SdkMeterProvider, Exporter, StorageSnapshotMetrics) {
+        let exporter = Exporter::default();
+        let reader = PeriodicReader::builder(exporter.clone())
+            .with_interval(Duration::from_secs(3600))
+            .build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        let snapshot = StorageSnapshotMetrics::new_unscoped(provider.meter("service-test"), Duration::from_secs(30));
         (provider, exporter, snapshot)
     }
 
@@ -327,6 +355,41 @@ mod tests {
     }
 
     #[test]
+    fn actual_sdk_stops_exporting_deleted_bucket_quota_series_after_tombstone() {
+        let (provider, exporter, mut snapshot) = setup_unscoped();
+        let bucket = "deleted-bucket";
+        let quota_metrics = |value| {
+            vec![
+                PrometheusMetric::from_descriptor(&super::super::schema::node_bucket::BUCKET_QUOTA_BYTES_MD, value)
+                    .with_label("bucket", bucket),
+                PrometheusMetric::from_descriptor(&super::super::schema::cluster_usage::USAGE_BUCKET_QUOTA_TOTAL_BYTES_MD, value)
+                    .with_label("bucket", bucket),
+            ]
+        };
+
+        snapshot.replace(quota_metrics(1024.0)).unwrap();
+        assert_eq!(
+            flush(&provider, &exporter)
+                .iter()
+                .filter(|point| point.value == 1024.0)
+                .count(),
+            2
+        );
+        assert!(flush(&provider, &exporter).iter().all(|point| point.scope == "service-test"));
+
+        snapshot.replace(quota_metrics(0.0)).unwrap();
+        let tombstones = flush(&provider, &exporter);
+        assert_eq!(tombstones.iter().filter(|point| point.value == 0.0).count(), 2);
+
+        snapshot.replace(Vec::new()).unwrap();
+        for _ in 0..2 {
+            let points = flush(&provider, &exporter);
+            assert!(points.is_empty(), "deleted bucket quota points must not remain in cumulative exports");
+        }
+        provider.shutdown().unwrap();
+    }
+
+    #[test]
     fn actual_sdk_preserves_counter_resets_instead_of_accumulating_old_absolute_values() {
         let (provider, exporter, mut snapshot) = setup();
         for value in [7.0, 2.0, 5.0] {
@@ -343,6 +406,69 @@ mod tests {
             );
         }
         provider.shutdown().unwrap();
+    }
+
+    #[test]
+    fn actual_sdk_exports_bucket_size_and_object_count_as_current_gauges() {
+        use crate::metrics::collectors::{BucketUsageStats, collect_bucket_usage_metrics};
+
+        let (provider, exporter, mut snapshot) = setup_unscoped();
+        let mut buckets = vec![
+            BucketUsageStats {
+                bucket: "client-a".into(),
+                total_bytes: 4096,
+                objects_count: 3,
+                ..Default::default()
+            },
+            BucketUsageStats {
+                bucket: "client-b".into(),
+                total_bytes: 8192,
+                objects_count: 7,
+                ..Default::default()
+            },
+            BucketUsageStats {
+                bucket: "empty".into(),
+                ..Default::default()
+            },
+        ];
+
+        for expected in [
+            vec![("client-a", 4096.0, 3.0), ("client-b", 8192.0, 7.0), ("empty", 0.0, 0.0)],
+            vec![("client-a", 1024.0, 1.0), ("empty", 0.0, 0.0)],
+        ] {
+            let metrics = collect_bucket_usage_metrics(&buckets);
+            assert!(
+                metrics.iter().all(|metric| metric.metric_type == MetricType::Gauge),
+                "bucket inventory values must decrease without counter semantics"
+            );
+            snapshot.replace(metrics).expect("publish current bucket usage");
+            let points = flush(&provider, &exporter);
+            for (name, index) in [
+                ("rustfs_cluster_usage_buckets_total_bytes", 0),
+                ("rustfs_cluster_usage_buckets_objects_count", 1),
+            ] {
+                let mut actual = points
+                    .iter()
+                    .filter(|point| point.name == name)
+                    .map(|point| {
+                        assert_eq!(point.scope, "service-test");
+                        assert_eq!(point.attributes.len(), 1, "usage is cluster-wide, not a per-node count");
+                        assert_eq!(point.attributes[0].key.as_str(), "bucket");
+                        (point.attributes[0].value.to_string(), point.value)
+                    })
+                    .collect::<Vec<_>>();
+                actual.sort_by(|a, b| a.0.cmp(&b.0));
+                let values = expected
+                    .iter()
+                    .map(|(bucket, bytes, objects)| (bucket.to_string(), if index == 0 { *bytes } else { *objects }))
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, values, "{name} must preserve each bucket's current value");
+            }
+            buckets.remove(1);
+            buckets[0].total_bytes = 1024;
+            buckets[0].objects_count = 1;
+        }
+        provider.shutdown().expect("shut down bucket usage test provider");
     }
 
     #[test]

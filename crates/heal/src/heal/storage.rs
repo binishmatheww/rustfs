@@ -459,6 +459,13 @@ pub trait HealStorageAPI: Send + Sync {
         Ok(None)
     }
 
+    /// Whether the exact old bucket generation has a durable deletion record.
+    /// Alternate backends must fail closed unless they can validate the same
+    /// deployment, bucket and incarnation identity.
+    async fn mrf_bucket_incarnation_retired(&self, _bucket: &str, _expected: Uuid) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Aggregate usage-cache baselines for the requested buckets.
     async fn erasure_set_usage_baseline(&self, _buckets: &[String]) -> Result<Option<HealBucketUsageBaseline>> {
         Ok(None)
@@ -483,6 +490,10 @@ pub trait HealStorageAPI: Send + Sync {
 
     /// Get all buckets
     async fn list_buckets(&self) -> Result<Vec<BucketInfo>>;
+
+    /// Return only a complete bucket inventory for an administrator task.
+    /// Incomplete discovery must fail before traversal or scope checkpointing.
+    async fn list_buckets_for_admin_heal(&self, selector: Option<DiskSetSelector>) -> Result<Vec<BucketInfo>>;
 
     /// Check object exists
     async fn object_exists(&self, bucket: &str, object: &str) -> Result<bool>;
@@ -566,6 +577,29 @@ pub trait HealStorageAPI: Send + Sync {
 
     /// Heal bucket using ecstore
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem>;
+
+    /// Recover transactions omitted by ordinary listings. Alternate providers
+    /// may explicitly expose no transaction-recovery capability.
+    async fn recover_delete_transactions(
+        &self,
+        _bucket: &str,
+        _object: Option<&str>,
+        _expected: Option<Uuid>,
+        _opts: &HealOpts,
+    ) -> Result<Option<HealResultItem>> {
+        Ok(None)
+    }
+
+    /// Recover hidden transactions only within the requested object prefix.
+    async fn recover_delete_prefix_transactions(
+        &self,
+        _bucket: &str,
+        _prefix: &str,
+        _expected: Option<Uuid>,
+        _opts: &HealOpts,
+    ) -> Result<Option<HealResultItem>> {
+        Ok(None)
+    }
 
     /// Heal format using ecstore
     async fn heal_format(&self, dry_run: bool) -> Result<(HealResultItem, Option<Error>)>;
@@ -700,6 +734,13 @@ pub trait HealStorageAPI: Send + Sync {
         _expected_identities: &[ReplacementTargetIdentity],
     ) -> Result<bool> {
         Ok(true)
+    }
+
+    /// Admit a one-shot recovery of an old pre-format intent only when the
+    /// current format fence permits its set, rebalance has a quiescent older
+    /// topology, and every target is a blank, unformatted replacement.
+    async fn replacement_preformat_retry_is_safe(&self, _set_disk_id: &str, _targets: &[String]) -> Result<bool> {
+        Ok(false)
     }
 
     async fn replacement_execution(&self, _targets: &[String]) -> Result<Arc<ReplacementExecution>> {
@@ -1178,6 +1219,13 @@ impl HealStorageAPI for ECStoreHealStorage {
             .map_err(Error::Storage)
     }
 
+    async fn mrf_bucket_incarnation_retired(&self, bucket: &str, expected: Uuid) -> Result<bool> {
+        self.ecstore
+            .is_bucket_incarnation_retired(bucket, expected)
+            .await
+            .map_err(Error::Storage)
+    }
+
     async fn erasure_set_usage_baseline(&self, buckets: &[String]) -> Result<Option<HealBucketUsageBaseline>> {
         if buckets.is_empty() {
             return Ok(None);
@@ -1296,6 +1344,14 @@ impl HealStorageAPI for ECStoreHealStorage {
                 Ok(false)
             }
         }
+    }
+
+    async fn list_buckets_for_admin_heal(&self, selector: Option<DiskSetSelector>) -> Result<Vec<BucketInfo>> {
+        let listing = self.ecstore.list_buckets_for_admin_heal(selector).await?;
+        if !listing.topology_complete {
+            return Err(Error::BucketDiscoveryIncomplete);
+        }
+        Ok(listing.buckets)
     }
 
     async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
@@ -1482,6 +1538,32 @@ impl HealStorageAPI for ECStoreHealStorage {
         Ok(self
             .object_result_with_receipt(bucket, object, version_id, opts, result, None)
             .await)
+    }
+
+    async fn recover_delete_transactions(
+        &self,
+        bucket: &str,
+        object: Option<&str>,
+        expected: Option<Uuid>,
+        opts: &HealOpts,
+    ) -> Result<Option<HealResultItem>> {
+        self.ecstore
+            .recover_delete_transactions_at_incarnation(bucket, object, expected, opts)
+            .await
+            .map_err(Error::Storage)
+    }
+
+    async fn recover_delete_prefix_transactions(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        expected: Option<Uuid>,
+        opts: &HealOpts,
+    ) -> Result<Option<HealResultItem>> {
+        self.ecstore
+            .recover_delete_prefix_at_incarnation(bucket, prefix, expected, opts)
+            .await
+            .map_err(Error::Storage)
     }
 
     async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
@@ -2033,6 +2115,14 @@ impl HealStorageAPI for ECStoreHealStorage {
 
     async fn replacement_execution(&self, targets: &[String]) -> Result<Arc<ReplacementExecution>> {
         ReplacementExecution::acquire(targets).await
+    }
+
+    async fn replacement_preformat_retry_is_safe(&self, set_disk_id: &str, targets: &[String]) -> Result<bool> {
+        let (pool_index, set_index) = crate::heal::utils::parse_set_disk_id(set_disk_id)?;
+        self.ecstore
+            .replacement_preformat_retry_is_safe(pool_index, set_index, targets)
+            .await
+            .map_err(Error::Storage)
     }
 }
 

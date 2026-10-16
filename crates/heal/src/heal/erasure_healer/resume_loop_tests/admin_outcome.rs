@@ -335,9 +335,23 @@ async fn admin_erasure_dispositions_do_not_invent_success_and_retries_count_once
         .expect_err("unhealed objects must retain the failed task status");
     let outcome = task.get_outcome().await;
     let c = &outcome.counters;
-    assert_eq!((c.processed, c.healed, c.unchanged, c.failed, c.skipped, c.unknown), (5, 0, 2, 1, 2, 1));
-    assert_eq!(c.attempt_failures, 5);
+    assert_eq!((c.processed, c.healed, c.unchanged, c.failed, c.skipped, c.unknown), (5, 0, 2, 0, 3, 1));
+    assert_eq!(c.attempt_failures, 8);
+    assert_eq!(storage.calls().iter().filter(|(name, _)| name == "gone").count(), 4);
     assert_eq!(storage.calls().iter().filter(|(name, _)| name == "offline").count(), 4);
+    let gone = outcome
+        .objects
+        .iter()
+        .find(|item| item.identity.object == "gone")
+        .expect("missing version outcome");
+    assert_eq!(
+        gone.disposition,
+        HealObjectDisposition::Deferred {
+            reason: HealDeferredReason::TransientExistenceCheck,
+            retry_not_before: None,
+        },
+        "exhausting retries cannot certify the missing version as absent"
+    );
     assert_partition(&outcome);
 }
 
@@ -468,4 +482,51 @@ async fn admin_erasure_checkpoint_publication_cannot_undo_acknowledged_cancel() 
     assert_eq!(outcome.execution, HealExecutionOutcome::Aborted(HealAbortReason::Cancelled));
     assert_eq!(outcome.coverage, HealTraversalCoverage::Partial);
     assert_eq!((outcome.counters.processed, outcome.counters.healed), (1, 1));
+}
+
+#[tokio::test]
+async fn admin_bucket_discovery_rejects_incomplete_checkpoint_and_freezes_complete_empty_scope() {
+    let env = make_env().await;
+    env.storage.bucket_discovery_incomplete.store(true, Ordering::SeqCst);
+    let result = env
+        .healer
+        .prepare_admin_checkpoint(&env.checkpoint, &[], "pool_0_set_0")
+        .await;
+    assert!(matches!(result, Err(Error::BucketDiscoveryIncomplete)));
+    assert!(env.checkpoint.get_checkpoint().await.admin.is_none());
+    let reloaded = CheckpointManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
+        .await
+        .expect("reload checkpoint");
+    assert!(reloaded.get_checkpoint().await.admin.is_none(), "incomplete scope must not be persisted");
+    assert_eq!(
+        env.storage.bucket_discovery_scopes.lock().expect("scopes").as_slice(),
+        &[Some(crate::heal::storage_api::storage::DiskSetSelector::new(0, 0))]
+    );
+
+    env.storage.bucket_discovery_incomplete.store(false, Ordering::SeqCst);
+    assert!(
+        env.healer
+            .prepare_admin_checkpoint(&env.checkpoint, &[], "pool_0_set_0")
+            .await
+            .expect("complete empty scope")
+            .is_empty()
+    );
+    env.storage.bucket_discovery_incomplete.store(true, Ordering::SeqCst);
+    objects(&env.storage, "created-after-admission", &["object"]);
+    let reloaded = CheckpointManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
+        .await
+        .expect("reload frozen scope");
+    assert!(
+        env.healer
+            .prepare_admin_checkpoint(&reloaded, &[], "pool_0_set_0")
+            .await
+            .expect("resume frozen scope")
+            .is_empty()
+    );
+    assert_eq!(
+        env.storage.bucket_discovery_scopes.lock().expect("scopes").len(),
+        2,
+        "resume must not rediscover or expand scope"
+    );
+    assert!(env.storage.calls().is_empty());
 }

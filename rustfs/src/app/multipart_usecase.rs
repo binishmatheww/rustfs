@@ -17,7 +17,7 @@
 use super::storage_api::multipart_usecase::ECStore;
 use super::storage_api::multipart_usecase::access::{
     TableDataPlaneListAccess, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
-    has_bypass_governance_header, replication_request_authorized,
+    has_bypass_governance_header, replication_request_authorized, retained_table_data_plane_publication_guards,
 };
 use super::storage_api::multipart_usecase::bucket::quota::checker::QuotaChecker;
 use super::storage_api::multipart_usecase::bucket::{
@@ -710,6 +710,7 @@ impl DefaultMultipartUsecase {
         let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
 
         let upload_user_defined = multipart_info.as_ref().map(|info| info.user_defined.clone());
+        let table_data_plane_publication_guards = retained_table_data_plane_publication_guards(&req);
 
         let quota_metadata_sys = self.bucket_metadata_sys();
         let quota_tracking = quota_metadata_sys.is_some();
@@ -778,7 +779,9 @@ impl DefaultMultipartUsecase {
             let key = key.clone();
             let upload_id = upload_id.clone();
             let opts = opts.clone();
+            let table_data_plane_publication_guards = table_data_plane_publication_guards;
             async move {
+                let _table_data_plane_publication_guards = table_data_plane_publication_guards;
                 let obj_info = store
                     .clone()
                     .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, &opts)
@@ -1523,6 +1526,7 @@ impl DefaultMultipartUsecase {
             key_marker,
             upload_id_marker,
             max_uploads,
+            encoding_type,
             ..
         } = req.input;
 
@@ -1575,7 +1579,12 @@ impl DefaultMultipartUsecase {
                 .map_err(ApiError::from)?,
         };
 
-        Ok(S3Response::new(build_list_multipart_uploads_output(bucket, prefix, result)))
+        Ok(S3Response::new(build_list_multipart_uploads_output(
+            bucket,
+            prefix,
+            result,
+            encoding_type.as_ref(),
+        )))
     }
 
     pub async fn execute_list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
@@ -1769,18 +1778,25 @@ impl DefaultMultipartUsecase {
             .into());
         }
 
-        let (src_reader, _source_cancellation) = store
-            .get_object_reader_for_copy(&src_bucket, &src_key, rs.clone(), h, &get_opts)
+        let prepared_source = store
+            .prepare_get_object_reader(&src_bucket, &src_key, rs.clone(), h, &get_opts)
             .await
             .map_err(map_get_object_reader_error)?;
 
-        let src_info = src_reader.object_info;
+        let src_info = prepared_source.object_info();
+        if src_info.delete_marker {
+            let error = if src_opts.version_id.is_none() {
+                StorageError::ObjectNotFound(src_bucket.clone(), src_key.clone())
+            } else {
+                StorageError::MethodNotAllowed
+            };
+            return Err(map_get_object_reader_error(error).into());
+        }
 
         // Same shape as CopyObject: the part copy reads the source plaintext, and the source
         // read resolves its material inside the object layer, which carries no request identity.
         authorize_sse_kms_object_read(copy_principal.as_ref(), &src_info.user_defined).await?;
 
-        let src_stream = src_reader.stream;
         let resolved_src_version_id = src_info.version_id.map(|version_id| {
             if version_id == Uuid::nil() {
                 "null".to_string()
@@ -1811,12 +1827,13 @@ impl DefaultMultipartUsecase {
             return Err(s3_error!(PreconditionFailed));
         }
 
-        let source_logical_size = match src_info.get_actual_size() {
-            Ok(size) if size >= 0 => size,
-            Ok(_) | Err(_) if destination_size_limit.is_some() => {
+        let source_actual_size = src_info.get_actual_size().ok().filter(|size| *size >= 0);
+        let source_logical_size = match source_actual_size {
+            Some(size) => size,
+            None if destination_size_limit.is_some() => {
                 return Err(S3Error::new(S3ErrorCode::UnexpectedContent));
             }
-            Ok(_) | Err(_) => src_info.size,
+            None => src_info.size,
         };
 
         let (_start_offset, length) = if let Some(ref range_spec) = rs {
@@ -1831,6 +1848,26 @@ impl DefaultMultipartUsecase {
         } else {
             (0, source_logical_size)
         };
+
+        // Resolve the range under the prepared source's read lock, then try the
+        // shared budget without waiting while holding namespace/lifecycle locks.
+        // Keep both the budget and source cancellation alive through the write.
+        let admission_length = source_actual_size.map_or(-1, |_| length);
+        let _copy_admission = match self.concurrency_manager().try_admit_multipart_part_copy(admission_length) {
+            ForegroundWriteAdmission::Disabled => None,
+            ForegroundWriteAdmission::Admitted(permit) => Some(permit),
+            ForegroundWriteAdmission::Rejected => {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::SlowDown,
+                    "foreground write concurrency limit reached, please reduce your request rate",
+                ));
+            }
+        };
+        let (src_reader, _source_cancellation) = prepared_source
+            .into_reader_for_copy()
+            .await
+            .map_err(map_get_object_reader_error)?;
+        let src_stream = src_reader.stream;
 
         let is_disk_compressed =
             rustfs_utils::http::contains_key_str(&mp_info.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
@@ -2035,6 +2072,7 @@ mod tests {
     use super::*;
 
     mod body_read_tests;
+    mod copy_admission_tests;
     use http::{Extensions, HeaderMap, Method, Uri, header::HeaderValue};
     use rustfs_filemeta::ObjectPartInfo;
     use rustfs_utils::http::{
@@ -2928,7 +2966,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn multipart_completion_rejects_rotated_quota_capability_before_rename() {
+    async fn multipart_completion_commits_after_quota_fleet_proof_loss_before_rename() {
         use crate::app::storage_api::test::set_disk::{MultipartCommitBarrier, MultipartCommitPause};
 
         let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("rotated-proof-mpu-quota", 4096).await;
@@ -2962,27 +3000,19 @@ mod tests {
                 .await
         });
         barrier.wait_until_paused().await;
-        assert!(
-            crate::storage::storage_api::ecstore_notification::rotate_cross_pool_fence_fleet_proof_for_test(),
-            "the gating environment must have a current fleet proof"
-        );
+        let _without_proof = crate::storage::storage_api::ecstore_notification::without_cross_pool_fence_fleet_proof_for_test();
+        assert!(crate::storage::storage_api::ecstore_notification::acquire_cross_pool_fence_fleet_proof().is_none());
         barrier.release();
 
-        let err = complete
+        complete
             .await
             .expect("completion task should not panic")
-            .expect_err("a replaced fleet proof must fence multipart rename");
-        assert!(matches!(
-            err,
-            StorageError::NamespaceLockQuorumUnavailable {
-                mode: "quota_reservation",
-                ..
-            }
-        ));
-        store
-            .get_multipart_info(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .expect("fleet proof loss must not invalidate multipart quota reservation and disk fences");
+        let stored = store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
             .await
-            .expect("proof rotation must preserve the multipart upload for retry");
+            .expect("completed multipart object must remain readable after fleet proof loss");
+        assert_eq!(stored.size, 4096);
     }
 
     #[tokio::test]

@@ -29,7 +29,7 @@ use crate::{
 use hmac::{Hmac, KeyInit, Mac};
 use rustfs_credentials::try_get_rpc_token;
 use rustfs_heal_contracts::heal_channel::HealScanMode;
-use rustfs_scanner_metrics::metrics::{Metric, Metrics};
+use rustfs_scanner_metrics::metrics::{CloseDiskGuard, Metric, Metrics, current_path_updater};
 use rustfs_utils::path::path_join_buf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -840,6 +840,7 @@ async fn scan_and_persist_local_bucket(
                 }
                 match persist_scanner_checkpoint(
                     set.clone(),
+                    store.clone(),
                     ScannerCheckpointPersistContext {
                         ctx: &scan_ctx,
                         expected_publication_epoch,
@@ -852,7 +853,7 @@ async fn scan_and_persist_local_bucket(
                 )
                 .await
                 {
-                    ScannerCheckpointPersistResult::Saved => {
+                    ScannerCheckpointPersistResult::Saved | ScannerCheckpointPersistResult::Skipped => {
                         if guard.is_lock_lost() {
                             scan_ctx.cancel();
                             let _ = tokio::time::timeout(NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan.as_mut()).await;
@@ -868,8 +869,12 @@ async fn scan_and_persist_local_bucket(
                             "remote namespace scanner cache fence changed during checkpoint save",
                         ));
                     }
-                    ScannerCheckpointPersistResult::Failed(_error) => {
-                        checkpoint_channel_closed = true;
+                    ScannerCheckpointPersistResult::RetryBucket(error) => {
+                        scan_ctx.cancel();
+                        let _ = tokio::time::timeout(NS_SCANNER_LOCK_LOSS_SHUTDOWN_TIMEOUT, scan.as_mut()).await;
+                        return Err(RemoteScannerServerError::retry_bucket(format!(
+                            "remote namespace scanner checkpoint needs reload: {error}",
+                        )));
                     }
                 }
             }
@@ -1012,71 +1017,79 @@ pub(crate) async fn scan_remote_bucket(
         )));
     }
 
-    let rpc_deadline = Instant::now() + NS_SCANNER_MAX_RPC_LIFETIME;
-    let open_deadline = (Instant::now() + NS_SCANNER_STALL_TIMEOUT).min(rpc_deadline);
-    let open_stream = disk.open_ns_scanner_stream(crate::NsScannerOpenRequest {
-        request_id,
-        server_epoch,
-        session_id,
-        session_sequence,
-        next_cycle,
-        leader_epoch,
-        body,
-        stall_timeout: Some(NS_SCANNER_STALL_TIMEOUT),
-    });
-    tokio::pin!(open_stream);
-    let reader = tokio::select! {
-        _ = ctx.cancelled() => {
-            budget.cancel_after_unreported_remote_progress();
-            return Err(RemoteScannerFailure::transport(StorageError::other(
-                "remote namespace scanner cancelled while opening stream",
-            )));
-        }
-        result = tokio::time::timeout_at(open_deadline, &mut open_stream) => {
-            match result {
-                Err(_) => {
-                    budget.cancel_after_unreported_remote_progress();
-                    return Err(RemoteScannerFailure::transport(StorageError::other(
-                        "remote namespace scanner response headers timed out",
-                    )));
-                }
-                Ok(Err(err)) if err.is_internode_http_status(429) => {
-                    return Err(RemoteScannerFailure::retry_bucket(StorageError::other(format!(
-                        "remote namespace scanner worker rejected zero-progress work: {err}"
-                    ))));
-                }
-                Ok(Err(err)) => {
-                    budget.cancel_after_unreported_remote_progress();
-                    return Err(RemoteScannerFailure::transport(StorageError::other(format!(
-                        "failed to open remote namespace scanner stream: {err}"
-                    ))));
-                }
-                Ok(Ok(reader)) => reader,
-            }
-        }
-    };
-    let authenticator = FrameAuthenticator::from_rpc_secret(request_id).map_err(|err| {
-        RemoteScannerFailure::transport(StorageError::other(format!(
-            "failed to authenticate remote namespace scanner stream: {err}"
-        )))
-    })?;
-
-    let stream_result = consume_remote_scanner_stream_until(
-        reader,
-        ctx,
-        budget.clone(),
-        RemoteScannerResponseExpectation {
-            bucket,
-            source: expected_source,
+    let disk_name = format!("{}{}", disk.host_name(), disk.path().display());
+    let (_, close_path) = current_path_updater(&disk_name, bucket).await;
+    let mut path_guard = CloseDiskGuard::new(close_path);
+    let result = async {
+        let rpc_deadline = Instant::now() + NS_SCANNER_MAX_RPC_LIFETIME;
+        let open_deadline = (Instant::now() + NS_SCANNER_STALL_TIMEOUT).min(rpc_deadline);
+        let open_stream = disk.open_ns_scanner_stream(crate::NsScannerOpenRequest {
+            request_id,
+            server_epoch,
+            session_id,
+            session_sequence,
             next_cycle,
-            scan_plan_digest,
-            tier_registry_generation,
-        },
-        authenticator,
-        rpc_deadline,
-    )
+            leader_epoch,
+            body,
+            stall_timeout: Some(NS_SCANNER_STALL_TIMEOUT),
+        });
+        tokio::pin!(open_stream);
+        let reader = tokio::select! {
+            _ = ctx.cancelled() => {
+                budget.cancel_after_unreported_remote_progress();
+                return Err(RemoteScannerFailure::transport(StorageError::other(
+                    "remote namespace scanner cancelled while opening stream",
+                )));
+            }
+            result = tokio::time::timeout_at(open_deadline, &mut open_stream) => {
+                match result {
+                    Err(_) => {
+                        budget.cancel_after_unreported_remote_progress();
+                        return Err(RemoteScannerFailure::transport(StorageError::other(
+                            "remote namespace scanner response headers timed out",
+                        )));
+                    }
+                    Ok(Err(err)) if err.is_internode_http_status(429) => {
+                        return Err(RemoteScannerFailure::retry_bucket(StorageError::other(format!(
+                            "remote namespace scanner worker rejected zero-progress work: {err}"
+                        ))));
+                    }
+                    Ok(Err(err)) => {
+                        budget.cancel_after_unreported_remote_progress();
+                        return Err(RemoteScannerFailure::transport(StorageError::other(format!(
+                            "failed to open remote namespace scanner stream: {err}"
+                        ))));
+                    }
+                    Ok(Ok(reader)) => reader,
+                }
+            }
+        };
+        let authenticator = FrameAuthenticator::from_rpc_secret(request_id).map_err(|err| {
+            RemoteScannerFailure::transport(StorageError::other(format!(
+                "failed to authenticate remote namespace scanner stream: {err}"
+            )))
+        })?;
+
+        let stream_result = consume_remote_scanner_stream_until(
+            reader,
+            ctx,
+            budget.clone(),
+            RemoteScannerResponseExpectation {
+                bucket,
+                source: expected_source,
+                next_cycle,
+                scan_plan_digest,
+                tier_registry_generation,
+            },
+            authenticator,
+            rpc_deadline,
+        )
+        .await;
+        finish_remote_scanner_stream(stream_result, budget.as_ref())
+    }
     .await;
-    finish_remote_scanner_stream(stream_result, budget.as_ref())
+    path_guard.close().await;
+    result
 }
 
 fn finish_remote_scanner_stream(
@@ -1246,11 +1259,12 @@ where
                 bounded_remote_scanner_deadline(Instant::now(), NS_SCANNER_SEMANTIC_STALL_TIMEOUT, rpc_deadline);
         }
 
-        match frame.result {
+        let terminal = match frame.result {
             RemoteScannerFrameResult::Progress => {
                 if budget.budget_elapsed() && frame.phase == RemoteScannerPhase::Scanning {
                     return Ok(RemoteScannerOutcome::Partial);
                 }
+                None
             }
             RemoteScannerFrameResult::Complete(complete) => {
                 if complete.usage.name != expected.bucket || complete.usage.parent != crate::DATA_USAGE_ROOT {
@@ -1279,22 +1293,23 @@ where
                     )));
                 }
                 if budget.budget_elapsed() {
-                    return Ok(RemoteScannerOutcome::Partial);
+                    Some(Ok(RemoteScannerOutcome::Partial))
+                } else {
+                    Some(Ok(RemoteScannerOutcome::Complete {
+                        usage: Box::new(complete.usage),
+                        pending_maintenance_work: complete.pending_maintenance_work,
+                    }))
                 }
-                return Ok(RemoteScannerOutcome::Complete {
-                    usage: Box::new(complete.usage),
-                    pending_maintenance_work: complete.pending_maintenance_work,
-                });
             }
-            RemoteScannerFrameResult::Partial => return Ok(RemoteScannerOutcome::Partial),
-            RemoteScannerFrameResult::NamespaceNotFound => return Ok(RemoteScannerOutcome::NamespaceNotFound),
+            RemoteScannerFrameResult::Partial => Some(Ok(RemoteScannerOutcome::Partial)),
+            RemoteScannerFrameResult::NamespaceNotFound => Some(Ok(RemoteScannerOutcome::NamespaceNotFound)),
             RemoteScannerFrameResult::CycleAhead { required_cycle } => {
                 if required_cycle <= expected.next_cycle || required_cycle == u64::MAX {
                     return Err(RemoteScannerStreamError::reconciled(StorageError::other(
                         "remote namespace scanner returned an invalid required cycle",
                     )));
                 }
-                return Ok(RemoteScannerOutcome::CycleAhead(required_cycle));
+                Some(Ok(RemoteScannerOutcome::CycleAhead(required_cycle)))
             }
             RemoteScannerFrameResult::Error(error_frame) => {
                 let retry_bucket = error_frame.message.starts_with(NS_SCANNER_RETRY_BUCKET_ERROR_PREFIX);
@@ -1305,12 +1320,45 @@ where
                     .unwrap_or(error_frame.message.as_str());
                 let error =
                     StorageError::other(format!("remote namespace scanner failed: {}", limit_error_message(message.to_string())));
-                return Err(match error_frame.scope {
+                Some(Err(match error_frame.scope {
                     RemoteScannerErrorScope::Bucket if retry_bucket => RemoteScannerStreamError::retry_bucket(error),
                     RemoteScannerErrorScope::Bucket => RemoteScannerStreamError::bucket(error),
                     RemoteScannerErrorScope::Worker => RemoteScannerStreamError::reconciled(error),
-                });
+                }))
             }
+        };
+
+        if let Some(result) = terminal {
+            let mut trailing = [0_u8; 1];
+            let read_deadline = rpc_deadline.min(semantic_progress_deadline);
+            let lifetime_limited = rpc_deadline <= semantic_progress_deadline;
+            let eof = tokio::select! {
+                biased;
+                _ = ctx.cancelled(), if budget.reason().is_none() => {
+                    return Err(RemoteScannerStreamError::for_phase(
+                        StorageError::other("remote namespace scanner cancelled"), last_phase,
+                    ));
+                }
+                read = tokio::time::timeout_at(read_deadline, reader.read(&mut trailing)) => match read {
+                    Ok(Ok(n)) => n,
+                    Ok(Err(err)) => return Err(RemoteScannerStreamError::for_phase(StorageError::other(err), last_phase)),
+                    Err(_) => {
+                        let message = if lifetime_limited {
+                            "remote namespace scanner RPC lifetime exceeded"
+                        } else {
+                            "remote namespace scanner made no semantic progress"
+                        };
+                        return Err(RemoteScannerStreamError::for_phase(StorageError::other(message), last_phase));
+                    }
+                }
+            };
+            if eof != 0 {
+                return Err(RemoteScannerStreamError::for_phase(
+                    StorageError::other("remote namespace scanner returned trailing bytes after terminal frame"),
+                    last_phase,
+                ));
+            }
+            return result;
         }
     }
 }

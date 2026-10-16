@@ -684,12 +684,12 @@ def check_ilm_build_budget(root: Path) -> list[str]:
         return [".github/workflows/ci.yml: missing workflow"]
     workflow = workflow_path.read_text()
     job = re.search(
-        r"^  test-ilm-integration-serial:\n(?P<body>.*?)(?=^  [a-z0-9-]+:\n)",
+        r"^  test-and-lint:\n(?P<body>.*?)(?=^  [a-z0-9-]+:\n)",
         workflow,
         re.MULTILINE | re.DOTALL,
     )
     if job is None:
-        return [".github/workflows/ci.yml: missing test-ilm-integration-serial job"]
+        return [".github/workflows/ci.yml: ILM integration must share the workspace test job"]
 
     step = re.search(
         r"^      - name: Run ignored ILM integration tests serially\n(?P<body>.*?)(?=^      - name:|\Z)",
@@ -705,6 +705,16 @@ def check_ilm_build_budget(root: Path) -> list[str]:
     )
     if budget not in step.group("body"):
         return [".github/workflows/ci.yml: ILM integration must keep the measured 3/2 Cargo build budget"]
+    for required in (
+        "        if: needs.classify-changes.outputs.mode == 'full'",
+        "cargo nextest run --profile default -j1 --run-ignored ignored-only",
+        "--all --exclude e2e_test",
+        "-E 'binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))'",
+        'status=${PIPESTATUS[0]}',
+        'exit "${status}"',
+    ):
+        if required not in step.group("body"):
+            return [f".github/workflows/ci.yml: ILM integration is missing {required.strip()}"]
     return []
 
 
@@ -1072,7 +1082,10 @@ def check_quick_checks(root: Path) -> list[str]:
         errors.append(f"{relative}: missing composite action")
         return errors
     steps = yaml_block(runs, "steps", 2) or []
-    for command in ("shellcheck --version && actionlint", "./scripts/check_error_other_format_ratchet.sh", "make script-tests"):
+    for command in (
+        "shellcheck --version && actionlint", "./scripts/check_error_other_format_ratchet.sh", "make script-tests",
+        "python3 ./scripts/test_object_generation_protocol_model.py",
+    ):
         step = workflow_step_block(steps, command, key="run", indent=4)
         if step is None:
             errors.append(f"{relative}: missing direct execution of {command}")
@@ -3517,6 +3530,8 @@ class SelfTests(unittest.TestCase):
                 "    - name: Error format ratchet\n      shell: bash\n"
                 "      run: ./scripts/check_error_other_format_ratchet.sh\n"
                 "    - name: Script tests\n      shell: bash\n      run: make script-tests\n"
+                "    - name: Object generation model\n      shell: bash\n"
+                "      run: python3 ./scripts/test_object_generation_protocol_model.py\n"
             )
             sources = {
                 ".github/workflows/ci.yml": caller.replace(
@@ -3576,6 +3591,11 @@ class SelfTests(unittest.TestCase):
                 "missing ratchet": action.replace("run: ./scripts/check_error_other_format_ratchet.sh", "run: echo skipped"),
                 "missing script tests": action.replace("run: make script-tests", "run: echo skipped"),
                 "swallowed script failure": action.replace("run: make script-tests", "run: make script-tests || true"),
+                "missing generation model": action.replace("run: python3 ./scripts/test_object_generation_protocol_model.py", "run: echo skipped"),
+                "swallowed generation model failure": action.replace(
+                    "run: python3 ./scripts/test_object_generation_protocol_model.py",
+                    "run: python3 ./scripts/test_object_generation_protocol_model.py || true",
+                ),
                 "swallowed lint failure": action.replace("&& actionlint", "&& actionlint || true"),
                 "swallowed ratchet failure": action.replace("ratchet.sh", "ratchet.sh || true"),
                 "conditional lint": action.replace("run: shellcheck", "if: false\n      run: shellcheck"),
@@ -3585,7 +3605,10 @@ class SelfTests(unittest.TestCase):
                     "name: Lint workflows", "name: |\n        run: shellcheck --version && actionlint"
                 ).replace("\n      run: shellcheck --version && actionlint\n", "\n      run: shellcheck --version && actionlint\n        || true\n"),
             }
-            for command in ("shellcheck --version && actionlint", "./scripts/check_error_other_format_ratchet.sh", "make script-tests"):
+            for command in (
+                "shellcheck --version && actionlint", "./scripts/check_error_other_format_ratchet.sh", "make script-tests",
+                "python3 ./scripts/test_object_generation_protocol_model.py",
+            ):
                 for key in ("'if' : false", '"if": false', "'continue-on-error': true", '"continue-on-error" : true'):
                     mutations[f"quoted {command} {key}"] = action.replace(f"run: {command}", f"{key}\n      run: {command}")
                 for separator in ("", "\n", "        # continued command\n"):
@@ -3606,8 +3629,9 @@ class SelfTests(unittest.TestCase):
             root = Path(tmp)
             (root / "scripts").mkdir()
             commands = ("shellcheck", "actionlint", "./scripts/check_error_other_format_ratchet.sh")
+            model_command = "python3 ./scripts/test_object_generation_protocol_model.py"
             (root / "Makefile").write_text(".PHONY: script-tests\nscript-tests:\n\texit 17\n")
-            for failing in (*commands, "make script-tests"):
+            for failing in (*commands, "make script-tests", model_command):
                 with self.subTest(command=failing):
                     run = "shellcheck --version && actionlint" if failing in ("shellcheck", "actionlint") else failing
                     step = workflow_step_block(steps, run, key="run", indent=4)
@@ -3619,6 +3643,9 @@ class SelfTests(unittest.TestCase):
                         shim = root / command
                         shim.write_text(f"#!/bin/sh\nexit {17 if command == failing else 0}\n")
                         shim.chmod(0o755)
+                    (root / "scripts/test_object_generation_protocol_model.py").write_text(
+                        f"raise SystemExit({17 if failing == model_command else 0})\n"
+                    )
                     result = subprocess.run(
                         ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", body],
                         cwd=root, env=dict(os.environ, PATH=f"{root}{os.pathsep}{os.environ['PATH']}"),
@@ -5549,12 +5576,17 @@ class SelfTests(unittest.TestCase):
             workflow.parent.mkdir(parents=True)
             valid = (
                 "jobs:\n"
-                "  test-ilm-integration-serial:\n"
+                "  test-and-lint:\n"
                 "    steps:\n"
                 "      - name: Run ignored ILM integration tests serially\n"
+                "        if: needs.classify-changes.outputs.mode == 'full'\n"
                 "        env:\n"
                 "          CARGO_BUILD_JOBS: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '3' || '2' }}\n"
-                "        run: cargo nextest run\n"
+                "        run: |\n"
+                "          cargo nextest run --profile default -j1 --run-ignored ignored-only --all --exclude e2e_test \\\n"
+                "            -E 'binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))'\n"
+                "          status=${PIPESTATUS[0]}\n"
+                '          exit "${status}"\n'
                 "  next-job:\n"
                 "    steps: []\n"
             )
@@ -5563,6 +5595,18 @@ class SelfTests(unittest.TestCase):
 
             workflow.write_text(valid.replace("          CARGO_BUILD_JOBS:", "          BUILD_JOBS:"))
             self.assertEqual(len(check_ilm_build_budget(root)), 1)
+            for old, new in (
+                ("test-and-lint:", "test-ilm-integration-serial:"),
+                ("outputs.mode == 'full'", "outputs.mode == 'docs'"),
+                ("--profile default", "--profile ci"),
+                ("-j1", "-j2"),
+                ("ignored-only", "default"),
+                ("--all --exclude e2e_test", "-p rustfs-scanner -p rustfs"),
+                ("binary(lifecycle_integration_test)", "none()"),
+                ('exit "${status}"', "exit 0"),
+            ):
+                workflow.write_text(valid.replace(old, new))
+                self.assertTrue(check_ilm_build_budget(root), (old, new))
 
     def test_vault_tests_require_cross_process_serialization(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

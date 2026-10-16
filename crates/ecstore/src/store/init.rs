@@ -108,6 +108,10 @@ fn should_retry_format_load(err: &Error) -> bool {
     )
 }
 
+fn format_load_retry_exhausted(err: &Error, retries: u32) -> bool {
+    retries >= 10 && !matches!(err, Error::ErasureReadQuorum | Error::FirstDiskWait | Error::NotFirstDisk)
+}
+
 fn should_auto_start_rebalance_after_init(decommission_running: bool, rebalance_resume_required: bool) -> bool {
     rebalance_resume_required && !decommission_running
 }
@@ -484,7 +488,7 @@ impl ECStore {
             check_disk_fatal_errs(&errs)?;
 
             let loaded_format = {
-                let mut times = 0;
+                let mut times = 0_u32;
                 let mut interval = 1;
                 loop {
                     match init_format::connect_load_init_formats_with_instance_ctx(
@@ -500,13 +504,13 @@ impl ECStore {
                         Ok(fm) => break Ok(fm),
                         Err(e) if !should_retry_format_load(&e) => break Err(e),
                         // Wrap the final error if we are giving up
-                        Err(e) if times >= 10 => {
+                        Err(e) if format_load_retry_exhausted(&e, times) => {
                             break Err(Error::other(format!("store init failed to load formats after {times} retries: {e}")));
                         }
                         // Retrying so just drop the error
                         Err(_) => {}
                     }
-                    times += 1;
+                    times = times.saturating_add(1);
                     if interval < 16 {
                         interval *= 2;
                     }
@@ -519,6 +523,12 @@ impl ECStore {
                         "Retrying storage format load"
                     );
                     select! {
+                        _ = ctx.cancelled() => {
+                            return Err(Error::other(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "storage format initialization cancelled",
+                            )));
+                        }
                         _ = tokio::signal::ctrl_c() => {
                             info!(
                                 event = EVENT_STORE_FORMAT_RETRY,
@@ -820,6 +830,8 @@ impl ECStore {
                 };
             }
         });
+
+        super::delete_recovery_runtime::start_delete_recovery(self.clone(), rx.clone());
 
         runtime_sources::init_bucket_monitor_for_current_endpoints();
         crate::bucket::bucket_target_sys::BucketTargetSys::get().start_heartbeat();
@@ -2199,6 +2211,23 @@ mod tests {
         tokio::time::advance(super::LOCAL_DECOMMISSION_WATCHDOG_INTERVAL).await;
         task.await.expect("watchdog task should exit after cancellation");
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn format_peer_wait_does_not_exhaust_the_retry_budget() {
+        for retries in [0, 9, 10, u32::MAX] {
+            for error in [
+                StorageError::ErasureReadQuorum,
+                StorageError::FirstDiskWait,
+                StorageError::NotFirstDisk,
+            ] {
+                assert!(
+                    !super::format_load_retry_exhausted(&error, retries),
+                    "peer availability must remain retryable"
+                );
+            }
+            assert_eq!(super::format_load_retry_exhausted(&StorageError::Timeout, retries), retries >= 10);
+        }
     }
 
     #[test]
@@ -4136,6 +4165,178 @@ mod tests {
         OfflineTestDisks { disks }
     }
 
+    #[cfg(feature = "test-util")]
+    async fn durable_quota_writes_with_one_offline_disk(sharded: bool) {
+        use crate::bucket::quota::BucketQuota;
+        use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
+
+        let temp_dir = tempfile::tempdir().expect("create degraded quota store dir");
+        let (ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "degraded-quota", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        let bucket = format!("degraded-quota-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create degraded quota bucket");
+        let quota = if sharded {
+            BucketQuota::new_sharded(16_384)
+        } else {
+            BucketQuota::new(Some(16_384))
+        };
+        crate::bucket::metadata_sys::update_in(
+            &ctx,
+            &bucket,
+            crate::bucket::metadata::BUCKET_QUOTA_CONFIG_FILE,
+            serde_json::to_vec(&quota).expect("encode durable quota"),
+        )
+        .await
+        .expect("configure durable quota before losing a disk");
+
+        let set = &store.pools[0].disk_set[0];
+        assert_eq!(set.disks.read().await.len(), 4);
+        let offline_disk = force_set_disk_range_offline_for_test(set, 0..1).await;
+        let _without_proof = crate::services::notification_sys::without_cross_pool_fence_fleet_proof_for_test();
+        assert!(crate::services::notification_sys::acquire_cross_pool_fence_fleet_proof().is_none());
+
+        let payload = vec![0x51; 4096];
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        store
+            .put_object(&bucket, "put", &mut reader, &ObjectOptions::default())
+            .await
+            .expect("three healthy disks must admit a quota PUT without fleet proof");
+
+        let upload = store
+            .new_multipart_upload(&bucket, "multipart", &ObjectOptions::default())
+            .await
+            .expect("create multipart upload with one disk offline");
+        let mut reader = PutObjReader::from_vec(payload.clone());
+        let part = store
+            .put_object_part(&bucket, "multipart", &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("stage multipart part with one disk offline");
+        Arc::clone(&store)
+            .complete_multipart_upload(
+                &bucket,
+                "multipart",
+                &upload.upload_id,
+                vec![crate::storage_api_contracts::multipart::CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("three healthy disks must complete a quota multipart upload without fleet proof");
+
+        let source = store
+            .get_object_reader(&bucket, "put", None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("read degraded copy source");
+        let mut copy_info = source.object_info.clone();
+        let size = copy_info.get_actual_size().expect("copy source logical size");
+        copy_info.put_object_reader = Some(PutObjReader::new(
+            rustfs_rio::HashReader::from_stream(source.stream, size, size, None, None, false)
+                .expect("construct copy source reader"),
+        ));
+        store
+            .copy_object(
+                &bucket,
+                "put",
+                &bucket,
+                "copy",
+                &mut copy_info,
+                &ObjectOptions::default(),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("three healthy disks must copy into a quota bucket without fleet proof");
+
+        // Hold the last available credit before publication so the competing
+        // writer must account for an outstanding reservation, not just objects.
+        let barrier = PutObjectCommitBarrier::install(&bucket, "reserved", PutObjectCommitPause::BeforeQuotaRename);
+        let first_store = Arc::clone(&store);
+        let first_bucket = bucket.clone();
+        let first = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(vec![0x52; 4096]);
+            first_store
+                .put_object(&first_bucket, "reserved", &mut reader, &ObjectOptions::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+            .await
+            .expect("the last within-limit writer must reach its commit barrier");
+        let mut reader = PutObjReader::from_vec(vec![0x53; 4096]);
+        let denied = store
+            .put_object(&bucket, "over-limit", &mut reader, &ObjectOptions::default())
+            .await
+            .expect_err("an outstanding reservation must prevent concurrent quota oversubscription");
+        assert!(matches!(denied, StorageError::QuotaExceeded { limit: 16_384, .. }));
+        barrier.release();
+        first
+            .await
+            .expect("reserved PUT task should not panic")
+            .expect("the reserved writer must commit while one disk is offline");
+
+        for object in ["put", "multipart", "copy", "reserved"] {
+            let mut reader = store
+                .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("degraded quota writes must be readable");
+            let mut body = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut body)
+                .await
+                .expect("read committed quota object");
+            let expected = if object == "reserved" {
+                vec![0x52; 4096]
+            } else {
+                payload.clone()
+            };
+            assert_eq!(body, expected, "committed body for {object}");
+        }
+        store
+            .get_object_info(&bucket, "over-limit", &ObjectOptions::default())
+            .await
+            .expect_err("the over-limit writer must not publish an object");
+
+        let second_offline_disk = force_set_disk_range_offline_for_test(set, 1..2).await;
+        let mut reader = PutObjReader::from_vec(vec![0x54; 4096]);
+        let denied = store
+            .put_object(&bucket, "put", &mut reader, &ObjectOptions::default())
+            .await
+            .expect_err("a zero-growth overwrite must still fail when the actual write quorum is lost");
+        assert!(
+            matches!(
+                denied,
+                StorageError::ErasureWriteQuorum
+                    | StorageError::ErasureReadQuorum
+                    | StorageError::InsufficientWriteQuorum(_, _)
+                    | StorageError::InsufficientReadQuorum(_, _)
+            ),
+            "loss of actual disk quorum must return a storage quorum error, got {denied:?}"
+        );
+        shutdown.cancel();
+        drop(second_offline_disk);
+        drop(offline_disk);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn durable_quota_v1_writes_with_one_offline_disk_and_no_fleet_proof() {
+        run_large_stack_async_test("degraded-quota-v1", || durable_quota_writes_with_one_offline_disk(false));
+    }
+
+    #[cfg(feature = "test-util")]
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn durable_quota_v2_writes_with_one_offline_disk_and_no_fleet_proof() {
+        run_large_stack_async_test("degraded-quota-v2", || durable_quota_writes_with_one_offline_disk(true));
+    }
+
     fn active_rebalance_meta_for_pool(pool_count: usize, active_pool_idx: usize) -> RebalanceMeta {
         let now = OffsetDateTime::now_utc();
         let mut pool_stats = vec![RebalanceStats::default(); pool_count];
@@ -4362,7 +4563,7 @@ mod tests {
             // successful attempts. Only injected faults spend this global budget.
             // A real failure may consume an attempt, so preserve the final chance.
             faults
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |faults| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |faults| {
                     (faults < crate::core::pools::DECOMMISSION_VERSION_COPY_ATTEMPTS.saturating_sub(1))
                         .then_some(faults.saturating_add(1))
                 })
@@ -5005,6 +5206,339 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn repeated_abort_recovers_exact_orphan_before_decommission_drains() {
+        use crate::storage_api_contracts::namespace::NamespaceLocking as _;
+        use sha2::Digest;
+
+        let temp_dir = tempfile::tempdir().expect("create orphan recovery store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "orphan-multipart-drain", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("orphan-multipart-{}", uuid::Uuid::new_v4());
+        let object = "exact-object.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let incarnation = store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation");
+        let lifecycle_guard = store.acquire_bucket_lifecycle_read_lock(&bucket).await.expect("bucket guard");
+        let mut upload_opts = ObjectOptions {
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        upload_opts.add_bucket_lifecycle_lock_guard(&lifecycle_guard);
+        let upload = store.pools[0]
+            .new_multipart_upload(&bucket, object, &upload_opts)
+            .await
+            .expect("create source upload");
+        drop(lifecycle_guard);
+        store
+            .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("initial abort");
+
+        let upload_sha =
+            hex_simd::encode_to_string(sha2::Sha256::digest(format!("{bucket}/{object}").as_bytes()), hex_simd::AsciiCase::Lower);
+        let upload_uuid = crate::runtime::sources::upload_uuid_suffix(&upload.upload_id);
+        let staging_dir = |pool_index: usize, disk_index: usize| {
+            temp_dir
+                .path()
+                .join(format!("pool{pool_index}/set0/disk{disk_index}"))
+                .join(crate::disk::RUSTFS_META_MULTIPART_BUCKET)
+                .join(&upload_sha)
+                .join(&upload_uuid)
+        };
+        for disk_index in 0..3 {
+            let path = staging_dir(0, disk_index);
+            tokio::fs::create_dir_all(&path).await.expect("create late part directory");
+            tokio::fs::write(path.join("part.1"), b"late part after abort")
+                .await
+                .expect("write late part fixture");
+        }
+        mark_test_pool_decommissioning(&store, 0).await;
+        assert!(
+            store
+                .list_multipart_uploads(&bucket, "", None, None, None, 100)
+                .await
+                .expect("logical upload listing")
+                .uploads
+                .is_empty()
+        );
+        assert!(store.ensure_decommission_multipart_uploads_drained_for_test(0).await.is_err());
+        assert!(
+            store
+                .abort_multipart_upload(&bucket, "different-key", &upload.upload_id, &ObjectOptions::default())
+                .await
+                .is_err(),
+            "the same UploadID for a different key must not recover this path"
+        );
+
+        // A minority metadata copy in another pool blocks recovery everywhere.
+        let conflicting_metadata = staging_dir(1, 0).join(crate::disk::STORAGE_FORMAT_FILE);
+        tokio::fs::create_dir_all(conflicting_metadata.parent().expect("metadata parent"))
+            .await
+            .expect("create conflicting pool staging");
+        tokio::fs::write(&conflicting_metadata, b"unreadable metadata")
+            .await
+            .expect("write conflicting metadata");
+        assert!(
+            store
+                .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+                .await
+                .is_err(),
+            "no pool may be cleaned until every pool proves absence"
+        );
+        for disk_index in 0..3 {
+            assert!(staging_dir(0, disk_index).join("part.1").exists());
+        }
+        tokio::fs::remove_file(conflicting_metadata)
+            .await
+            .expect("remove conflicting fixture");
+        let (paused, release) = crate::store::multipart::pause_orphan_multipart_cleanup_for_test(&bucket);
+        let recovery_store = store.clone();
+        let recovery_bucket = bucket.clone();
+        let recovery_upload = upload.upload_id.clone();
+        let mut recovery = tokio::spawn(async move {
+            recovery_store
+                .abort_multipart_upload(&recovery_bucket, object, &recovery_upload, &ObjectOptions::default())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                paused = paused => paused.expect("cleanup owner announces arrival"),
+                result = &mut recovery => panic!("recovery returned before physical cleanup: {result:?}"),
+            }
+        })
+        .await
+        .expect("recovery should reach physical cleanup");
+        recovery.abort();
+        assert!(recovery.await.expect_err("request waiter is cancellable").is_cancelled());
+        let upload_lock = store.pools[0]
+            .get_disks_by_key(object)
+            .new_ns_lock(crate::disk::RUSTFS_META_MULTIPART_BUCKET, &format!("{upload_sha}/{upload_uuid}"))
+            .await
+            .expect("same upload namespace");
+        let mut upload_writer = Box::pin(upload_lock.get_write_lock(Duration::from_secs(10)));
+        let mut bucket_writer = Box::pin(store.acquire_bucket_lifecycle_write_lock(&bucket));
+        assert!(
+            futures::poll!(&mut upload_writer).is_pending(),
+            "cancelled recovery must retain the upload lock"
+        );
+        assert!(
+            futures::poll!(&mut bucket_writer).is_pending(),
+            "cancelled recovery must retain the real bucket guard"
+        );
+        release.send(()).expect("allow physical cleanup to finish");
+        let (upload_guard, bucket_guard) =
+            tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(upload_writer, bucket_writer) })
+                .await
+                .expect("both guards should release after physical cleanup");
+        drop(upload_guard.expect("upload writer resumes"));
+        drop(bucket_guard.expect("bucket writer resumes"));
+        for pool_index in 0..2 {
+            for disk_index in 0..4 {
+                assert!(!staging_dir(pool_index, disk_index).exists(), "every checked staging path must be absent");
+            }
+        }
+        store
+            .ensure_decommission_multipart_uploads_drained_for_test(0)
+            .await
+            .expect("physical decommission gate should open after recovery");
+        assert!(
+            matches!(
+                store
+                    .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+                    .await,
+                Err(StorageError::InvalidUploadID(_, _, _))
+            ),
+            "an absent upload must not claim to have recovered anything"
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn repeated_abort_keeps_no_such_upload_while_a_disk_is_offline() {
+        use sha2::Digest;
+
+        let temp_dir = tempfile::tempdir().expect("create offline-disk recovery store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "orphan-multipart-offline", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("orphan-multipart-{}", uuid::Uuid::new_v4());
+        let object = "offline-object.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let incarnation = store.bucket_incarnation_id(&bucket).await.expect("bucket incarnation");
+        let lifecycle_guard = store.acquire_bucket_lifecycle_read_lock(&bucket).await.expect("bucket guard");
+        let mut upload_opts = ObjectOptions {
+            expected_bucket_incarnation_id: Some(incarnation),
+            ..Default::default()
+        };
+        upload_opts.add_bucket_lifecycle_lock_guard(&lifecycle_guard);
+        let upload = store.pools[0]
+            .new_multipart_upload(&bucket, object, &upload_opts)
+            .await
+            .expect("create source upload");
+        drop(lifecycle_guard);
+        store
+            .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("initial abort");
+
+        let upload_sha =
+            hex_simd::encode_to_string(sha2::Sha256::digest(format!("{bucket}/{object}").as_bytes()), hex_simd::AsciiCase::Lower);
+        let upload_uuid = crate::runtime::sources::upload_uuid_suffix(&upload.upload_id);
+        let staging_dir = |disk_index: usize| {
+            temp_dir
+                .path()
+                .join(format!("pool0/set0/disk{disk_index}"))
+                .join(crate::disk::RUSTFS_META_MULTIPART_BUCKET)
+                .join(&upload_sha)
+                .join(&upload_uuid)
+        };
+        for disk_index in 0..3 {
+            let path = staging_dir(disk_index);
+            tokio::fs::create_dir_all(&path).await.expect("create late part directory");
+            tokio::fs::write(path.join("part.1"), b"late part after abort")
+                .await
+                .expect("write late part fixture");
+        }
+
+        // One offline disk means absence cannot be proven. The idempotent Abort
+        // must keep answering NoSuchUpload instead of surfacing a disk error,
+        // and must not delete anything.
+        let set = store.pools[0].get_disks_by_key(object);
+        let offline = set.disks.write().await[3].take();
+        assert!(offline.is_some(), "fixture disk must have been online");
+        assert!(
+            matches!(
+                store
+                    .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+                    .await,
+                Err(StorageError::InvalidUploadID(_, _, _))
+            ),
+            "unprovable absence must keep NoSuchUpload while a disk is offline"
+        );
+        for disk_index in 0..3 {
+            assert!(
+                staging_dir(disk_index).join("part.1").exists(),
+                "no staging may be deleted while a disk is offline"
+            );
+        }
+
+        set.disks.write().await[3] = offline;
+        store
+            .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("recovery resumes once every disk is observable");
+        for disk_index in 0..4 {
+            assert!(!staging_dir(disk_index).exists(), "recovered staging must be absent");
+        }
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn orphan_multipart_recovery_preserves_current_bucket_incarnation() {
+        use sha2::Digest;
+
+        let temp_dir = tempfile::tempdir().expect("create bucket lifetime recovery store dir");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "orphan-bucket-lifetime", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("orphan-lifetime-{}", uuid::Uuid::new_v4());
+        let object = "object.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create original bucket");
+        let original_incarnation = store.bucket_incarnation_id(&bucket).await.expect("original incarnation");
+        let upload = store
+            .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("create original upload");
+        store
+            .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("abort original upload");
+        store
+            .delete_bucket(&bucket, &crate::storage_api_contracts::bucket::DeleteBucketOptions::default())
+            .await
+            .expect("delete original bucket");
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("recreate bucket");
+        assert_ne!(store.bucket_incarnation_id(&bucket).await.expect("new incarnation"), original_incarnation);
+        let mut reader = PutObjReader::from_vec(b"current bucket object".to_vec());
+        store
+            .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("write current bucket object");
+        let current_upload = store
+            .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("create current incarnation upload for the same key");
+
+        let upload_sha =
+            hex_simd::encode_to_string(sha2::Sha256::digest(format!("{bucket}/{object}").as_bytes()), hex_simd::AsciiCase::Lower);
+        let upload_uuid = crate::runtime::sources::upload_uuid_suffix(&upload.upload_id);
+        let leftover = temp_dir
+            .path()
+            .join("pool0/set0/disk0")
+            .join(crate::disk::RUSTFS_META_MULTIPART_BUCKET)
+            .join(upload_sha)
+            .join(upload_uuid)
+            .join("part.1");
+        tokio::fs::create_dir_all(leftover.parent().expect("staging parent"))
+            .await
+            .expect("create old incarnation staging");
+        tokio::fs::write(&leftover, b"previous bucket lifetime")
+            .await
+            .expect("write previous incarnation fixture");
+        for opts in [
+            ObjectOptions {
+                expected_bucket_incarnation_id: Some(original_incarnation),
+                ..Default::default()
+            },
+            ObjectOptions {
+                expected_bucket_incarnation_id: Some(uuid::Uuid::nil()),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                store
+                    .abort_multipart_upload(&bucket, object, &upload.upload_id, &opts)
+                    .await
+                    .is_err(),
+                "a stale or nil current-bucket identity must fail closed"
+            );
+            assert!(leftover.exists(), "failed bucket lifetime proof must preserve the path");
+        }
+        store
+            .abort_multipart_upload(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("exact metadata-less staging from an old incarnation is unreferenced");
+        assert!(!leftover.exists());
+        store
+            .get_multipart_info(&bucket, object, &current_upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect("recovery must preserve the current incarnation's active upload");
+        let mut reader = store
+            .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("current object must remain readable");
+        let mut body = Vec::new();
+        reader.stream.read_to_end(&mut body).await.expect("read current object");
+        assert_eq!(body, b"current bucket object");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn active_multipart_upload_routes_before_faulted_suspended_source() {
         use sha2::Digest;
 
@@ -5152,6 +5686,179 @@ mod tests {
         );
 
         shutdown.cancel();
+    }
+
+    #[test]
+    #[serial_test::serial(storage_class_env)]
+    fn decommission_listing_accepts_committed_inline_layout_change() {
+        // Keep the native migration scenario off the small debug test stack.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(2)
+                    .build()
+                    .expect("build migration listing runtime");
+                runtime.block_on(async move {
+                    use crate::config::storageclass::{
+                        INLINE_BLOCK_ENV, OPTIMIZE_ENV, RRS_ENV, STANDARD_ENV, lookup_config_for_pools,
+                    };
+
+                    let temp_dir = tempfile::tempdir().expect("create migration listing store");
+                    let (_ctx, store, shutdown) = Box::pin(without_storage_class_env(build_isolated_test_store(
+                        temp_dir.path(),
+                        "decommission-inline-listing",
+                        &[3, 9],
+                    )))
+                    .await;
+                    let _shutdown_guard = shutdown.drop_guard();
+                    crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+                    let bucket = "decommission-inline-listing";
+                    let object = "object.bin";
+                    let payload = vec![0x5a; 64 * 1024];
+                    Box::pin(store.make_bucket(bucket, &MakeBucketOptions::default()))
+                        .await
+                        .expect("create migration listing bucket");
+
+                    // A source written with inline storage disabled remains valid after
+                    // the destination starts using the default inline policy.
+                    let external_config = temp_env::with_vars(
+                        [
+                            (STANDARD_ENV, None),
+                            (RRS_ENV, None),
+                            (OPTIMIZE_ENV, None),
+                            (INLINE_BLOCK_ENV, Some("0")),
+                        ],
+                        || lookup_config_for_pools(&KVS::new(), &[3, 9]),
+                    )
+                    .expect("external storage policy");
+                    for set in &store.pools[1].disk_set {
+                        set.set_test_storage_class_config(external_config.clone());
+                    }
+                    let source = Box::pin(store.pools[1].put_object(
+                        bucket,
+                        object,
+                        &mut PutObjReader::from_vec(payload.clone()),
+                        &ObjectOptions::default(),
+                    ))
+                    .await
+                    .expect("write external source");
+                    assert!(!source.inlined, "fixture must use external source shards");
+                    store.pool_meta.write().await.pools[1].decommission = Some(PoolDecommissionInfo {
+                        start_time: Some(OffsetDateTime::now_utc()),
+                        ..Default::default()
+                    });
+
+                    let reader = Box::pin(store.pools[1].get_object_reader(
+                        bucket,
+                        object,
+                        None,
+                        HeaderMap::new(),
+                        &ObjectOptions {
+                            no_lock: true,
+                            data_movement: true,
+                            raw_data_movement_read: true,
+                            ..Default::default()
+                        },
+                    ))
+                    .await
+                    .expect("read migration source");
+                    let incarnation = store.bucket_incarnation_id(bucket).await.expect("bucket incarnation");
+                    Box::pin(crate::data_movement::migrate_decommission_object(
+                        store.clone(),
+                        1,
+                        bucket.to_string(),
+                        reader,
+                        Some(incarnation),
+                        "test_decommission_inline_listing",
+                        None,
+                    ))
+                    .await
+                    .expect("commit migrated target while retaining source");
+
+                    for pool_index in [0, 1] {
+                        let mut reader = Box::pin(store.pools[pool_index].get_object_reader(
+                            bucket,
+                            object,
+                            None,
+                            HeaderMap::new(),
+                            &ObjectOptions::default(),
+                        ))
+                        .await
+                        .expect("both physical copies must remain readable");
+                        assert_eq!(reader.object_info.inlined, pool_index == 0);
+                        assert_eq!(reader.object_info.etag, source.etag);
+                        assert_eq!(reader.object_info.mod_time, source.mod_time);
+                        let mut actual = Vec::new();
+                        reader
+                            .stream
+                            .read_to_end(&mut actual)
+                            .await
+                            .expect("read complete object body");
+                        assert_eq!(actual, payload);
+                    }
+
+                    Box::pin(store.pools[0].put_object(
+                        bucket,
+                        "z-sentinel",
+                        &mut PutObjReader::from_vec(b"sentinel".to_vec()),
+                        &ObjectOptions::default(),
+                    ))
+                    .await
+                    .expect("write pagination sentinel");
+                    let listing = Box::pin(
+                        store
+                            .clone()
+                            .inner_list_objects_v2(bucket, "", None, None, 1, false, None, false),
+                    )
+                    .await
+                    .expect("listing must merge committed source and target copies");
+                    assert!(listing.is_truncated);
+                    assert_eq!(listing.objects.len(), 1);
+                    assert_eq!(listing.objects[0].name, object);
+                    assert_eq!(listing.objects[0].etag, source.etag);
+                    assert_eq!(listing.objects[0].size, i64::try_from(payload.len()).expect("payload size"));
+                    let next = Box::pin(store.clone().inner_list_objects_v2(
+                        bucket,
+                        "",
+                        listing.next_continuation_token,
+                        None,
+                        1,
+                        false,
+                        None,
+                        false,
+                    ))
+                    .await
+                    .expect("continue after the merged object");
+                    assert!(!next.is_truncated);
+                    assert_eq!(next.objects.len(), 1);
+                    assert_eq!(next.objects[0].name, "z-sentinel");
+
+                    Box::pin(store.pools[1].delete_object(bucket, object, ObjectOptions::default()))
+                        .await
+                        .expect("remove the migrated source copy");
+                    let after_cleanup = Box::pin(
+                        store
+                            .clone()
+                            .inner_list_objects_v2(bucket, "", None, None, 100, false, None, false),
+                    )
+                    .await
+                    .expect("listing must remain complete after source cleanup");
+                    assert!(!after_cleanup.is_truncated);
+                    assert_eq!(
+                        after_cleanup
+                            .objects
+                            .iter()
+                            .map(|info| info.name.as_str())
+                            .collect::<Vec<_>>(),
+                        [object, "z-sentinel"]
+                    );
+                });
+            })
+            .expect("spawn migration listing test")
+            .join()
+            .expect("migration listing test must complete");
     }
 
     #[test]
@@ -9567,8 +10274,18 @@ mod tests {
     #[cfg(feature = "test-util")]
     async fn decommission_migrates_and_verifies_registered_durable_ilm_records_scenario() {
         let temp_dir = tempfile::tempdir().expect("create temp store dir");
-        let (ctx, store, _shutdown) =
-            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "durable-ilm-decommission", &[4, 4])).await;
+        // The explicit recovery below must be the only journal consumer,
+        // including when receipt validation outlasts the background interval.
+        let mut instance_ctx = crate::runtime::instance::InstanceContext::new();
+        instance_ctx.suppress_tier_delete_journal_recovery_for_test();
+        let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store_with_layout(
+            temp_dir.path(),
+            "durable-ilm-decommission",
+            &[(1, 4), (1, 4)],
+            CancellationToken::new(),
+            Some(Arc::new(instance_ctx)),
+        ))
+        .await;
 
         let tier_name = "DECOMMISSION-ILM";
         let backend = register_transition_reconcile_test_tier(&ctx.tier_config_mgr(), tier_name).await;
@@ -10040,6 +10757,16 @@ mod tests {
         .await
         .expect("manual task receipt should restore after the corruption check");
 
+        assert!(matches!(
+            com::read_config(store.pools[0].clone(), &tier_path).await,
+            Err(Error::ConfigNotFound)
+        ));
+        assert_eq!(
+            com::read_config(store.pools[1].clone(), &tier_path)
+                .await
+                .expect("manual recovery must still observe the exact migrated tier journal"),
+            tier_bytes
+        );
         let tier_stats = recover_tier_delete_journal_entries(store.clone(), 100, None)
             .await
             .expect("tier journal recovery should consume the migrated record before completion");
@@ -10796,8 +11523,19 @@ mod tests {
         const JOURNAL_COUNT: usize = 65;
 
         let temp_dir = tempfile::tempdir().expect("create bounded rollback store dir");
-        let (ctx, store, _shutdown) =
-            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "bounded-dispatch-rollback", &[4])).await;
+        // The test's worker must be the only one to roll back the seeded manifest: if
+        // the setup outlasts TIER_DELETE_JOURNAL_RECOVERY_INTERVAL, a background pass
+        // rolls it back before the slow-delete hook is installed.
+        let mut instance_ctx = crate::runtime::instance::InstanceContext::new();
+        instance_ctx.suppress_tier_delete_journal_recovery_for_test();
+        let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store_with_layout(
+            temp_dir.path(),
+            "bounded-dispatch-rollback",
+            &[(1, 4)],
+            CancellationToken::new(),
+            Some(Arc::new(instance_ctx)),
+        ))
+        .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
         let bucket = "bounded-dispatch-rollback-bucket";
         store
@@ -10953,8 +11691,19 @@ mod tests {
     #[serial_test::serial(storage_class_env)]
     async fn dispatch_manifest_page_timeout_detaches_one_deduplicated_worker_until_convergence() {
         let temp_dir = tempfile::tempdir().expect("create detached rollback store dir");
-        let (ctx, store, _shutdown) =
-            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "detached-dispatch-rollback", &[4])).await;
+        // The test's own passes must be the only ones to process the seeded manifest:
+        // if the setup outlasts TIER_DELETE_JOURNAL_RECOVERY_INTERVAL, a background
+        // pass rolls it back before the slow-delete hook is installed.
+        let mut instance_ctx = crate::runtime::instance::InstanceContext::new();
+        instance_ctx.suppress_tier_delete_journal_recovery_for_test();
+        let (ctx, store, _shutdown) = without_storage_class_env(build_isolated_test_store_with_layout(
+            temp_dir.path(),
+            "detached-dispatch-rollback",
+            &[(1, 4)],
+            CancellationToken::new(),
+            Some(Arc::new(instance_ctx)),
+        ))
+        .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
         let bucket = "detached-dispatch-rollback-bucket";
         store
@@ -11022,9 +11771,20 @@ mod tests {
         const WORKER_LIMIT: usize = 4;
 
         let temp_dir = tempfile::tempdir().expect("create bounded detached rollback store dir");
-        let (ctx, store, shutdown) =
-            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "bounded-detached-dispatch-rollback", &[4]))
-                .await;
+        // The test's passes must be the only ones to process the seeded manifests: if
+        // the setup outlasts TIER_DELETE_JOURNAL_RECOVERY_INTERVAL, a background pass
+        // rolls them back before the pause hook is installed. The restarted store
+        // below keeps background recovery, which its half of the test relies on.
+        let mut instance_ctx = crate::runtime::instance::InstanceContext::new();
+        instance_ctx.suppress_tier_delete_journal_recovery_for_test();
+        let (ctx, store, shutdown) = without_storage_class_env(build_isolated_test_store_with_layout(
+            temp_dir.path(),
+            "bounded-detached-dispatch-rollback",
+            &[(1, 4)],
+            CancellationToken::new(),
+            Some(Arc::new(instance_ctx)),
+        ))
+        .await;
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
         let tier_name = "BOUNDED-DETACHED-DISPATCH-ROLLBACK";
         let _backend = register_mock_tier(&ctx.tier_config_mgr(), tier_name).await;
@@ -14521,15 +15281,19 @@ mod tests {
             let barrier = TierDeleteChunkTestBarrier::install(stage);
             let worker_store = store.clone();
             let worker_bucket = bucket.clone();
+            // Simulate a crash at the barrier. Aborting a caller of the public entry
+            // point no longer stops the delete, which runs on a detached task, so
+            // drive the delete below that task.
             let worker = tokio::spawn(async move {
                 worker_store
-                    .delete_object_with_tier_delete_journal(
+                    .handle_delete_object_with_journal(
                         &worker_bucket,
                         prefix,
                         ObjectOptions {
                             delete_prefix: true,
                             ..Default::default()
                         },
+                        Some(worker_store.clone()),
                     )
                     .await
             });
@@ -14538,6 +15302,11 @@ mod tests {
                 .unwrap_or_else(|_| panic!("chunk delete did not reach crash boundary {stage:?}"));
             worker.abort();
             let _ = worker.await;
+            assert_eq!(
+                ctx.detached_mutation_count(),
+                0,
+                "the crash must stop the delete below the detached task, so nothing keeps running after the abort"
+            );
             drop(barrier);
             let released_bucket_guard =
                 tokio::time::timeout(Duration::from_secs(5), store.acquire_bucket_lifecycle_write_lock(&bucket))
@@ -14683,15 +15452,19 @@ mod tests {
 
         let barrier = TierDeleteChunkTestBarrier::install(TierDeleteChunkTestStage::DispatchAuthorized);
         let worker_store = store.clone();
+        // Simulate a crash at the barrier. Aborting a caller of the public entry
+        // point no longer stops the delete, which runs on a detached task, so
+        // drive the delete below that task.
         let worker = tokio::spawn(async move {
             worker_store
-                .delete_object_with_tier_delete_journal(
+                .handle_delete_object_with_journal(
                     bucket,
                     prefix,
                     ObjectOptions {
                         delete_prefix: true,
                         ..Default::default()
                     },
+                    Some(worker_store.clone()),
                 )
                 .await
         });
@@ -14700,6 +15473,11 @@ mod tests {
             .expect("chunk delete should persist its authorization before corruption injection");
         worker.abort();
         let _ = worker.await;
+        assert_eq!(
+            ctx.detached_mutation_count(),
+            0,
+            "the crash must stop the delete below the detached task, so nothing keeps running after the abort"
+        );
         drop(barrier);
 
         let records = store
@@ -16397,11 +17175,10 @@ mod tests {
             .delete_object_with_tier_delete_journal(bucket, object, ObjectOptions::default())
             .await
             .expect_err("one post-commit error plus one offline disk must miss delete quorum");
-        assert!(matches!(err, StorageError::Io(_)), "unexpected local delete failure: {err:?}");
-        assert!(
-            err.to_string()
-                .contains("Storage resources are insufficient for the write operation"),
-            "the caller must observe the wrapped quorum failure: {err}"
+        assert_eq!(
+            err,
+            StorageError::InsufficientWriteQuorum(bucket.to_owned(), object.to_owned()),
+            "the caller must observe the typed quorum failure with its object identity"
         );
         set.disks.write().await[1] = Some(saved_disk);
 
@@ -17328,6 +18105,19 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
     async fn delete_holds_bucket_incarnation_sentinel_through_object_commit() {
+        // The recreation waits for the delete's sentinel on its lifecycle write lock
+        // from before `barrier.release()`, so that lock wait also has to cover the
+        // delete's commit. Raise the lock acquire timeout from the 5 s default to give
+        // the commit room on a starved runner; a kept sentinel still fails the test,
+        // after 30 s instead of 5 s.
+        temp_env::async_with_vars(
+            [(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("30"))],
+            delete_holds_bucket_incarnation_sentinel_through_object_commit_body(),
+        )
+        .await;
+    }
+
+    async fn delete_holds_bucket_incarnation_sentinel_through_object_commit_body() {
         let temp = tempfile::tempdir().expect("create temp store dir");
         let (_ctx, store, _shutdown) =
             without_storage_class_env(build_isolated_test_store(temp.path(), "delete-bucket-incarnation", &[4])).await;
@@ -17400,13 +18190,19 @@ mod tests {
             "bucket delete and same-name recreation must wait for the in-flight object delete"
         );
         barrier.release();
-        delete
+        // The recreation's lock wait started before the release; give the delete as long.
+        tokio::time::timeout(Duration::from_secs(30), delete)
             .await
+            .expect("delete should finish once the barrier is released")
             .expect("delete task should join")
             .expect("old-generation delete should complete");
-        tokio::time::timeout(Duration::from_secs(10), recreate)
+        // If the delete kept the sentinel, `delete_bucket` would fail on its lifecycle
+        // write lock after the lock acquire timeout (30 s here). The rest of the
+        // recreation is fsync-bound IO on four disks, so this bound, above the lock
+        // timeout, only stops a hang.
+        tokio::time::timeout(Duration::from_secs(120), recreate)
             .await
-            .expect("bucket recreation should finish after delete releases the sentinel")
+            .expect("bucket recreation should not hang after delete releases the sentinel")
             .expect("bucket recreation task should join")
             .expect("bucket recreation should succeed");
 
@@ -17459,6 +18255,19 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
     async fn delete_objects_holds_bucket_incarnation_sentinel_through_commit() {
+        // The recreation waits for the delete's sentinel on its lifecycle write lock
+        // from before `barrier.release()`, so that lock wait also has to cover the
+        // delete's commit. Raise the lock acquire timeout from the 5 s default to give
+        // the commit room on a starved runner; a kept sentinel still fails the test,
+        // after 30 s instead of 5 s.
+        temp_env::async_with_vars(
+            [(rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("30"))],
+            delete_objects_holds_bucket_incarnation_sentinel_through_commit_body(),
+        )
+        .await;
+    }
+
+    async fn delete_objects_holds_bucket_incarnation_sentinel_through_commit_body() {
         let temp = tempfile::tempdir().expect("create temp store dir");
         let (_ctx, store, _shutdown) =
             without_storage_class_env(build_isolated_test_store(temp.path(), "batch-delete-bucket-incarnation", &[4])).await;
@@ -17520,20 +18329,354 @@ mod tests {
             "bucket recreation must wait for the in-flight batch delete"
         );
         barrier.release();
-        let (_deleted, errors) = delete.await.expect("batch delete task should join");
+        // The recreation's lock wait started before the release; give the delete as long.
+        let (_deleted, errors) = tokio::time::timeout(Duration::from_secs(30), delete)
+            .await
+            .expect("batch delete should finish once the barrier is released")
+            .expect("batch delete task should join");
         assert!(
             errors.iter().all(Option::is_none),
             "old-generation batch delete should complete: {errors:?}"
         );
-        tokio::time::timeout(Duration::from_secs(10), recreate)
+        // If the delete kept the sentinel, `delete_bucket` would fail on its lifecycle
+        // write lock after the lock acquire timeout (30 s here). The rest of the
+        // recreation is fsync-bound IO on four disks, so this bound, above the lock
+        // timeout, only stops a hang.
+        tokio::time::timeout(Duration::from_secs(120), recreate)
             .await
-            .expect("bucket recreation should finish after batch delete releases the sentinel")
+            .expect("bucket recreation should not hang after batch delete releases the sentinel")
             .expect("bucket recreation task should join")
             .expect("bucket recreation should succeed");
         store
             .get_object_info(&bucket, object, &ObjectOptions::default())
             .await
             .expect("new-generation object must survive the old batch delete");
+    }
+
+    async fn put_detached_delete_fixture(store: &Arc<crate::store::ECStore>, bucket: &str, object: &str) {
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create detached delete bucket");
+        // Large enough for a data dir, so the delete commit leaves a marked
+        // data dir and a rollback backup until its cleanup pass runs.
+        let mut reader = PutObjReader::from_vec(vec![7u8; 2 * 1024 * 1024]);
+        store
+            .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("put detached delete fixture");
+    }
+
+    async fn assert_delete_lock_moved_to_detached_task(store: &Arc<crate::store::ECStore>, bucket: &str, object: &str) {
+        let lock = store
+            .handle_new_ns_lock(bucket, object)
+            .await
+            .expect("namespace lock handle for the deleted key");
+        lock.get_write_lock_quiet(Duration::from_millis(200))
+            .await
+            .expect_err("the detached delete must keep its object lock after the caller is dropped");
+    }
+
+    fn assert_no_delete_residue(temp_dir: &std::path::Path, bucket: &str, object: &str, disks: usize) {
+        for disk in 0..disks {
+            let object_dir = temp_dir.join(format!("pool0/set0/disk{disk}")).join(bucket).join(object);
+            assert!(
+                !object_dir.exists(),
+                "disk {disk} must hold neither metadata, rollback backup nor data of the deleted object: {object_dir:?}"
+            );
+        }
+    }
+
+    // #6898: a DeleteObjects request dropped between the per-disk commit and the
+    // cleanup pass (client disconnect) must not leave metadata-less residue.
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn delete_objects_finishes_cleanup_after_caller_is_dropped() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "detached-batch-delete", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("detached-batch-delete-{}", uuid::Uuid::new_v4());
+        let object = "residue/batch.bin";
+        put_detached_delete_fixture(&store, &bucket, object).await;
+
+        let barrier = crate::set_disk::DeleteCleanupBarrier::install(&bucket);
+        let delete = store.delete_objects_with_tier_delete_journal_and_accounting(
+            &bucket,
+            vec![ObjectToDelete {
+                object_name: object.to_string(),
+                ..Default::default()
+            }],
+            ObjectOptions::default(),
+        );
+        tokio::select! {
+            () = barrier.wait_until_paused() => {}
+            _ = delete => panic!("batch delete must pause between its commit and its cleanup"),
+        }
+        assert_eq!(ctx.detached_mutation_count(), 1, "the dropped request must leave its delete running");
+        assert_delete_lock_moved_to_detached_task(&store, &bucket, object).await;
+
+        barrier.release();
+        assert!(
+            ctx.wait_for_detached_mutations(Duration::from_secs(30)).await,
+            "the detached batch delete should finish"
+        );
+        assert_no_delete_residue(temp.path(), &bucket, object, 4);
+        store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect_err("the object must be deleted");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn delete_object_finishes_cleanup_after_caller_is_dropped() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "detached-single-delete", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("detached-single-delete-{}", uuid::Uuid::new_v4());
+        let object = "residue/single.bin";
+        put_detached_delete_fixture(&store, &bucket, object).await;
+
+        let barrier = crate::set_disk::DeleteCleanupBarrier::install(&bucket);
+        let delete = store.delete_object_with_tier_delete_journal(&bucket, object, ObjectOptions::default());
+        tokio::select! {
+            () = barrier.wait_until_paused() => {}
+            _ = delete => panic!("single delete must pause between its commit and its cleanup"),
+        }
+        assert_eq!(ctx.detached_mutation_count(), 1, "the dropped request must leave its delete running");
+        assert_delete_lock_moved_to_detached_task(&store, &bucket, object).await;
+
+        barrier.release();
+        assert!(
+            ctx.wait_for_detached_mutations(Duration::from_secs(30)).await,
+            "the detached single delete should finish"
+        );
+        assert_no_delete_residue(temp.path(), &bucket, object, 4);
+        store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect_err("the object must be deleted");
+    }
+
+    // A recursive (force) delete runs under its caller's bucket lifecycle write
+    // lock and carries only that lock's fence. If the caller is dropped, the
+    // detached delete must still hold the lock: otherwise a PUT under the prefix
+    // succeeds and is then removed by the delete that is still running.
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn recursive_delete_keeps_bucket_lock_after_caller_is_dropped() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "detached-recursive-delete", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("detached-recursive-delete-{}", uuid::Uuid::new_v4());
+        let old_object = "folder/old.bin";
+        let new_object = "folder/new.bin";
+        put_detached_delete_fixture(&store, &bucket, old_object).await;
+
+        // The S3 force-delete path: the caller owns the lock, opts carry its fence.
+        let guard = store
+            .lock_bucket_for_recursive_delete(&bucket)
+            .await
+            .expect("recursive delete should lock the bucket");
+        let mut opts = ObjectOptions {
+            delete_prefix: true,
+            ..Default::default()
+        };
+        opts.add_bucket_lifecycle_lock_guard(&guard);
+        let barrier = crate::store::object::DeleteAfterObjectLockSnapshotBarrier::install(&bucket);
+        let delete = store.delete_object_with_tier_delete_journal_and_guards(&bucket, "folder/", opts, Some(guard));
+        tokio::select! {
+            () = barrier.wait_until_paused() => {}
+            _ = delete => panic!("recursive delete must pause inside its detached task"),
+        }
+        assert_eq!(ctx.detached_mutation_count(), 1, "the dropped caller must leave its delete running");
+
+        let put_store = Arc::clone(&store);
+        let put_bucket = bucket.clone();
+        let mut put = tokio::spawn(async move {
+            let mut reader = PutObjReader::from_vec(b"written while the delete runs".to_vec());
+            put_store
+                .put_object(&put_bucket, new_object, &mut reader, &ObjectOptions::default())
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut put).await.is_err(),
+            "a PUT under the prefix must wait while the detached recursive delete runs"
+        );
+
+        barrier.release();
+        assert!(
+            ctx.wait_for_detached_mutations(Duration::from_secs(30)).await,
+            "the detached recursive delete should finish"
+        );
+        put.await
+            .expect("PUT task should join")
+            .expect("the PUT should succeed once the recursive delete has finished");
+        store
+            .get_object_info(&bucket, old_object, &ObjectOptions::default())
+            .await
+            .expect_err("the recursive delete must remove the object it covered");
+        store
+            .get_object_info(&bucket, new_object, &ObjectOptions::default())
+            .await
+            .expect("the PUT that waited for the recursive delete must survive it");
+        for disk in 0..4 {
+            let metadata = temp
+                .path()
+                .join(format!("pool0/set0/disk{disk}"))
+                .join(&bucket)
+                .join(new_object)
+                .join(crate::disk::STORAGE_FORMAT_FILE);
+            assert!(
+                metadata.exists(),
+                "disk {disk} must keep the object written after the delete: {metadata:?}"
+            );
+        }
+    }
+
+    // Lifecycle expiry holds the table-bucket publication read lock and passes
+    // only its lock-lost signal to the delete. A cancelled expiry worker must not
+    // release that lock while its detached delete is still running.
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn lifecycle_expiry_keeps_publication_lock_after_worker_is_dropped() {
+        let temp = tempfile::tempdir().expect("create temp store dir");
+        let (ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "detached-lifecycle-expiry", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("detached-lifecycle-expiry-{}", uuid::Uuid::new_v4());
+        let object = "expired.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create lifecycle bucket");
+        let mut reader = PutObjReader::from_vec(b"expired data".to_vec());
+        let object_info = store
+            .put_object(&bucket, object, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("put expired object");
+        let bucket_incarnation_id = store.bucket_incarnation_id(&bucket).await.expect("read bucket incarnation");
+
+        let barrier = crate::store::object::DeleteAfterObjectLockSnapshotBarrier::install(&bucket);
+        let expiry_store = Arc::clone(&store);
+        let expiry = tokio::spawn(async move {
+            crate::bucket::lifecycle::bucket_lifecycle_ops::apply_expiry_on_non_transitioned_objects(
+                expiry_store,
+                &object_info,
+                &crate::bucket::lifecycle::lifecycle::Event {
+                    action: crate::bucket::lifecycle::lifecycle::IlmAction::DeleteAction,
+                    ..Default::default()
+                },
+                &crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Scanner,
+                bucket_incarnation_id,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+            .await
+            .expect("lifecycle delete should pause inside its detached task");
+        // A cancelled worker drops its future while the delete keeps running.
+        expiry.abort();
+        assert!(
+            expiry
+                .await
+                .expect_err("aborted expiry worker should not join")
+                .is_cancelled(),
+            "expiry worker should be cancelled"
+        );
+        assert_eq!(ctx.detached_mutation_count(), 1, "the cancelled worker must leave its delete running");
+
+        let publication_lock = store
+            .handle_new_ns_lock(&bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
+            .await
+            .expect("table-bucket publication lock handle");
+        publication_lock
+            .get_write_lock_quiet(Duration::from_millis(300))
+            .await
+            .expect_err("table-bucket publication must wait for the detached lifecycle delete");
+
+        barrier.release();
+        assert!(
+            ctx.wait_for_detached_mutations(Duration::from_secs(30)).await,
+            "the detached lifecycle delete should finish"
+        );
+        let publication_guard = publication_lock
+            .get_write_lock_quiet(crate::set_disk::get_lock_acquire_timeout())
+            .await
+            .expect("table-bucket publication should proceed once the lifecycle delete has finished");
+        drop(publication_guard);
+        store
+            .get_object_info(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect_err("the detached lifecycle delete should still remove the expired object");
+    }
+
+    // #6898: residue that an older build stranded (every disk committed the
+    // delete, the cleanup pass never ran) is reclaimed by deleting the key again.
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn repeated_delete_objects_finishes_committed_delete_residue() {
+        use crate::disk::DiskAPI as _;
+
+        for drives in [1, 4] {
+            let temp = tempfile::tempdir().expect("create temp store dir");
+            let (_ctx, store, _shutdown) =
+                without_storage_class_env(build_isolated_test_store(temp.path(), "residue-retry", &[drives])).await;
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+            let bucket = format!("residue-retry-{drives}-{}", uuid::Uuid::new_v4());
+            let object = "residue/retry.bin";
+            put_detached_delete_fixture(&store, &bucket, object).await;
+
+            let transaction = uuid::Uuid::new_v4();
+            let disks = store.pools[0].disk_set[0].disks.read().await.clone();
+            for disk in disks.iter().flatten() {
+                let errors = disk
+                    .delete_versions(
+                        &bucket,
+                        vec![crate::disk::FileInfoVersions {
+                            name: object.to_string(),
+                            versions: vec![rustfs_filemeta::FileInfo {
+                                name: object.to_string(),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }],
+                        crate::disk::DeleteOptions {
+                            old_data_dir: Some(transaction),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                assert!(errors.iter().all(Option::is_none), "the delete should commit on every disk: {errors:?}");
+            }
+            for disk in 0..drives {
+                let object_dir = temp.path().join(format!("pool0/set0/disk{disk}")).join(&bucket).join(object);
+                assert!(!object_dir.join(crate::disk::STORAGE_FORMAT_FILE).exists());
+                assert!(
+                    object_dir
+                        .join(transaction.to_string())
+                        .join(crate::disk::STORAGE_FORMAT_FILE_BACKUP)
+                        .exists(),
+                    "disk {disk} should hold the stranded rollback backup"
+                );
+            }
+
+            let (_deleted, errors) = store
+                .delete_objects(
+                    &bucket,
+                    vec![ObjectToDelete {
+                        object_name: object.to_string(),
+                        ..Default::default()
+                    }],
+                    ObjectOptions::default(),
+                )
+                .await;
+            assert!(errors.iter().all(Option::is_none), "a missing key deletes successfully: {errors:?}");
+            assert_no_delete_residue(temp.path(), &bucket, object, drives);
+        }
     }
 
     #[tokio::test]
@@ -17974,7 +19117,7 @@ mod tests {
         let bucket = format!("lock-create-intent-retry-{}", uuid::Uuid::new_v4());
         let mut intent = crate::bucket::metadata::BucketMetadata::new(&bucket);
         intent.lock_enabled = true;
-        crate::bucket::metadata_sys::set_new_bucket_metadata_in(&ctx, intent)
+        crate::bucket::metadata_sys::set_new_bucket_metadata_intent_in(&ctx, intent)
             .await
             .expect("persist pre-visibility lock intent");
         assert!(
@@ -18125,6 +19268,70 @@ mod tests {
         let mut body = Vec::new();
         reader.stream.read_to_end(&mut body).await.expect("read replacement object");
         assert_eq!(body, b"new-generation");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial]
+    #[serial_test::serial(storage_class_env)]
+    async fn cancelled_ecstore_put_part_keeps_bucket_lifecycle_lock_through_commit() {
+        for pause in [
+            crate::set_disk::MultipartCommitPause::PutPartAfterCapacityAdmission,
+            crate::set_disk::MultipartCommitPause::PutPartAfterRename,
+        ] {
+            let temp_dir = tempfile::tempdir().expect("create cancelled multipart lifecycle store dir");
+            let (_ctx, store, shutdown) =
+                without_storage_class_env(build_isolated_test_store(temp_dir.path(), "cancelled-multipart-lifecycle", &[4, 4]))
+                    .await;
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+            let bucket = format!("cancelled-part-lifecycle-{}", Uuid::new_v4());
+            let object = "part.bin";
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket for multipart lifecycle cancellation");
+            let upload = store
+                .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+                .await
+                .expect("create upload through the owning ECStore");
+            let barrier = crate::set_disk::MultipartCommitBarrier::install(&bucket, object, pause);
+            let put_store = Arc::clone(&store);
+            let put_bucket = bucket.clone();
+            let put_upload_id = upload.upload_id.clone();
+            let put = tokio::spawn(async move {
+                let mut reader = PutObjReader::from_vec(vec![0x45; 4096]);
+                put_store
+                    .put_object_part(&put_bucket, object, &put_upload_id, 1, &mut reader, &ObjectOptions::default())
+                    .await
+            });
+            barrier.wait_until_paused().await;
+            put.abort();
+            assert!(
+                put.await
+                    .expect_err("the ECStore request waiter must remain cancellable")
+                    .is_cancelled()
+            );
+
+            let mut writer = Box::pin(store.acquire_bucket_lifecycle_write_lock(&bucket));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut writer).await.is_err(),
+                "canceling UploadPart at {pause:?} must not release its bucket lifecycle owner before the commit drains"
+            );
+            barrier.release();
+            let lifecycle_guard = tokio::time::timeout(Duration::from_secs(10), writer)
+                .await
+                .expect("the bucket lifecycle writer must resume after the part commit drains")
+                .expect("acquire the bucket lifecycle write lock after cancellation");
+            drop(lifecycle_guard);
+
+            let parts = store
+                .list_object_parts(&bucket, object, &upload.upload_id, None, 100, &ObjectOptions::default())
+                .await
+                .expect("the cancelled request's owned part commit must finish successfully");
+            assert_eq!(parts.parts.len(), 1, "the commit must publish exactly the uploaded part at {pause:?}");
+            assert_eq!(parts.parts[0].part_num, 1);
+            assert_eq!(parts.parts[0].size, 4096);
+            shutdown.cancel();
+        }
     }
 
     #[tokio::test]
@@ -21679,7 +22886,6 @@ mod tests {
             .make_bucket(bucket, &MakeBucketOptions::default())
             .await
             .expect("kill-point bucket should be created");
-        let _compaction_proof = install_transition_transaction_compaction_fleet_proof_for_test("object-transaction-fencing-test");
 
         for (index, point, expected_state, expected_revision, expected_committed, expected_recovered) in [
             (
@@ -21723,10 +22929,14 @@ mod tests {
                 .await
                 .expect("kill-point source should be written");
             let remote_before = backend.object_count().await;
+            // Earlier cancellation/recovery cases must not consume this
+            // transaction's 30-second homogeneous-fleet proof window.
+            let _compaction_proof =
+                install_transition_transaction_compaction_fleet_proof_for_test("object-transaction-fencing-test");
             let barrier = TransitionTransactionKillPointBarrier::install(bucket, &object, point);
             let transition_store = store.clone();
             let transition_object = object.clone();
-            let transition = tokio::spawn(async move {
+            let mut transition = tokio::spawn(async move {
                 transition_store
                     .transition_object(
                         bucket,
@@ -21745,7 +22955,12 @@ mod tests {
                     )
                     .await
             });
-            barrier.wait_until_paused().await;
+            tokio::select! {
+                _ = barrier.wait_until_paused() => {}
+                result = &mut transition => {
+                    panic!("transition exited before reaching {point:?}: {result:?}");
+                }
+            }
             transition.abort();
             assert!(
                 transition

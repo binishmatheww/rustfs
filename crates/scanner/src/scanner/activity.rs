@@ -152,17 +152,19 @@ impl ScannerRetryBackoff {
 pub(super) fn scanner_superseded_retry_interval(
     backoff: ScannerRetryBackoff,
     runtime_config: &ScannerRuntimeConfig,
+    maintenance_features: ScannerMaintenanceFeatures,
 ) -> Option<Duration> {
-    let retry_interval = backoff.retry_interval(runtime_config.cycle_interval)?;
-    if runtime_config.cycle_interval_source == ScannerRuntimeConfigSource::Default {
-        return Some(retry_interval);
+    let mut retry_interval = backoff.retry_interval(runtime_config.cycle_interval)?;
+    // Preserve an operator-selected duty-cycle floor during convergence.
+    if runtime_config.cycle_interval_source != ScannerRuntimeConfigSource::Default {
+        retry_interval = retry_interval.max(runtime_config.cycle_interval);
     }
-
-    // An explicit cycle is an operator-selected duty-cycle floor. A
-    // superseded snapshot keeps its dirty work pending, but retrying that work
-    // sooner than the configured cadence would turn continuous writes into a
-    // repeated full-walk loop despite the override.
-    Some(retry_interval.max(runtime_config.cycle_interval))
+    // A complete but non-authoritative walk must not postpone lifecycle or
+    // replication evaluation beyond its ordinary maintenance cadence.
+    if maintenance_features.needs_regular_cycle() {
+        retry_interval = retry_interval.min(runtime_config.cycle_interval.max(Duration::from_secs(1)));
+    }
+    Some(retry_interval)
 }
 
 const SCANNER_PUBLICATION_PROOF_RETRY_MAX_INTERVAL: Duration = Duration::from_secs(30);
@@ -183,6 +185,8 @@ pub(crate) fn scanner_publication_lease_error_is_retryable(error: &str) -> bool 
     scanner_publication_activity_error_is_retryable(error)
         || error.ends_with("scanner publication lease capacity is exhausted")
         || error.ends_with("scanner publication lease response arrived after its safety window")
+        || error.ends_with("scanner publication lease is blocked by pending namespace commit")
+        || error.ends_with("scanner publication lease namespace changed during acquisition")
 }
 
 pub(crate) enum ScannerPublicationProofWait<T, E> {

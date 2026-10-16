@@ -32,10 +32,12 @@ use crate::server::{
     ssec_transport::SsecTransportLayer,
     strip_valid_port_suffix,
     tls_material::{
-        TlsAcceptFailure, TlsAcceptorHolder, TlsHandshakeFailureKind, accept_tls_with_deadline, build_acceptor_from_loaded,
+        PreparedServerTls, TlsAcceptFailure, TlsAcceptorHolder, TlsHandshakeFailureKind, accept_tls_with_deadline,
         load_tls_material, spawn_reload_loop,
     },
 };
+#[cfg(feature = "http3")]
+use crate::server::{http3, hybrid::HybridBody};
 use crate::storage_api::server::http as storage;
 use crate::storage_api::server::http::rpc::InternodeRpcService;
 #[cfg(test)]
@@ -101,6 +103,20 @@ use tower_http::classify::ServerErrorsFailureClass;
 use tower_http::compression::CompressionLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
+
+#[cfg(feature = "http3")]
+type Http3CoreService = tower::util::BoxCloneService<
+    HttpRequest<http3::RequestBody>,
+    Response<HybridBody<s3s::Body, http_body_util::Empty<Bytes>>>,
+    Box<dyn std::error::Error + Send + Sync>,
+>;
+
+#[cfg(feature = "http3")]
+type Http3ExternalService = tower::util::BoxCloneService<
+    HttpRequest<http3::RequestBody>,
+    Response<tower_http::body::UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
+    Box<dyn std::error::Error + Send + Sync>,
+>;
 use tracing::{Level, Span, debug, error, info, instrument, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -1086,6 +1102,153 @@ fn make_http_trace_span<ReqBody>(request: &HttpRequest<ReqBody>) -> Span {
     span
 }
 
+// Keep TCP and QUIC on the same external request stack. A macro preserves the
+// concrete Tower types for each streaming request body without boxing TCP.
+macro_rules! external_service_stack {
+    ($service:expr, $remote_addr:expr, $trusted_proxy_layer:expr, $is_console:expr,
+     $rate_limit_layer:expr, $connection_is_tls:expr, $readiness:expr, $keystone_auth:expr,
+     $compression_config:expr, $server_ctx:expr, $server_domains_configured:expr) => {{
+        let remote_addr = $remote_addr;
+        let trusted_proxy_layer = $trusted_proxy_layer;
+        let is_console = $is_console;
+        let rate_limit_layer = $rate_limit_layer;
+        let connection_is_tls = $connection_is_tls;
+        let readiness = $readiness;
+        let keystone_auth = $keystone_auth;
+        let compression_config = $compression_config;
+        let server_ctx = $server_ctx;
+        let server_domains_configured = $server_domains_configured;
+        ServiceBuilder::new()
+            // NOTE: Both extension types are intentionally inserted to maintain compatibility:
+            // 1. `Option<RemoteAddr>` - Used by existing admin/storage handlers throughout the codebase
+            // 2. `std::net::SocketAddr` - Required by TrustedProxyMiddleware for proxy validation
+            // This dual insertion is necessary because the middleware expects the raw SocketAddr type
+            // while our application code uses the RemoteAddr wrapper. Consolidating these would
+            // require either modifying the third-party middleware or refactoring all existing handlers.
+            .layer(AddExtensionLayer::new(remote_addr))
+            .option_layer(remote_addr.map(|ra| AddExtensionLayer::new(ra.0)))
+            // Add TrustedProxyLayer to handle X-Forwarded-For and other proxy headers
+            // This should be placed before TraceLayer so that logs reflect the real client IP
+            // Pre-computed in ConnectionContext to avoid per-connection is_enabled() check.
+            .option_layer(trusted_proxy_layer)
+            .map_request(move |mut request: HttpRequest<_>| {
+                if request.version() == Version::HTTP_3 {
+                    if let Some(info) = request.extensions_mut().get_mut::<ClientInfo>() {
+                        if !info.is_from_trusted_proxy {
+                            info.forwarded_proto = Some("https".to_owned());
+                        }
+                    } else if let Some(peer) = remote_addr {
+                        let mut info = ClientInfo::direct(peer.0);
+                        info.forwarded_proto = Some("https".to_owned());
+                        request.extensions_mut().insert(info);
+                    }
+                }
+                request
+            })
+            .layer(ExternalRequestContextLayer::new(is_console))
+            .layer(StsQueryApiCompatLayer)
+            .layer(EmptyBodyContentLengthCompatLayer)
+            .layer(CatchPanicLayer::new())
+            // Per-client API rate limit (backlog#1191): rejects over-limit
+            // requests with 429 before readiness/auth/tracing spend any
+            // work on them, but after the trusted-proxy layer has resolved
+            // a spoof-proof client IP. Absent (None) unless enabled via
+            // RUSTFS_API_RATE_LIMIT_ENABLE with a non-zero RPM.
+            .option_layer(rate_limit_layer)
+            // backlog#2369 P7.2: an SSE-C request carries the customer key
+            // in a header, so a plaintext hop leaks it permanently. Sits
+            // beside the rate limiter: after the trusted-proxy layer, which
+            // is what makes a forwarded `https` protocol trustworthy, and
+            // after the request context so a rejection can echo the request
+            // id. Reports by default; refuses only under
+            // RUSTFS_SSE_C_REQUIRE_TLS.
+            .layer(SsecTransportLayer::new(connection_is_tls))
+            // CRITICAL: Insert ReadinessGateLayer before business logic
+            // This stops requests from hitting IAMAuth or Storage if they are not ready.
+            .layer(ReadinessGateLayer::new(readiness.clone()))
+            // Add Keystone authentication middleware
+            // This validates X-Auth-Token headers and stores credentials in task-local storage
+            // Must be placed AFTER ReadinessGateLayer but BEFORE business logic
+            // Pre-computed in ConnectionContext to avoid per-connection OnceLock read.
+            .layer(KeystoneAuthLayer::new(keystone_auth))
+            // Maintain the in-flight request gauge with an RAII guard so it is
+            // decremented exactly once per request (backlog#806-35). Placed just
+            // outside TraceLayer so the counting window matches the old on_request
+            // timing while avoiding the 5xx double-decrement.
+            .layer(InFlightLayer)
+            .layer(
+                TraceLayer::new_for_http()
+                    .make_span_with(make_http_trace_span)
+                    .on_request(|request: &HttpRequest<_>, span: &Span| {
+                        let _enter = span.enter();
+                        trace!("HTTP request started");
+                        let method_metrics = http_method_metrics(request.method());
+                        // In-flight counting is handled by InFlightLayer's RAII guard
+                        // (backlog#806-35); do not adjust the active-requests gauge here.
+                        method_metrics.requests.increment(1);
+
+                        if let Some(cl) = request.headers().get("content-length")
+                            && let Some(len) = cl.to_str().ok().and_then(|s| s.parse::<u64>().ok())
+                        {
+                            REQUEST_BODY_BYTES_COUNTER.increment(len);
+                            method_metrics.request_body_size.record(len as f64);
+                        }
+                    })
+                    .on_response(trace_on_response)
+                    .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
+                        RESP_BODY_BYTES_COUNTER.increment(usize_to_u64_saturating(chunk.len()));
+                        record_response_body_chunk_observation(chunk.len(), latency);
+                        #[cfg(feature = "tracing-chunk-debug")]
+                        {
+                            let _enter = span.enter();
+                            debug!(chunk_bytes = chunk.len(), duration_ms = duration_ms(latency), "HTTP response body chunk sent");
+                        }
+                        #[cfg(not(feature = "tracing-chunk-debug"))]
+                        {
+                            let _ = (latency, span);
+                        }
+                    })
+                    .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, span: &Span| {
+                        record_response_body_stream_duration(stream_duration);
+                        #[cfg(feature = "tracing-chunk-debug")]
+                        {
+                            let _enter = span.enter();
+                            debug!(duration_ms = duration_ms(stream_duration), "HTTP response stream closed");
+                        }
+                        #[cfg(not(feature = "tracing-chunk-debug"))]
+                        {
+                            let _ = (_trailers, stream_duration, span);
+                        }
+                    })
+                    .on_failure(|error, latency: Duration, span: &Span| {
+                        let _enter = span.enter();
+                        // In-flight counting is handled by InFlightLayer's RAII guard
+                        // (backlog#806-35). This hook previously also fired for 5xx
+                        // responses (which ALSO hit on_response), double-decrementing
+                        // the gauge; only the failure metric is recorded here now.
+                        HTTP_TRANSPORT_FAILURES_COUNTER.increment(1);
+                        record_http_transport_failure_if_body_error(&error);
+                        trace!(error = ?error, duration_ms = duration_ms(latency), "HTTP request failure captured by trace layer");
+                    }),
+            )
+            .layer(RequestLoggingLayer)
+            .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(compression_config.clone())))
+            .option_layer(compression_config.enabled.then_some(PathCategoryInjectionLayer))
+            .layer(S3ErrorMessageCompatLayer)
+            .layer(IcebergRestErrorCompatLayer)
+            .layer(ObjectAttributesEtagFixLayer)
+            .layer(ConditionalCorsLayer::new())
+            .option_layer(if is_console { Some(RedirectLayer) } else { None })
+            .layer(BodylessStatusFixLayer)
+            .layer(HeadRequestBodyFixLayer)
+            .layer(PublicHealthEndpointLayer::new(server_ctx, readiness))
+            .option_layer((!server_domains_configured && !is_console).then_some(VirtualHostStyleHintLayer))
+            .layer(DoubleSlashListBucketsCompatLayer)
+            .layer(SigV4HeaderGuardLayer)
+            .service($service)
+    }};
+}
+
 pub async fn start_http_server(
     config: &config::Config,
     readiness: Arc<GlobalReadiness>,
@@ -1269,9 +1432,23 @@ pub async fn start_http_server(
 
     let tls_path = config.tls_path.as_deref().map(str::trim).unwrap_or_default();
     let tls_path_configured = !tls_path.is_empty();
+
+    #[cfg(feature = "http3")]
+    let http3_enabled = !config.console_enable
+        && rustfs_utils::get_env_bool(rustfs_config::ENV_HTTP3_ENABLE, rustfs_config::DEFAULT_HTTP3_ENABLE);
+
+    #[cfg(feature = "http3")]
+    if http3_enabled && !tls_path_configured {
+        return Err(Error::other("HTTP/3 requires TLS configuration"));
+    }
+
+    #[cfg(feature = "http3")]
+    let mut http3_server_config = None;
+
     // Load TLS materials and build server acceptor in a single pass.
     // Outbound material (root CAs, mTLS identity) was already published in main.rs;
     // this load is needed for the server-side TLS acceptor and reload loop.
+    let mut tls_initial_snapshot = None;
     let tls_acceptor = if tls_path_configured {
         let snapshot = load_tls_material(tls_path).await.map_err(|e| {
             Error::other(format!(
@@ -1279,20 +1456,31 @@ pub async fn start_http_server(
                 tls_path, e
             ))
         })?;
-        let acceptor = build_acceptor_from_loaded(snapshot.server, std::path::Path::new(tls_path))
-            .await
-            .map_err(|e| Error::other(e.to_string()))?;
+
+        let prepared = PreparedServerTls::from_snapshot(&snapshot).map_err(|e| Error::other(e.to_string()))?;
 
         // Fail closed: if TLS was explicitly configured but no server certificates
         // were found, refuse to start rather than silently falling back to plain HTTP.
-        match acceptor {
+        match prepared {
             None => {
                 return Err(Error::other(format!(
                     "TLS is explicitly configured via RUSTFS_TLS_PATH/tls_path='{}' but no server certificates were found",
                     tls_path
                 )));
             }
-            Some(a) => Some(a),
+            Some(prepared) => {
+                #[cfg(feature = "http3")]
+                if http3_enabled {
+                    http3_server_config = Some(
+                        prepared
+                            .http3_config()
+                            .map_err(|e| Error::other(format!("HTTP/3 TLS configuration failed: {e}")))?,
+                    );
+                }
+                let acceptor = prepared.tcp_acceptor().map_err(|e| Error::other(e.to_string()))?;
+                tls_initial_snapshot = Some((snapshot, prepared));
+                Some(acceptor)
+            }
         }
     } else {
         None
@@ -1300,10 +1488,6 @@ pub async fn start_http_server(
     let tls_enabled = tls_acceptor.is_some();
     let protocol = if tls_enabled { "https" } else { "http" };
 
-    // Spawn background TLS certificate hot-reload loop (if enabled).
-    if let Some(holder) = &tls_acceptor {
-        spawn_reload_loop(tls_path.to_string(), holder.clone());
-    }
     // Obtain the listener address
     let local_addr: SocketAddr = listener.local_addr()?;
     let local_ip = match rustfs_utils::get_local_ip() {
@@ -1431,6 +1615,7 @@ pub async fn start_http_server(
 
     // Create shutdown channel
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel(1);
+
     // Create compression configuration from environment variables
     let compression_config = HttpCompressionConfig::from_env();
     if compression_config.enabled {
@@ -1512,6 +1697,83 @@ pub async fn start_http_server(
         );
     }
 
+    let http_request_body_read_timeout = Duration::from_secs(rustfs_utils::get_env_u64(
+        rustfs_config::ENV_HTTP_REQUEST_BODY_READ_TIMEOUT,
+        rustfs_config::DEFAULT_HTTP_REQUEST_BODY_READ_TIMEOUT,
+    ));
+    #[cfg(feature = "http3")]
+    let http3_server = if let Some(server_config) = http3_server_config {
+        let h3_s3_service = s3_service.clone();
+        let h3_readiness = Arc::clone(&readiness);
+        let h3_server_ctx = Arc::clone(&server_ctx);
+        let h3_keystone = auth_keystone::get_keystone_auth();
+        let h3_rate_limit = api_rate_limit_layer.clone();
+        let h3_compression = compression_config.clone();
+        let h3_trusted_proxy = rustfs_trusted_proxies::is_enabled().then(|| rustfs_trusted_proxies::layer().clone());
+        let h3_domains_configured = !config.server_domains.is_empty();
+
+        let make_service = move |peer_addr: SocketAddr| -> Http3ExternalService {
+            let remote_addr = RemoteAddr(peer_addr);
+
+            #[cfg(feature = "swift")]
+            let service = SwiftService::new(true, None, h3_s3_service.clone());
+            #[cfg(not(feature = "swift"))]
+            let service = h3_s3_service.clone();
+            let service = EarlyResponseBodyService::new(service, http_request_body_read_timeout);
+            let service = ServiceBuilder::new()
+                .layer(tower::util::MapResponseLayer::new(|response: Response<s3s::Body>| {
+                    response.map(|rest_body| HybridBody::<s3s::Body, http_body_util::Empty<Bytes>>::Rest { rest_body })
+                }))
+                .service(service);
+            #[cfg(not(feature = "swift"))]
+            let service = ServiceBuilder::new()
+                .map_err(|error: s3s::HttpError| -> Box<dyn std::error::Error + Send + Sync> { error.into() })
+                .service(service);
+            let service = Http3CoreService::new(service);
+            Http3ExternalService::new(external_service_stack!(
+                service,
+                Some(remote_addr),
+                h3_trusted_proxy.clone(),
+                false,
+                h3_rate_limit.clone(),
+                true,
+                h3_readiness.clone(),
+                h3_keystone.clone(),
+                h3_compression.clone(),
+                h3_server_ctx.clone(),
+                h3_domains_configured
+            ))
+        };
+
+        let (endpoint, task) = http3::spawn(
+            server_config,
+            local_addr,
+            make_service,
+            max_connections,
+            http_request_body_read_timeout,
+            shutdown_tx.subscribe(),
+        )
+        .map_err(|e| Error::other(format!("HTTP/3 startup failed: {e}")))?;
+
+        Some((endpoint, task))
+    } else {
+        None
+    };
+    let tls_reload_task = if let (Some(holder), Some((initial, prepared))) = (tls_acceptor.as_ref(), tls_initial_snapshot.take())
+    {
+        spawn_reload_loop(
+            tls_path.to_string(),
+            holder.clone(),
+            initial,
+            prepared,
+            #[cfg(feature = "http3")]
+            http3_server.as_ref().map(|(endpoint, _)| endpoint.clone()),
+        )
+        .map_err(|e| Error::other(e.to_string()))?
+    } else {
+        None
+    };
+
     let is_console = config.console_enable;
     let server_domains_configured = !config.server_domains.is_empty();
     let task_handle = tokio::spawn(async move {
@@ -1550,10 +1812,6 @@ pub async fn start_http_server(
             rustfs_config::ENV_HTTP1_HEADER_READ_TIMEOUT,
             rustfs_config::DEFAULT_HTTP1_HEADER_READ_TIMEOUT,
         );
-        let http_request_body_read_timeout = Duration::from_secs(rustfs_utils::get_env_u64(
-            rustfs_config::ENV_HTTP_REQUEST_BODY_READ_TIMEOUT,
-            rustfs_config::DEFAULT_HTTP_REQUEST_BODY_READ_TIMEOUT,
-        ));
         let http1_max_buf_size =
             rustfs_utils::get_env_usize(rustfs_config::ENV_HTTP1_MAX_BUF_SIZE, rustfs_config::DEFAULT_HTTP1_MAX_BUF_SIZE);
 
@@ -1790,6 +2048,25 @@ pub async fn start_http_server(
                     "HTTP connection drain timed out"
                 );
             }
+        }
+
+        if let Some(task) = tls_reload_task {
+            task.abort();
+            let _ = task.await;
+        }
+
+        #[cfg(feature = "http3")]
+        if let Some((_, task)) = http3_server
+            && let Err(error) = task.await
+        {
+            error!(
+                event = EVENT_HTTP_TRANSPORT_FAILED,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_TRANSPORT,
+                protocol = "http3",
+                error = ?error,
+                "HTTP/3 server task failed during shutdown"
+            );
         }
     });
 
@@ -2074,123 +2351,19 @@ fn process_connection(
         // transport/auth/observability subset needed by `/rustfs/rpc/...`.
         // ─────────────────────────────────────────────────────────────
         let build_external_stack = |service| {
-            ServiceBuilder::new()
-                // NOTE: Both extension types are intentionally inserted to maintain compatibility:
-                // 1. `Option<RemoteAddr>` - Used by existing admin/storage handlers throughout the codebase
-                // 2. `std::net::SocketAddr` - Required by TrustedProxyMiddleware for proxy validation
-                // This dual insertion is necessary because the middleware expects the raw SocketAddr type
-                // while our application code uses the RemoteAddr wrapper. Consolidating these would
-                // require either modifying the third-party middleware or refactoring all existing handlers.
-                .layer(AddExtensionLayer::new(remote_addr))
-                .option_layer(remote_addr.map(|ra| AddExtensionLayer::new(ra.0)))
-                // Add TrustedProxyLayer to handle X-Forwarded-For and other proxy headers
-                // This should be placed before TraceLayer so that logs reflect the real client IP
-                // Pre-computed in ConnectionContext to avoid per-connection is_enabled() check.
-                .option_layer(trusted_proxy_layer.clone())
-                .layer(ExternalRequestContextLayer::new(is_console))
-                .layer(StsQueryApiCompatLayer)
-                .layer(EmptyBodyContentLengthCompatLayer)
-                .layer(CatchPanicLayer::new())
-                // Per-client API rate limit (backlog#1191): rejects over-limit
-                // requests with 429 before readiness/auth/tracing spend any
-                // work on them, but after the trusted-proxy layer has resolved
-                // a spoof-proof client IP. Absent (None) unless enabled via
-                // RUSTFS_API_RATE_LIMIT_ENABLE with a non-zero RPM.
-                .option_layer(rate_limit_layer.clone())
-                // backlog#2369 P7.2: an SSE-C request carries the customer key
-                // in a header, so a plaintext hop leaks it permanently. Sits
-                // beside the rate limiter: after the trusted-proxy layer, which
-                // is what makes a forwarded `https` protocol trustworthy, and
-                // after the request context so a rejection can echo the request
-                // id. Reports by default; refuses only under
-                // RUSTFS_SSE_C_REQUIRE_TLS.
-                .layer(SsecTransportLayer::new(connection_is_tls))
-                // CRITICAL: Insert ReadinessGateLayer before business logic
-                // This stops requests from hitting IAMAuth or Storage if they are not ready.
-                .layer(ReadinessGateLayer::new(readiness.clone()))
-                // Add Keystone authentication middleware
-                // This validates X-Auth-Token headers and stores credentials in task-local storage
-                // Must be placed AFTER ReadinessGateLayer but BEFORE business logic
-                // Pre-computed in ConnectionContext to avoid per-connection OnceLock read.
-                .layer(KeystoneAuthLayer::new(keystone_auth.clone()))
-                // Maintain the in-flight request gauge with an RAII guard so it is
-                // decremented exactly once per request (backlog#806-35). Placed just
-                // outside TraceLayer so the counting window matches the old on_request
-                // timing while avoiding the 5xx double-decrement.
-                .layer(InFlightLayer)
-                .layer(
-                    TraceLayer::new_for_http()
-                        .make_span_with(make_http_trace_span)
-                        .on_request(|request: &HttpRequest<_>, span: &Span| {
-                            let _enter = span.enter();
-                            trace!("HTTP request started");
-                            let method_metrics = http_method_metrics(request.method());
-                            // In-flight counting is handled by InFlightLayer's RAII guard
-                            // (backlog#806-35); do not adjust the active-requests gauge here.
-                            method_metrics.requests.increment(1);
-
-                            if let Some(cl) = request.headers().get("content-length")
-                                && let Some(len) = cl.to_str().ok().and_then(|s| s.parse::<u64>().ok())
-                            {
-                                REQUEST_BODY_BYTES_COUNTER.increment(len);
-                                method_metrics.request_body_size.record(len as f64);
-                            }
-                        })
-                        .on_response(trace_on_response)
-                        .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
-                            RESP_BODY_BYTES_COUNTER.increment(usize_to_u64_saturating(chunk.len()));
-                            record_response_body_chunk_observation(chunk.len(), latency);
-                            #[cfg(feature = "tracing-chunk-debug")]
-                            {
-                                let _enter = span.enter();
-                                debug!(chunk_bytes = chunk.len(), duration_ms = duration_ms(latency), "HTTP response body chunk sent");
-                            }
-                            #[cfg(not(feature = "tracing-chunk-debug"))]
-                            {
-                                let _ = (latency, span);
-                            }
-                        })
-                        .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, span: &Span| {
-                            record_response_body_stream_duration(stream_duration);
-                            #[cfg(feature = "tracing-chunk-debug")]
-                            {
-                                let _enter = span.enter();
-                                debug!(duration_ms = duration_ms(stream_duration), "HTTP response stream closed");
-                            }
-                            #[cfg(not(feature = "tracing-chunk-debug"))]
-                            {
-                                let _ = (_trailers, stream_duration, span);
-                            }
-                        })
-                        .on_failure(|error, latency: Duration, span: &Span| {
-                            let _enter = span.enter();
-                            // In-flight counting is handled by InFlightLayer's RAII guard
-                            // (backlog#806-35). This hook previously also fired for 5xx
-                            // responses (which ALSO hit on_response), double-decrementing
-                            // the gauge; only the failure metric is recorded here now.
-                            HTTP_TRANSPORT_FAILURES_COUNTER.increment(1);
-                            record_http_transport_failure_if_body_error(&error);
-                            trace!(error = ?error, duration_ms = duration_ms(latency), "HTTP request failure captured by trace layer");
-                        }),
-                )
-                .layer(RequestLoggingLayer)
-                .layer(CompressionLayer::new().compress_when(PathAwareHttpCompressionPredicate::new(compression_config.clone())))
-                .option_layer(compression_config.enabled.then_some(PathCategoryInjectionLayer))
-                .layer(S3ErrorMessageCompatLayer)
-                .layer(IcebergRestErrorCompatLayer)
-                .layer(ObjectAttributesEtagFixLayer)
-                .layer(ConditionalCorsLayer::new())
-                .option_layer(if is_console { Some(RedirectLayer) } else { None })
-                .layer(BodylessStatusFixLayer)
-                .layer(HeadRequestBodyFixLayer)
-                .layer(PublicHealthEndpointLayer::new(
-                    Arc::clone(&server_ctx),
-                    Arc::clone(&readiness),
-                ))
-                .option_layer((!server_domains_configured && !is_console).then_some(VirtualHostStyleHintLayer))
-                .layer(DoubleSlashListBucketsCompatLayer)
-                .layer(SigV4HeaderGuardLayer)
-                .service(service)
+            external_service_stack!(
+                service,
+                remote_addr,
+                trusted_proxy_layer.clone(),
+                is_console,
+                rate_limit_layer.clone(),
+                connection_is_tls,
+                readiness.clone(),
+                keystone_auth.clone(),
+                compression_config.clone(),
+                server_ctx.clone(),
+                server_domains_configured
+            )
         };
         let build_internode_stack = |service| {
             ServiceBuilder::new()
@@ -2334,18 +2507,8 @@ fn process_connection(
 /// Handles connection errors by logging them with appropriate severity
 fn handle_connection_error(peer_addr: Option<&str>, err: &(dyn std::error::Error + 'static)) {
     let peer_addr = peer_addr.unwrap_or("unknown");
-    let s = err.to_string();
-    if s.contains("connection reset") || s.contains("broken pipe") {
-        log_transport_closed(peer_addr, "connection_reset", &s, "client_disconnect");
-        return;
-    }
-
     if let Some(hyper_err) = err.downcast_ref::<hyper::Error>() {
-        if hyper_err.is_incomplete_message() {
-            log_transport_closed(peer_addr, "incomplete_message", &hyper_err.to_string(), "client_disconnect");
-        } else if hyper_err.is_closed() {
-            log_transport_closed(peer_addr, "connection_closed", &hyper_err.to_string(), "client_disconnect");
-        } else if hyper_err.is_parse() {
+        if hyper_err.is_parse() {
             log_transport_failed(peer_addr, "parse_failure", &hyper_err.to_string());
         } else if hyper_err.is_user() {
             // is_user() = "error from user's Body stream": the application
@@ -2366,6 +2529,14 @@ fn handle_connection_error(peer_addr: Option<&str>, err: &(dyn std::error::Error
                 result = "transport_error",
                 "HTTP transport failed"
             );
+        } else if let Some(kind) =
+            peer_transport_close_kind(err).or_else(|| hyper_body_write_close_kind(&format!("{hyper_err:?}")))
+        {
+            log_transport_closed(peer_addr, kind, &hyper_err.to_string(), "client_disconnect");
+        } else if hyper_err.is_incomplete_message() {
+            log_transport_closed(peer_addr, "incomplete_message", &hyper_err.to_string(), "client_disconnect");
+        } else if hyper_err.is_closed() {
+            log_transport_closed(peer_addr, "connection_closed", &hyper_err.to_string(), "client_disconnect");
         } else if hyper_err.is_canceled() {
             log_transport_closed(peer_addr, "canceled", &hyper_err.to_string(), "client_disconnect");
         } else if format!("{:?}", hyper_err).contains("HeaderTimeout") {
@@ -2383,6 +2554,10 @@ fn handle_connection_error(peer_addr: Option<&str>, err: &(dyn std::error::Error
             );
         }
     } else if let Some(io_err) = err.downcast_ref::<Error>() {
+        if let Some(kind) = peer_transport_close_kind(err) {
+            log_transport_closed(peer_addr, kind, &io_err.to_string(), "client_disconnect");
+            return;
+        }
         error!(
             event = EVENT_HTTP_TRANSPORT_FAILED,
             component = LOG_COMPONENT_SERVER,
@@ -2404,6 +2579,37 @@ fn handle_connection_error(peer_addr: Option<&str>, err: &(dyn std::error::Error
             result = "transport_error",
             "HTTP transport failed"
         );
+    }
+}
+
+fn peer_transport_close_kind(err: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
+    let mut source = Some(err);
+    while let Some(error) = source {
+        if let Some(io_error) = error.downcast_ref::<Error>() {
+            let kind = match io_error.kind() {
+                std::io::ErrorKind::BrokenPipe => Some("broken_pipe"),
+                std::io::ErrorKind::ConnectionReset => Some("connection_reset"),
+                std::io::ErrorKind::ConnectionAborted => Some("connection_aborted"),
+                _ => None,
+            };
+            if kind.is_some() {
+                return kind;
+            }
+        }
+        source = error.source();
+    }
+    None
+}
+
+fn hyper_body_write_close_kind(debug: &str) -> Option<&'static str> {
+    let debug = debug.to_ascii_lowercase();
+    let fields = debug.strip_prefix("hyper::error(bodywrite, os {")?.split("message:").next()?;
+    let kind = fields.split(',').find_map(|field| field.trim().strip_prefix("kind: "))?;
+    match kind.trim_end_matches([' ', '}']) {
+        "brokenpipe" => Some("broken_pipe"),
+        "connectionreset" => Some("connection_reset"),
+        "connectionaborted" => Some("connection_aborted"),
+        _ => None,
     }
 }
 
@@ -2450,7 +2656,10 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
             .unwrap_or("unknown");
         let peer_addr = req
             .extensions()
-            .get::<RemoteAddr>()
+            .get::<Option<RemoteAddr>>()
+            .copied()
+            .flatten()
+            .or_else(|| req.extensions().get::<RemoteAddr>().copied())
             .map(|addr| addr.0.to_string())
             .unwrap_or_else(|| "unknown".to_string());
         let failure_reason = storage::tonic_rpc_auth_failure_reason(&e);
@@ -2466,25 +2675,41 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
             INTERNODE_TRANSPORT_BACKEND_GRPC,
             failure_reason,
         );
-        error!(
-            event = EVENT_RPC_SIGNATURE_VERIFICATION_FAILED,
-            component = LOG_COMPONENT_SERVER,
-            subsystem = LOG_SUBSYSTEM_HTTP,
-            failure_reason,
-            rpc_path,
-            rpc_service,
-            rpc_method,
-            expected_audience = %audience,
-            peer_addr = %peer_addr,
-            replay_scope_bootstrap_allowed = allow_replay_scope_bootstrap,
-            error = %e,
-            "RPC signature verification failed"
-        );
         if failure_reason == "stale_boot_epoch" {
             // The signature is valid, but the peer restarted before this request. Reject it
             // before execution and let the client retry after its authenticated epoch refresh.
+            warn!(
+                event = EVENT_RPC_SIGNATURE_VERIFICATION_FAILED,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_HTTP,
+                result = "retryable_rejection",
+                failure_reason,
+                rpc_path,
+                rpc_service,
+                rpc_method,
+                expected_audience = %audience,
+                peer_addr = %peer_addr,
+                replay_scope_bootstrap_allowed = allow_replay_scope_bootstrap,
+                error = %e,
+                "RPC boot epoch changed; request rejected for retry"
+            );
             Status::unavailable("RPC boot epoch changed")
         } else {
+            error!(
+                event = EVENT_RPC_SIGNATURE_VERIFICATION_FAILED,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_HTTP,
+                result = "rejected",
+                failure_reason,
+                rpc_path,
+                rpc_service,
+                rpc_method,
+                expected_audience = %audience,
+                peer_addr = %peer_addr,
+                replay_scope_bootstrap_allowed = allow_replay_scope_bootstrap,
+                error = %e,
+                "RPC signature verification failed"
+            );
             Status::unauthenticated("No valid auth token")
         }
     })?;
@@ -2611,6 +2836,224 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{Notify, mpsc};
     use tower::{Layer, Service, ServiceBuilder};
+
+    type RateLimitTestCore = tower::util::BoxCloneService<
+        HttpRequest<s3s::Body>,
+        Response<crate::server::hybrid::HybridBody<s3s::Body, Empty<Bytes>>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    >;
+    type RateLimitTestStack = tower::util::BoxCloneService<
+        HttpRequest<s3s::Body>,
+        Response<tower_http::body::UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    >;
+
+    fn rate_limited_external_stack(
+        peer: SocketAddr,
+        proxy_layer: Option<rustfs_trusted_proxies::TrustedProxyLayer>,
+        inner: RateLimitTestCore,
+    ) -> RateLimitTestStack {
+        use crate::server::rate_limit::RateLimitQuota;
+
+        let readiness = Arc::new(GlobalReadiness::new());
+        readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+        RateLimitTestStack::new(external_service_stack!(
+            inner,
+            Some(RemoteAddr(peer)),
+            proxy_layer,
+            false,
+            Some(RateLimitLayer::new(
+                Some(RateLimitQuota {
+                    requests_per_minute: 1,
+                    burst: 1
+                }),
+                None,
+                vec![]
+            )),
+            false,
+            readiness,
+            None::<Arc<rustfs_keystone::KeystoneAuthProvider>>,
+            HttpCompressionConfig::default(),
+            ServerContextSlot::new(),
+            false
+        ))
+    }
+
+    #[tokio::test]
+    async fn external_stack_limits_socket_peers_without_trusted_proxies() {
+        use crate::server::hybrid::HybridBody;
+        use tower::ServiceExt;
+
+        for peer in ["192.0.2.10:51000", "[2001:db8::10]:51000"] {
+            let peer: SocketAddr = peer.parse().expect("socket peer");
+            for version in [Version::HTTP_11, Version::HTTP_2, Version::HTTP_3] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let inner_calls = calls.clone();
+                let inner = tower::service_fn(move |request: HttpRequest<s3s::Body>| {
+                    assert_eq!(
+                        request
+                            .extensions()
+                            .get::<Option<RemoteAddr>>()
+                            .copied()
+                            .flatten()
+                            .map(|addr| addr.0),
+                        Some(peer)
+                    );
+                    inner_calls.fetch_add(1, Ordering::SeqCst);
+                    async {
+                        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::new(
+                            HybridBody::<s3s::Body, Empty<Bytes>>::Rest {
+                                rest_body: s3s::Body::empty(),
+                            },
+                        ))
+                    }
+                });
+                let mut service = rate_limited_external_stack(peer, None, RateLimitTestCore::new(inner));
+
+                for (forwarded, expected) in [
+                    ("203.0.113.1", StatusCode::OK),
+                    ("203.0.113.2", StatusCode::TOO_MANY_REQUESTS),
+                ] {
+                    let request = HttpRequest::builder()
+                        .uri("/bucket/object")
+                        .version(version)
+                        .header("x-forwarded-for", forwarded)
+                        .header("x-real-ip", forwarded)
+                        .body(s3s::Body::empty())
+                        .expect("request");
+                    let response = service
+                        .ready()
+                        .await
+                        .expect("service ready")
+                        .call(request)
+                        .await
+                        .expect("response");
+                    assert_eq!(response.status(), expected, "peer={peer}, version={version:?}");
+                    if expected == StatusCode::TOO_MANY_REQUESTS {
+                        assert!(response.headers().contains_key(http::header::RETRY_AFTER));
+                        let body = response.into_body().collect().await.expect("body").to_bytes();
+                        assert!(String::from_utf8_lossy(&body).contains("<Code>TooManyRequests</Code>"));
+                    }
+                }
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "throttled requests must not reach the inner service");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn external_stack_limits_validated_proxy_clients_independently() {
+        use crate::server::hybrid::HybridBody;
+        use rustfs_trusted_proxies::{
+            LegacyTrustedProxyLayer, TrustedProxy, TrustedProxyConfig, TrustedProxyLayer, ValidationMode,
+        };
+        use tower::ServiceExt;
+
+        let peer: SocketAddr = "192.0.2.100:51000".parse().expect("proxy peer");
+        for version in [Version::HTTP_11, Version::HTTP_2, Version::HTTP_3] {
+            let proxy_config =
+                TrustedProxyConfig::new(vec![TrustedProxy::Single(peer.ip())], ValidationMode::HopByHop, false, 3, false, vec![]);
+            let proxy_layer = TrustedProxyLayer::legacy(LegacyTrustedProxyLayer::new(proxy_config, None, true));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let inner_calls = calls.clone();
+            let inner = tower::service_fn(move |request: HttpRequest<s3s::Body>| {
+                let info = request.extensions().get::<ClientInfo>().expect("validated client context");
+                assert!(info.is_from_trusted_proxy);
+                assert_ne!(info.real_ip, peer.ip());
+                inner_calls.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::new(
+                        HybridBody::<s3s::Body, Empty<Bytes>>::Rest {
+                            rest_body: s3s::Body::empty(),
+                        },
+                    ))
+                }
+            });
+            let mut service = rate_limited_external_stack(peer, Some(proxy_layer), RateLimitTestCore::new(inner));
+
+            for (client, expected) in [
+                ("203.0.113.1", StatusCode::OK),
+                ("203.0.113.2", StatusCode::OK),
+                ("203.0.113.1", StatusCode::TOO_MANY_REQUESTS),
+            ] {
+                let request = HttpRequest::builder()
+                    .uri("/bucket/object")
+                    .version(version)
+                    .header("x-forwarded-for", client)
+                    .body(s3s::Body::empty())
+                    .expect("request");
+                let response = service
+                    .ready()
+                    .await
+                    .expect("service ready")
+                    .call(request)
+                    .await
+                    .expect("response");
+                assert_eq!(response.status(), expected, "client={client}, version={version:?}");
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[test]
+    fn peer_transport_close_kind_uses_io_error_sources() {
+        #[derive(Debug)]
+        struct SourceError(Error);
+
+        impl std::fmt::Display for SourceError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+
+        impl std::error::Error for SourceError {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        for (io_kind, expected) in [
+            (std::io::ErrorKind::BrokenPipe, "broken_pipe"),
+            (std::io::ErrorKind::ConnectionReset, "connection_reset"),
+            (std::io::ErrorKind::ConnectionAborted, "connection_aborted"),
+        ] {
+            let nested = SourceError(Error::new(io_kind, "peer closed"));
+            assert_eq!(peer_transport_close_kind(&nested), Some(expected));
+        }
+        assert_eq!(peer_transport_close_kind(&Error::other("Broken pipe")), None);
+        assert_eq!(
+            peer_transport_close_kind(&Error::new(std::io::ErrorKind::UnexpectedEof, "stream failed")),
+            None
+        );
+    }
+
+    #[test]
+    fn capitalized_hyper_body_write_peer_close_uses_narrow_fallback() {
+        let observed = "hyper::Error(BodyWrite, Os { code: 32, kind: BrokenPipe, message: \"Broken pipe\" })";
+        assert_eq!(hyper_body_write_close_kind(observed), Some("broken_pipe"));
+        assert_eq!(hyper_body_write_close_kind(&observed.to_ascii_lowercase()), Some("broken_pipe"));
+        assert_eq!(
+            hyper_body_write_close_kind(
+                "hyper::Error(BodyWrite, Os { code: 104, kind: ConnectionReset, message: \"Connection reset by peer\" })"
+            ),
+            Some("connection_reset")
+        );
+        assert_eq!(
+            hyper_body_write_close_kind(
+                "hyper::Error(BodyWrite, Os { code: 103, kind: ConnectionAborted, message: \"Software caused connection abort\" })"
+            ),
+            Some("connection_aborted")
+        );
+        assert_eq!(hyper_body_write_close_kind("hyper::Error(User, Broken pipe)"), None);
+        assert_eq!(hyper_body_write_close_kind("hyper::Error(Parse, Os { kind: BrokenPipe })"), None);
+        assert_eq!(
+            hyper_body_write_close_kind("hyper::Error(BodyWrite, Os { kind: Other, message: \"Broken pipe\" })"),
+            None
+        );
+        assert_eq!(
+            hyper_body_write_close_kind("hyper::Error(BodyWrite, Os { kind: Other, message: \"kind: BrokenPipe\" })"),
+            None
+        );
+    }
 
     type MetricRow = (
         metrics_util::CompositeKey,
@@ -3021,6 +3464,291 @@ mod tests {
         assert!(dropped.load(Ordering::Acquire));
         assert!(sender.send(Bytes::from_static(b"payload")).is_err());
         assert_eq!(bytes_polled.load(Ordering::Relaxed), 0);
+    }
+
+    mod conditional_object_http {
+        use super::*;
+        use crate::app::storage_api::object_usecase::{StorageObjectInfo, check_preconditions};
+        use crate::server::hybrid::HybridBody;
+
+        #[derive(Clone)]
+        struct ConditionalObjectS3 {
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[derive(Debug)]
+        struct FixtureTransportError(String);
+
+        impl std::fmt::Display for FixtureTransportError {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(&self.0)
+            }
+        }
+
+        impl std::error::Error for FixtureTransportError {}
+
+        type HttpConditionCase<'a> = (&'a str, &'a [(&'a str, &'a str)], StatusCode, bool);
+
+        impl<'a> From<Box<dyn std::error::Error + Send + Sync + 'a>> for FixtureTransportError {
+            fn from(error: Box<dyn std::error::Error + Send + Sync + 'a>) -> Self {
+                Self(error.to_string())
+            }
+        }
+
+        fn object_info() -> StorageObjectInfo {
+            StorageObjectInfo {
+                etag: Some("abc".to_owned()),
+                mod_time: Some(time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixture timestamp")),
+                user_defined: HashMap::from([("cache-control".to_owned(), "max-age=60".to_owned())]).into(),
+                ..Default::default()
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl s3s::S3 for ConditionalObjectS3 {
+            async fn get_object(
+                &self,
+                req: s3s::S3Request<s3s::dto::GetObjectInput>,
+            ) -> s3s::S3Result<s3s::S3Response<s3s::dto::GetObjectOutput>> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(req.input.bucket, "bucket");
+                assert_eq!(req.input.key, "object");
+                assert_eq!(req.input.if_match.is_some(), req.headers.contains_key(http::header::IF_MATCH));
+                assert_eq!(req.input.if_none_match.is_some(), req.headers.contains_key(http::header::IF_NONE_MATCH));
+                check_preconditions(&req.headers, &object_info())?;
+                Ok(s3s::S3Response::new(s3s::dto::GetObjectOutput {
+                    body: Some(s3s::dto::StreamingBlob::from_bytes(Bytes::from_static(b"payload"))),
+                    content_length: Some(7),
+                    e_tag: Some(s3s::dto::ETag::Strong("abc".to_owned())),
+                    ..Default::default()
+                }))
+            }
+
+            async fn head_object(
+                &self,
+                req: s3s::S3Request<s3s::dto::HeadObjectInput>,
+            ) -> s3s::S3Result<s3s::S3Response<s3s::dto::HeadObjectOutput>> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(req.input.bucket, "bucket");
+                assert_eq!(req.input.key, "object");
+                assert_eq!(req.input.if_match.is_some(), req.headers.contains_key(http::header::IF_MATCH));
+                assert_eq!(req.input.if_none_match.is_some(), req.headers.contains_key(http::header::IF_NONE_MATCH));
+                check_preconditions(&req.headers, &object_info())?;
+                Ok(s3s::S3Response::new(s3s::dto::HeadObjectOutput {
+                    content_length: Some(7),
+                    e_tag: Some(s3s::dto::ETag::Strong("abc".to_owned())),
+                    ..Default::default()
+                }))
+            }
+        }
+
+        #[tokio::test]
+        async fn conditional_get_head_http1_http2_parse_headers_and_apply_precedence() {
+            let cases: &[HttpConditionCase<'_>] = &[
+                ("strong list", &[("if-none-match", "\"other\", \"abc\"")], StatusCode::NOT_MODIFIED, true),
+                ("weak list", &[("if-none-match", "\"other\", W/\"abc\"")], StatusCode::NOT_MODIFIED, true),
+                ("weak tag", &[("if-none-match", "W/\"abc\"")], StatusCode::NOT_MODIFIED, true),
+                ("wildcard", &[("if-none-match", "*")], StatusCode::NOT_MODIFIED, true),
+                ("strong match list", &[("if-match", "\"other\", \"abc\"")], StatusCode::OK, true),
+                ("weak match fails", &[("if-match", "W/\"abc\"")], StatusCode::PRECONDITION_FAILED, true),
+                ("wildcard match", &[("if-match", "*")], StatusCode::OK, true),
+                (
+                    "If-Match precedes matching If-None-Match",
+                    &[("if-match", "\"other\""), ("if-none-match", "\"abc\"")],
+                    StatusCode::PRECONDITION_FAILED,
+                    true,
+                ),
+                (
+                    "matching If-Match does not suppress If-None-Match",
+                    &[("if-match", "\"abc\""), ("if-none-match", "W/\"abc\"")],
+                    StatusCode::NOT_MODIFIED,
+                    true,
+                ),
+                (
+                    "If-Match suppresses If-Unmodified-Since",
+                    &[
+                        ("if-match", "\"abc\""),
+                        ("if-unmodified-since", "Tue, 14 Nov 2023 22:13:19 GMT"),
+                    ],
+                    StatusCode::OK,
+                    true,
+                ),
+                (
+                    "If-None-Match suppresses If-Modified-Since",
+                    &[
+                        ("if-none-match", "\"other\""),
+                        ("if-modified-since", "Tue, 14 Nov 2023 22:13:21 GMT"),
+                    ],
+                    StatusCode::OK,
+                    true,
+                ),
+                (
+                    "If-Unmodified-Since precedes wildcard If-None-Match",
+                    &[
+                        ("if-unmodified-since", "Tue, 14 Nov 2023 22:13:19 GMT"),
+                        ("if-none-match", "*"),
+                    ],
+                    StatusCode::PRECONDITION_FAILED,
+                    true,
+                ),
+                (
+                    "date matches at same second",
+                    &[("if-modified-since", "Tue, 14 Nov 2023 22:13:20 GMT")],
+                    StatusCode::NOT_MODIFIED,
+                    true,
+                ),
+                ("unmatched list", &[("if-none-match", "\"other\", W/\"different\"")], StatusCode::OK, true),
+                (
+                    "empty list member is allowed",
+                    &[("if-none-match", "\"other\", , \"abc\"")],
+                    StatusCode::NOT_MODIFIED,
+                    true,
+                ),
+                // s3s accepts these quoted fields; the canonical matcher must validate every member.
+                (
+                    "adjacent tags cannot validate cache",
+                    &[("if-none-match", "\"other\"\"abc\"")],
+                    StatusCode::OK,
+                    true,
+                ),
+                (
+                    "adjacent tags cannot satisfy If-Match",
+                    &[("if-match", "\"other\"\"abc\"")],
+                    StatusCode::PRECONDITION_FAILED,
+                    true,
+                ),
+                (
+                    "matching prefix with trailing garbage",
+                    &[("if-none-match", "\"abc\"garbage\"")],
+                    StatusCode::OK,
+                    true,
+                ),
+                (
+                    "matching prefix cannot satisfy If-Match",
+                    &[("if-match", "\"abc\"garbage\"")],
+                    StatusCode::PRECONDITION_FAILED,
+                    true,
+                ),
+                (
+                    "matching first tag with malformed later member",
+                    &[("if-none-match", "\"abc\", \"other\"\"different\"")],
+                    StatusCode::OK,
+                    true,
+                ),
+                (
+                    "If-Match validates malformed later member",
+                    &[("if-match", "\"abc\", \"other\"\"different\"")],
+                    StatusCode::PRECONDITION_FAILED,
+                    true,
+                ),
+                // These existing s3s parse boundaries reject the request before the handler.
+                ("malformed ETag", &[("if-none-match", "\"abc")], StatusCode::BAD_REQUEST, false),
+                ("invalid date", &[("if-modified-since", "not-a-date")], StatusCode::BAD_REQUEST, false),
+                (
+                    "obsolete date",
+                    &[("if-modified-since", "Tuesday, 14-Nov-23 22:13:20 GMT")],
+                    StatusCode::BAD_REQUEST,
+                    false,
+                ),
+                (
+                    "duplicate condition",
+                    &[("if-none-match", "\"other\""), ("if-none-match", "\"abc\"")],
+                    StatusCode::BAD_REQUEST,
+                    false,
+                ),
+            ];
+            for http2 in [false, true] {
+                for method in [Method::GET, Method::HEAD] {
+                    for (name, headers, expected_status, reaches_handler) in cases {
+                        let calls = Arc::new(AtomicUsize::new(0));
+                        let inner = S3ServiceBuilder::new(ConditionalObjectS3 {
+                            calls: Arc::clone(&calls),
+                        })
+                        .build();
+                        let service = ServiceBuilder::new()
+                            .layer(BodylessStatusFixLayer)
+                            .layer(HeadRequestBodyFixLayer)
+                            .map_response(|response: Response<s3s::Body>| {
+                                response.map(|rest_body| HybridBody::<s3s::Body, Empty<Bytes>>::Rest { rest_body })
+                            })
+                            .map_err(|error: s3s::HttpError| FixtureTransportError(error.to_string()))
+                            .service(inner);
+                        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                        let server = tokio::spawn(async move {
+                            let service = TowerToHyperService::new(service);
+                            if http2 {
+                                hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                                    .serve_connection(TokioIo::new(server_io), service)
+                                    .await
+                                    .expect("HTTP/2 server");
+                            } else {
+                                hyper::server::conn::http1::Builder::new()
+                                    .serve_connection(TokioIo::new(server_io), service)
+                                    .await
+                                    .expect("HTTP/1 server");
+                            }
+                        });
+                        let mut request = HttpRequest::builder()
+                            .method(method.clone())
+                            .uri("http://localhost/bucket/object");
+                        for (header, value) in *headers {
+                            request = request.header(*header, *value);
+                        }
+                        let request = request.body(Empty::<Bytes>::new()).expect("conditional request");
+                        let (response, client) = if http2 {
+                            let (mut sender, connection) =
+                                hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(client_io))
+                                    .await
+                                    .expect("HTTP/2 handshake");
+                            let client = tokio::spawn(async move {
+                                connection.await.expect("HTTP/2 client");
+                            });
+                            let response = tokio::time::timeout(Duration::from_secs(5), sender.send_request(request))
+                                .await
+                                .expect("HTTP/2 response deadline")
+                                .expect("HTTP/2 response");
+                            (response, client)
+                        } else {
+                            let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+                                .await
+                                .expect("HTTP/1 handshake");
+                            let client = tokio::spawn(async move {
+                                connection.await.expect("HTTP/1 client");
+                            });
+                            let response = tokio::time::timeout(Duration::from_secs(5), sender.send_request(request))
+                                .await
+                                .expect("HTTP/1 response deadline")
+                                .expect("HTTP/1 response");
+                            (response, client)
+                        };
+                        assert_eq!(response.status(), *expected_status, "{name}: {method}, HTTP/2={http2}");
+                        assert_eq!(calls.load(Ordering::Relaxed), usize::from(*reaches_handler), "{name}: parser routing");
+                        if *expected_status == StatusCode::NOT_MODIFIED {
+                            assert_eq!(response.headers()[http::header::ETAG], "\"abc\"", "{name}");
+                            assert_eq!(response.headers()[http::header::CACHE_CONTROL], "max-age=60", "{name}");
+                            assert!(response.headers().contains_key(http::header::LAST_MODIFIED), "{name}");
+                            assert!(response.headers().contains_key(http::header::DATE), "{name}");
+                            assert!(!response.headers().contains_key(CONTENT_LENGTH), "{name}");
+                            assert!(!response.headers().contains_key(http::header::TRANSFER_ENCODING), "{name}");
+                        }
+                        let bytes = tokio::time::timeout(Duration::from_secs(5), response.into_body().collect())
+                            .await
+                            .expect("body deadline")
+                            .expect("response body")
+                            .to_bytes();
+                        if method == Method::HEAD || *expected_status == StatusCode::NOT_MODIFIED {
+                            assert!(bytes.is_empty(), "{name}: {method}, HTTP/2={http2}");
+                        } else if *expected_status == StatusCode::OK {
+                            assert_eq!(&bytes[..], b"payload", "{name}");
+                        } else if *expected_status == StatusCode::PRECONDITION_FAILED {
+                            assert!(String::from_utf8_lossy(&bytes).contains("<Code>PreconditionFailed</Code>"), "{name}");
+                        }
+                        client.abort();
+                        server.abort();
+                    }
+                }
+            }
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -3721,14 +4449,14 @@ mod tests {
         let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
         let previous_node_name = rustfs_common::get_global_local_node_name().await;
         let audience = "127.0.0.1:9000";
-        let path = "/node_service.NodeService/ReadVersion";
+        let path = "/node_service.NodeService/ReadAll";
         rustfs_common::set_global_local_node_name(audience).await;
         let challenge = uuid::Uuid::new_v4();
         let proof = storage::tonic_boot_epoch_response_headers(audience, challenge).expect("signed epoch proof");
         let epoch = storage::verify_tonic_boot_epoch_response(audience, challenge, &proof).expect("authenticated epoch");
         let stale_epoch = uuid::Uuid::from_u128(epoch.as_u128() ^ 1);
         let signed_headers = |audience: &str, epoch| {
-            let mut headers = storage::gen_tonic_signature_headers(audience, "node_service.NodeService", "ReadVersion", None)
+            let mut headers = storage::gen_tonic_signature_headers(audience, "node_service.NodeService", "ReadAll", None)
                 .expect("method-bound signature");
             let replay = storage::gen_tonic_replay_scope_headers(
                 audience,
@@ -3741,34 +4469,198 @@ mod tests {
             headers.extend(replay);
             headers
         };
-        let request = |headers: HeaderMap| {
+        let request = |headers: HeaderMap, peer: Option<SocketAddr>| {
             let mut request = Request::new(());
             request.metadata_mut().as_mut().extend(headers);
             request.extensions_mut().insert(RpcRequestTarget {
                 uri: format!("http://{audience}{path}").parse().expect("RPC URI"),
                 method: Method::POST,
             });
+            // The connection stack stores this optional wrapper, not a bare RemoteAddr.
+            request.extensions_mut().insert(peer.map(RemoteAddr));
             request
         };
-
+        let log_file = tempfile::NamedTempFile::new().expect("create RPC auth log capture");
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_ansi(false)
+            .with_max_level(Level::TRACE)
+            .with_writer(Arc::new(log_file.reopen().expect("open RPC auth log writer")))
+            .finish();
+        let peer: SocketAddr = "192.0.2.10:51000".parse().expect("test peer address");
         let stale = signed_headers(audience, stale_epoch);
-        let error = check_auth(request(stale.clone())).expect_err("a stale epoch must still reject the request");
-        assert_eq!(error.code(), tonic::Code::Unavailable);
-        assert_eq!(error.message(), "RPC boot epoch changed");
+        tracing::subscriber::with_default(subscriber, || {
+            let error = check_auth(request(stale.clone(), Some(peer))).expect_err("a stale epoch must still reject the request");
+            assert_eq!(error.code(), tonic::Code::Unavailable);
+            assert_eq!(error.message(), "RPC boot epoch changed");
+            let mut forged = stale.clone();
+            forged.insert("x-rustfs-rpc-signature-v3", HeaderValue::from_static("00"));
+            let error = check_auth(request(forged, Some(peer))).expect_err("a forged stale-epoch signature must remain terminal");
+            assert_eq!(error.code(), tonic::Code::Unauthenticated);
+            let error = check_auth(request(signed_headers("127.0.0.1:9001", stale_epoch), Some(peer)))
+                .expect_err("a stale epoch must not hide an audience mismatch");
+            assert_eq!(error.code(), tonic::Code::Unauthenticated);
 
-        let mut forged = stale;
-        forged.insert("x-rustfs-rpc-signature-v3", HeaderValue::from_static("00"));
-        let error = check_auth(request(forged)).expect_err("a forged stale-epoch signature must remain terminal");
-        assert_eq!(error.code(), tonic::Code::Unauthenticated);
-        let error = check_auth(request(signed_headers("127.0.0.1:9001", stale_epoch)))
-            .expect_err("a stale epoch must not hide an audience mismatch");
-        assert_eq!(error.code(), tonic::Code::Unauthenticated);
-
-        let current = signed_headers(audience, epoch);
-        assert!(check_auth(request(current.clone())).is_ok(), "a fresh authenticated scope must succeed");
-        let error = check_auth(request(current)).expect_err("a same-epoch nonce replay must remain terminal");
-        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+            let current = signed_headers(audience, epoch);
+            assert!(
+                check_auth(request(current.clone(), Some(peer))).is_ok(),
+                "a fresh authenticated scope must succeed"
+            );
+            let error = check_auth(request(current, Some(peer))).expect_err("a same-epoch nonce replay must remain terminal");
+            assert_eq!(error.code(), tonic::Code::Unauthenticated);
+            let error =
+                check_auth(request(stale.clone(), None)).expect_err("a missing peer address must not affect authentication");
+            assert_eq!(error.code(), tonic::Code::Unavailable);
+        });
         rustfs_common::set_global_local_node_name(&previous_node_name).await;
+
+        let logs = std::fs::read_to_string(log_file.path()).expect("read RPC auth logs");
+        let events: Vec<serde_json::Value> = logs
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid JSON log event"))
+            .filter(|event| event["fields"]["event"] == EVENT_RPC_SIGNATURE_VERIFICATION_FAILED)
+            .collect();
+        assert_eq!(events.len(), 5, "each authentication rejection must retain its diagnostic event");
+        let stale_events: Vec<_> = events
+            .iter()
+            .filter(|event| event["fields"]["failure_reason"] == "stale_boot_epoch")
+            .collect();
+        assert_eq!(stale_events.len(), 2);
+        for event in &stale_events {
+            assert_eq!(event["level"], "WARN");
+            assert_eq!(event["fields"]["result"], "retryable_rejection");
+            assert_eq!(event["fields"]["rpc_method"], "ReadAll");
+        }
+        assert_eq!(stale_events[0]["fields"]["peer_addr"], peer.to_string());
+        assert_eq!(stale_events[1]["fields"]["peer_addr"], "unknown");
+        for event in events
+            .iter()
+            .filter(|event| event["fields"]["failure_reason"] != "stale_boot_epoch")
+        {
+            assert_eq!(event["level"], "ERROR");
+            assert_eq!(event["fields"]["result"], "rejected");
+            assert_eq!(event["fields"]["peer_addr"], peer.to_string());
+        }
+        assert!(!logs.contains("rpc-http-test-secret"), "logs must not expose the RPC secret");
+        for header in ["x-rustfs-signature", "x-rustfs-rpc-signature-v2", "x-rustfs-rpc-signature-v3"] {
+            if let Some(signature) = stale.get(header) {
+                assert!(
+                    !logs.contains(signature.to_str().expect("ASCII signature")),
+                    "logs must not expose {header}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rpc_auth_read_all_recovers_after_stale_boot_epoch() {
+        use storage::DiskAPI;
+
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_INTERNODE_IDEMPOTENT_READ_RETRIES", Some("1")),
+                ("RUSTFS_INTERNODE_PREWARM", Some("false")),
+            ],
+            async {
+                let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
+                let listener = TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind ReadAll epoch recovery peer");
+                let addr = listener.local_addr().expect("ReadAll recovery address");
+                let audience = addr.to_string();
+                let previous_node_name = rustfs_common::get_global_local_node_name().await;
+                rustfs_common::set_global_local_node_name(&audience).await;
+                let challenge = uuid::Uuid::new_v4();
+                let proof = storage::tonic_boot_epoch_response_headers(&audience, challenge).expect("current epoch proof");
+                let epoch = storage::verify_tonic_boot_epoch_response(&audience, challenge, &proof).expect("current epoch");
+                let stale_epoch = uuid::Uuid::from_u128(epoch.as_u128() ^ 1);
+                let admitted = Arc::new(AtomicUsize::new(0));
+                let admitted_by_server = Arc::clone(&admitted);
+                let node = InterceptedService::new(NodeServiceServer::new(make_server()), move |request: Request<()>| {
+                    let request = check_auth(request)?;
+                    assert!(
+                        request.extensions().get::<Option<RemoteAddr>>().copied().flatten().is_some(),
+                        "production auth must receive the connection's optional peer address"
+                    );
+                    admitted_by_server.fetch_add(1, Ordering::SeqCst);
+                    Ok(request)
+                });
+                let scopes = Arc::new(Mutex::new(Vec::new()));
+                let observed_scopes = Arc::clone(&scopes);
+                let service = ServiceBuilder::new()
+                    .map_request(move |mut request: HttpRequest<hyper::body::Incoming>| {
+                        assert_eq!(request.uri().path(), "/node_service.NodeService/ReadAll");
+                        let mut scopes = observed_scopes.lock().expect("captured replay scopes");
+                        if scopes.is_empty() {
+                            assert!(
+                                !request.headers().contains_key("x-rustfs-rpc-boot-epoch"),
+                                "the fresh peer must start without a cached epoch"
+                            );
+                            // Inject a correctly signed stale scope at the transport boundary.
+                            // The retry must learn its scope from the real server response proof.
+                            let replay = storage::gen_tonic_replay_scope_headers(
+                                &audience,
+                                request.uri().path(),
+                                request.headers()["x-rustfs-timestamp"].to_str().expect("timestamp"),
+                                request.headers()["x-rustfs-content-sha256"].to_str().expect("body digest"),
+                                stale_epoch,
+                            )
+                            .expect("signed stale scope");
+                            request.headers_mut().extend(replay);
+                        }
+                        let parse_uuid = |name: &str| {
+                            uuid::Uuid::parse_str(request.headers()[name].to_str().expect("UUID header"))
+                                .expect("valid replay scope UUID")
+                        };
+                        scopes.push((parse_uuid("x-rustfs-rpc-boot-epoch"), parse_uuid("x-rustfs-rpc-replay-nonce")));
+                        request
+                    })
+                    .service(RpcRequestPathService::new(Routes::new(node).prepare()));
+                let server = tokio::spawn(async move {
+                    let (socket, peer) = listener.accept().await.expect("accept ReadAll recovery connection");
+                    let service = ServiceBuilder::new()
+                        .layer(AddExtensionLayer::new(Some(RemoteAddr(peer))))
+                        .service(service);
+                    ConnBuilder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(socket), TowerToHyperService::new(service))
+                        .await
+                        .expect("serve ReadAll recovery connection");
+                });
+                let mut endpoint =
+                    Endpoint::try_from(format!("http://{addr}/missing-read-all-disk").as_str()).expect("ReadAll remote endpoint");
+                endpoint.is_local = false;
+                let disk = storage::new_disk(
+                    &endpoint,
+                    &storage::DiskOption {
+                        cleanup: false,
+                        health_check: false,
+                    },
+                )
+                .await
+                .expect("production remote disk client");
+                let result = tokio::time::timeout(Duration::from_secs(10), disk.read_all("bucket", "object")).await;
+                server.abort();
+                let _ = server.await;
+                rustfs_common::set_global_local_node_name(&previous_node_name).await;
+
+                let error = result
+                    .expect("bounded ReadAll retry must complete")
+                    .expect_err("missing disk must remain an error");
+                assert_eq!(
+                    error.to_string(),
+                    "io error io error cannot find disk",
+                    "the retry must reach the real ReadAll missing-disk handler"
+                );
+                let scopes = scopes.lock().expect("captured replay scopes");
+                assert_eq!(scopes.len(), 2, "stale epoch recovery must use one bounded retry");
+                assert_eq!(scopes[0].0, stale_epoch);
+                assert_eq!(scopes[1].0, epoch, "the retry must use the authenticated response epoch");
+                assert_ne!(scopes[0].1, scopes[1].1, "the retry must carry a fresh replay nonce");
+                assert_eq!(admitted.load(Ordering::SeqCst), 1, "the stale request must not reach the handler");
+            },
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -3898,6 +4790,51 @@ mod tests {
             error.contains("storage layer is not initialized") || error.contains("scoped dirty usage peer or process changed"),
             "signed probe must pass production path authentication and reach owner validation: {error}"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cold_delete_recovery_discovery_uses_production_body_auth() {
+        use storage::DiskAPI;
+        temp_env::async_with_vars([("RUSTFS_INTERNODE_RPC_BODY_DIGEST_STRICT", Some("false"))], async {
+            let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind recovery RPC peer");
+            let addr = listener.local_addr().expect("recovery RPC address");
+            let previous_node_name = rustfs_common::get_global_local_node_name().await;
+            rustfs_common::set_global_local_node_name(&addr.to_string()).await;
+            let node = InterceptedService::new(NodeServiceServer::new(make_server()), check_auth);
+            let service = RpcRequestPathService::new(Routes::new(node).prepare());
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.expect("accept recovery RPC connection");
+                ConnBuilder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(socket), TowerToHyperService::new(service))
+                    .await
+                    .expect("serve recovery RPC connection");
+            });
+            let mut endpoint =
+                Endpoint::try_from(format!("http://{addr}/cold-recovery-disk").as_str()).expect("remote recovery endpoint");
+            endpoint.is_local = false;
+            let disk = storage::new_disk(
+                &endpoint,
+                &storage::DiskOption {
+                    cleanup: false,
+                    health_check: false,
+                },
+            )
+            .await
+            .expect("production remote disk client");
+            // Recovery may race a heal-control peer-state refresh, before another
+            // authenticated response has repopulated the shared peer state.
+            let result = disk.discover_delete_transactions("cold-recovery-bucket", None, None, 1).await;
+            server.abort();
+            let _ = server.await;
+            rustfs_common::set_global_local_node_name(&previous_node_name).await;
+            assert!(
+                matches!(result, Err(crate::storage_api::error::DiskError::DiskNotFound)),
+                "the cold request must pass production authentication and reach the missing-disk handler: {result:?}"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -4150,5 +5087,234 @@ mod tests {
         let result = futures::executor::block_on(svc.call(req));
         assert!(result.is_err(), "ErrService must return an error");
         assert_eq!(active_http_requests(), before, "gauge must net to zero on service error");
+    }
+    #[cfg(feature = "http3")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn http3_external_stack_enforces_readiness_keystone_context_and_rate_limit() -> http3::tests::TestResult {
+        use crate::server::rate_limit::RateLimitQuota;
+        use http3::tests::{client_endpoint, configs, connect, request};
+        use rustfs_keystone::{KeystoneAuthProvider, KeystoneClient, KeystoneVersion};
+        temp_env::async_with_vars([("NO_PROXY", Some("127.0.0.1,localhost")), ("no_proxy", Some("127.0.0.1,localhost"))], async {
+            let mock = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let auth_url = format!("http://{}", mock.local_addr()?);
+            let mock_task = tokio::spawn(async move {
+                let (socket, _) = mock.accept().await.expect("Keystone connection");
+                hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(socket), hyper::service::service_fn(|request: HttpRequest<Incoming>| async move {
+                    assert_eq!(request.uri().path(), "/v3/auth/tokens");
+                    let valid = request.headers().get("x-subject-token").is_some_and(|value| value == "valid-token");
+                    let mut response = Response::new(http_body_util::Full::new(Bytes::from_static(br#"{"token":{"user":{"id":"user-id","name":"test-user"},"expires_at":"2099-01-01T00:00:00Z"}}"#)));
+                    if !valid { *response.status_mut() = http::StatusCode::UNAUTHORIZED; }
+                    response.headers_mut().insert("content-type", HeaderValue::from_static("application/json"));
+                    Ok::<_, std::convert::Infallible>(response)
+                })).await.expect("Keystone mock");
+            });
+            let provider = Arc::new(KeystoneAuthProvider::new(KeystoneClient::new(auth_url, KeystoneVersion::V3,
+                None, None, None, "Default".to_owned(), true, Duration::from_secs(5)), 10, Duration::from_secs(60), false));
+            let readiness = Arc::new(GlobalReadiness::new());
+            let server_readiness = readiness.clone();
+            let rate = RateLimitLayer::new(Some(RateLimitQuota { requests_per_minute: 1, burst: 4 }), None, vec![]);
+            let (config, cert) = configs()?;
+            let (shutdown, receiver) = tokio::sync::broadcast::channel(1);
+            let (endpoint, task) = http3::spawn(config, "127.0.0.1:0".parse()?, move |peer| {
+                let inner = tower::service_fn(move |request: HttpRequest<http3::RequestBody>| async move {
+                    assert_eq!(request.version(), Version::HTTP_3);
+                    assert_eq!(request.extensions().get::<Option<RemoteAddr>>().copied().flatten().expect("peer").0, peer);
+                    let info = request.extensions().get::<ClientInfo>().expect("policy context");
+                    assert_eq!(info.real_ip, peer.ip());
+                    assert_eq!(info.forwarded_proto.as_deref(), Some("https"));
+                    let identity = rustfs_keystone::KEYSTONE_CREDENTIALS.try_with(Clone::clone).ok().flatten().map(|credentials| credentials.parent_user).unwrap_or_else(|| "anonymous".to_owned());
+                    if request.headers().contains_key("x-auth-token") { assert_eq!(identity, "test-user"); }
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::new(HybridBody::<s3s::Body, http_body_util::Empty<Bytes>>::Rest { rest_body: s3s::Body::from(identity) }))
+                });
+                let inner = Http3CoreService::new(inner);
+                Http3ExternalService::new(external_service_stack!(inner, Some(RemoteAddr(peer)), None::<rustfs_trusted_proxies::TrustedProxyLayer>, false,
+                    Some(rate.clone()), true, server_readiness.clone(), Some(provider.clone()),
+                    HttpCompressionConfig::default(), ServerContextSlot::new(), false))
+            }, 0, Duration::from_secs(1), receiver)?;
+            let client_endpoint = client_endpoint(vec![cert])?;
+            let (quic, mut client, driver) = connect(&client_endpoint, endpoint.local_addr()?).await?;
+            let make_request = || HttpRequest::builder().uri("https://localhost/bucket/key").body(());
+            assert_eq!(request(&mut client, make_request()?, Bytes::new()).await?.0, http::StatusCode::SERVICE_UNAVAILABLE);
+            readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+            assert_eq!(request(&mut client, HttpRequest::builder().uri("https://localhost/bucket/key").header("x-auth-token", "invalid-token").body(())?, Bytes::new()).await?.0, http::StatusCode::UNAUTHORIZED);
+            let (status, headers, body) = request(&mut client, HttpRequest::builder().uri("https://localhost/bucket/key").header("x-auth-token", "valid-token").header("x-forwarded-for", "203.0.113.1").body(())?, Bytes::new()).await?;
+            assert_eq!(status, http::StatusCode::OK);
+            assert_eq!(body, "test-user");
+            assert!(headers.contains_key("x-amz-request-id"), "request context must survive HTTP/3 dispatch");
+            assert_eq!(request(&mut client, make_request()?, Bytes::new()).await?.2, "anonymous", "Keystone task-local credentials must not leak between streams");
+            assert_eq!(request(&mut client, make_request()?, Bytes::new()).await?.0, http::StatusCode::TOO_MANY_REQUESTS);
+            shutdown.send(())?;
+            drop(client);
+            quic.close(0u32.into(), b"test complete");
+            tokio::time::timeout(Duration::from_secs(5), task).await??;
+            driver.abort();
+            mock_task.abort();
+            Ok(())
+        }).await
+    }
+    #[cfg(feature = "http3")]
+    #[tokio::test]
+    async fn http3_upload_part_timeout_preserves_s3_error_and_other_streams() -> http3::tests::TestResult {
+        use bytes::Buf;
+        use http3::tests::{client_endpoint, configs, connect};
+        let (config, cert) = configs()?;
+        let readiness = Arc::new(GlobalReadiness::new());
+        readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+        let s3 = S3ServiceBuilder::new(UploadPartTimeoutS3 {
+            timeout: Duration::from_secs(1),
+        })
+        .build();
+        let (shutdown, receiver) = tokio::sync::broadcast::channel(1);
+        let (endpoint, task) = http3::spawn(
+            config,
+            "127.0.0.1:0".parse()?,
+            move |peer| {
+                let inner = ServiceBuilder::new()
+                    .map_response(|response: Response<s3s::Body>| {
+                        response.map(|rest_body| HybridBody::<s3s::Body, http_body_util::Empty<Bytes>>::Rest { rest_body })
+                    })
+                    .map_err(|error: s3s::HttpError| -> Box<dyn std::error::Error + Send + Sync> { error.into() })
+                    .service(EarlyResponseBodyService::new(s3.clone(), Duration::from_secs(1)));
+                let inner = Http3CoreService::new(inner);
+                Http3ExternalService::new(external_service_stack!(
+                    inner,
+                    Some(RemoteAddr(peer)),
+                    None::<rustfs_trusted_proxies::TrustedProxyLayer>,
+                    false,
+                    None::<RateLimitLayer>,
+                    true,
+                    readiness.clone(),
+                    None::<Arc<rustfs_keystone::KeystoneAuthProvider>>,
+                    HttpCompressionConfig::default(),
+                    ServerContextSlot::new(),
+                    false
+                ))
+            },
+            0,
+            Duration::from_secs(1),
+            receiver,
+        )?;
+        let client_endpoint = client_endpoint(vec![cert])?;
+        let (quic, mut client, driver) = connect(&client_endpoint, endpoint.local_addr()?).await?;
+        let mut stalled = client
+            .send_request(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri("https://localhost/bucket/object?partNumber=1&uploadId=upload")
+                    .header("content-length", 1024)
+                    .body(())?,
+            )
+            .await?;
+        stalled.send_data(Bytes::from_static(b"x")).await?;
+        let response = tokio::time::timeout(Duration::from_secs(5), stalled.recv_response()).await??;
+        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+        let mut xml = Vec::new();
+        while let Some(mut chunk) = stalled.recv_data().await? {
+            xml.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+        }
+        assert!(String::from_utf8(xml)?.contains("<Code>RequestTimeout</Code>"));
+        let mut subsequent = client
+            .send_request(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri("https://localhost/bucket/object?partNumber=1&uploadId=upload")
+                    .header("content-length", 0)
+                    .body(())?,
+            )
+            .await?;
+        subsequent.finish().await?;
+        let response = tokio::time::timeout(Duration::from_secs(5), subsequent.recv_response()).await??;
+        assert_eq!(
+            response.status(),
+            http::StatusCode::OK,
+            "timed-out uploads must not close unrelated HTTP/3 streams"
+        );
+        while subsequent.recv_data().await?.is_some() {}
+        drop(stalled);
+        drop(subsequent);
+        shutdown.send(())?;
+        drop(client);
+        quic.close(0u32.into(), b"test complete");
+        tokio::time::timeout(Duration::from_secs(5), task).await??;
+        driver.abort();
+        Ok(())
+    }
+    #[cfg(feature = "http3")]
+    struct SignedS3;
+
+    #[cfg(feature = "http3")]
+    #[async_trait::async_trait]
+    impl s3s::S3 for SignedS3 {
+        async fn list_buckets(
+            &self,
+            req: s3s::S3Request<s3s::dto::ListBucketsInput>,
+        ) -> s3s::S3Result<s3s::S3Response<s3s::dto::ListBucketsOutput>> {
+            assert_eq!(req.credentials.expect("verified SigV4 credentials").access_key, "test-key");
+            Ok(s3s::S3Response::new(s3s::dto::ListBucketsOutput {
+                buckets: Some(vec![s3s::dto::Bucket {
+                    name: Some("http3-bucket".to_owned()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }))
+        }
+    }
+
+    #[cfg(feature = "http3")]
+    #[tokio::test]
+    async fn http3_s3_service_verifies_sigv4_before_dispatch() -> http3::tests::TestResult {
+        use http3::tests::{client_endpoint, configs, connect, request};
+        use s3s_sigv4::{
+            AmzDate, EMPTY_STRING_SHA256_HASH, Payload, calculate_signature, create_canonical_request, create_string_to_sign,
+        };
+        let (config, cert) = configs()?;
+        let mut builder = s3s::service::S3ServiceBuilder::new(SignedS3);
+        builder.set_auth(s3s::auth::SimpleAuth::from_single("test-key", "test-secret"));
+        let service = builder.build();
+        let (shutdown, receiver) = tokio::sync::broadcast::channel(1);
+        let (endpoint, task) = http3::spawn(
+            config,
+            "127.0.0.1:0".parse()?,
+            move |_| service.clone(),
+            0,
+            Duration::from_secs(1),
+            receiver,
+        )?;
+        let endpoint_client = client_endpoint(vec![cert])?;
+        let (quic, mut client, driver) = connect(&endpoint_client, endpoint.local_addr()?).await?;
+        let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let date = AmzDate::parse(&timestamp)?;
+        let canonical = create_canonical_request(
+            "GET",
+            "/",
+            &[] as &[(&str, &str)],
+            [
+                ("host", "localhost"),
+                ("x-amz-content-sha256", EMPTY_STRING_SHA256_HASH),
+                ("x-amz-date", timestamp.as_str()),
+            ],
+            Payload::SingleChunk(EMPTY_STRING_SHA256_HASH),
+        );
+        let string_to_sign = create_string_to_sign(&canonical, &date, "us-east-1", "s3");
+        let make_request = |secret| {
+            let signature = calculate_signature(&string_to_sign, secret, &date, "us-east-1", "s3");
+            HttpRequest::builder().uri("https://localhost/").header("host", "localhost")
+                .header("x-amz-date", &timestamp).header("x-amz-content-sha256", EMPTY_STRING_SHA256_HASH)
+                .header("authorization", format!("AWS4-HMAC-SHA256 Credential=test-key/{}/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={signature}", date.fmt_date()))
+                .body(())
+        };
+        let (status, _, body) = request(&mut client, make_request("wrong-secret")?, Bytes::new()).await?;
+        assert_eq!(status, http::StatusCode::FORBIDDEN);
+        assert!(String::from_utf8(body.to_vec())?.contains("SignatureDoesNotMatch"));
+        let (status, _, body) = request(&mut client, make_request("test-secret")?, Bytes::new()).await?;
+        assert_eq!(status, http::StatusCode::OK);
+        assert!(String::from_utf8(body.to_vec())?.contains("<Name>http3-bucket</Name>"));
+        shutdown.send(())?;
+        drop(client);
+        quic.close(0u32.into(), b"test complete");
+        tokio::time::timeout(Duration::from_secs(5), task).await??;
+        driver.abort();
+        Ok(())
     }
 }

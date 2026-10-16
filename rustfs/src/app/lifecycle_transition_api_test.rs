@@ -26,7 +26,9 @@ use super::storage_api::test::contract::{
 };
 use super::storage_api::test::ecfs::FS;
 use super::storage_api::test::object_utils::to_s3s_etag;
-use super::storage_api::test::runtime::{MockWarmBackend, MockWarmOp, register_mock_tier as register_mock_tier_util};
+use super::storage_api::test::runtime::{
+    MockWarmBackend, MockWarmOp, get_global_transition_state, register_mock_tier as register_mock_tier_util,
+};
 use super::storage_api::test::{
     ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, StorageObjectInfo as ObjectInfo,
     StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader, install_all_v6_fleet_capability_proof,
@@ -405,11 +407,15 @@ async fn wait_for_restore_completion(
 // runtime (`worker_threads = 1`), so no concurrent test can mutate process environment during the
 // `env::set_var` / `env::remove_var` window.
 #[allow(unsafe_code)]
-async fn with_forced_immediate_enqueue_timeout<F, Fut>(test_fn: F)
+async fn with_forced_immediate_enqueue_timeout<F, Fut>(backend: &MockWarmBackend, test_fn: F)
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
+    let transition_state = get_global_transition_state();
+    let missed_before = transition_state.missed_immediate_tasks();
+    let compensation_before = transition_state.compensation_scheduled_tasks();
+    let put_barrier = backend.arm_put_barrier().await;
     let original = env::var_os(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT);
     unsafe {
         env::set_var(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT, "1");
@@ -426,6 +432,20 @@ where
     if let Err(err) = result {
         std::panic::resume_unwind(err);
     }
+
+    assert!(
+        transition_state.missed_immediate_tasks() > missed_before,
+        "the operation should exercise the forced immediate enqueue failure"
+    );
+    assert!(
+        transition_state.compensation_scheduled_tasks() > compensation_before,
+        "the operation should schedule automatic compensation backfill"
+    );
+
+    // Separate automatic discovery and queue latency from the metadata commit deadline.
+    put_barrier.wait_until_paused().await;
+    assert_eq!(backend.object_count().await, 1, "compensation should store the body before committing");
+    put_barrier.release();
 }
 
 async fn with_get_codec_streaming_remote_probe_env<F, Fut>(test_fn: F)
@@ -944,7 +964,11 @@ async fn copy_object_allows_new_version_for_locked_destination_but_blocks_explic
         .await
         .expect_err("explicit CopyObject overwrite of a locked version should be blocked");
 
-    assert_eq!(err.code(), &s3s::S3ErrorCode::AccessDenied);
+    assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidArgument);
+    assert_eq!(
+        err.message(),
+        Some("Invalid argument: A destination versionId requires replication authorization")
+    );
     assert_eq!(read_object_bytes(&ecstore, bucket.as_str(), dst_object).await, source_payload);
     assert_eq!(live_object_version_count(&ecstore, bucket.as_str(), dst_object).await, 2);
 }
@@ -1639,7 +1663,7 @@ async fn immediate_transition_timeout_eventually_completes_via_compensation() {
         .await
         .expect("Failed to set lifecycle configuration");
 
-    with_forced_immediate_enqueue_timeout(|| async {
+    with_forced_immediate_enqueue_timeout(&backend, || async {
         let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
     })
     .await;
@@ -1648,6 +1672,7 @@ async fn immediate_transition_timeout_eventually_completes_via_compensation() {
         .await
         .expect("object should eventually transition after compensation backfill");
 
+    assert_eq!(backend.put_count().await, 1, "compensation should upload the version once");
     assert_eq!(info.transitioned_object.status, "complete");
     assert_eq!(info.transitioned_object.tier, tier_name);
     assert!(backend.contains(&info.transitioned_object.name).await);
@@ -1687,7 +1712,7 @@ async fn compensation_driven_copy_still_completes_transition() {
         .build()
         .unwrap();
 
-    with_forced_immediate_enqueue_timeout(|| async {
+    with_forced_immediate_enqueue_timeout(&backend, || async {
         Box::pin(usecase.execute_copy_object(build_request(copy_input, Method::PUT)))
             .await
             .expect("Failed to copy object through usecase");
@@ -1698,9 +1723,11 @@ async fn compensation_driven_copy_still_completes_transition() {
         .await
         .expect("copied object should eventually transition after compensation backfill");
 
+    assert_eq!(backend.put_count().await, 1, "compensation should upload the copied version once");
     assert_eq!(info.transitioned_object.status, "complete");
     assert_eq!(info.transitioned_object.tier, tier_name);
     assert!(backend.contains(&info.transitioned_object.name).await);
+    assert_eq!(read_object_bytes(&ecstore, dst_bucket.as_str(), dst_object).await, payload);
 }
 
 #[serial]
@@ -1764,7 +1791,7 @@ async fn compensation_driven_complete_multipart_upload_still_transitions_inner()
         .build()
         .unwrap();
 
-    with_forced_immediate_enqueue_timeout(|| async {
+    with_forced_immediate_enqueue_timeout(&backend, || async {
         Box::pin(usecase.execute_complete_multipart_upload(build_request(complete_input, Method::POST)))
             .await
             .expect("Failed to complete multipart upload through usecase");
@@ -1775,6 +1802,7 @@ async fn compensation_driven_complete_multipart_upload_still_transitions_inner()
         .await
         .expect("multipart object should eventually transition after compensation backfill");
 
+    assert_eq!(backend.put_count().await, 1, "compensation should upload the version once");
     assert_eq!(info.transitioned_object.status, "complete");
     assert_eq!(info.transitioned_object.tier, tier_name);
     assert!(backend.contains(&info.transitioned_object.name).await);
@@ -1801,7 +1829,7 @@ async fn compensation_driven_transition_still_cleans_remote_tier_on_delete() {
         .await
         .expect("Failed to set lifecycle configuration");
 
-    with_forced_immediate_enqueue_timeout(|| async {
+    with_forced_immediate_enqueue_timeout(&backend, || async {
         let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
     })
     .await;
@@ -1809,6 +1837,7 @@ async fn compensation_driven_transition_still_cleans_remote_tier_on_delete() {
     let transitioned = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
         .await
         .expect("object should eventually transition after compensation backfill");
+    assert_eq!(backend.put_count().await, 1, "compensation should upload the version once");
     let remote_object = transitioned.transitioned_object.name.clone();
 
     assert!(backend.contains(&remote_object).await);
@@ -1862,7 +1891,7 @@ async fn compensation_driven_versioned_delete_still_creates_delete_marker() {
         .await
         .expect("Failed to set lifecycle configuration");
 
-    with_forced_immediate_enqueue_timeout(|| async {
+    with_forced_immediate_enqueue_timeout(&backend, || async {
         let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
     })
     .await;
@@ -1870,6 +1899,7 @@ async fn compensation_driven_versioned_delete_still_creates_delete_marker() {
     let transitioned = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
         .await
         .expect("object should eventually transition after compensation backfill");
+    assert_eq!(backend.put_count().await, 1, "compensation should upload the version once");
     let remote_object = transitioned.transitioned_object.name.clone();
 
     assert!(backend.contains(&remote_object).await);
@@ -1917,7 +1947,7 @@ async fn compensation_driven_delete_marker_still_honors_lifecycle_cleanup() {
         .await
         .expect("Failed to set transition lifecycle configuration");
 
-    with_forced_immediate_enqueue_timeout(|| async {
+    with_forced_immediate_enqueue_timeout(&backend, || async {
         let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
     })
     .await;
@@ -1925,6 +1955,7 @@ async fn compensation_driven_delete_marker_still_honors_lifecycle_cleanup() {
     let transitioned = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
         .await
         .expect("object should eventually transition after compensation backfill");
+    assert_eq!(backend.put_count().await, 1, "compensation should upload the version once");
     let remote_object = transitioned.transitioned_object.name.clone();
 
     assert!(backend.contains(&remote_object).await);

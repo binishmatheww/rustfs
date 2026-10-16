@@ -29,6 +29,7 @@ use tempfile::TempDir;
 pub(super) mod admin_overlap;
 mod root_recovery;
 use uuid::Uuid;
+mod auto_scan;
 mod running_mainline;
 
 use super::super::{DiskOption, DiskStore, Endpoint, new_disk, storage_api::status::BucketInfo};
@@ -599,6 +600,13 @@ impl HealStorageAPI for MockStorage {
 
     async fn get_bucket_info(&self, _bucket: &str) -> Result<Option<BucketInfo>> {
         Ok(None)
+    }
+
+    async fn list_buckets_for_admin_heal(
+        &self,
+        _selector: Option<crate::heal::storage_api::storage::DiskSetSelector>,
+    ) -> Result<Vec<BucketInfo>> {
+        self.list_buckets().await
     }
 
     async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
@@ -1208,6 +1216,123 @@ fn queued_request_id_for_dedup_key_tracks_the_representative() {
     let last = queue.pop_next().expect("second request must be queued");
     assert_eq!(last.id, second_id);
     assert!(queue.queued_request_id_for_dedup_key(&first_key).is_none());
+}
+
+#[tokio::test]
+async fn durable_mrf_anchor_snapshot_follows_live_owners_and_ignores_stale_notices() {
+    use rustfs_common::mrf_channel::{MrfIngressResult, MrfIntent, MrfKind, MrfScope, try_rearm_mrf_replay_intent};
+    let mut intent = MrfIntent {
+        bucket: Arc::from("mrf-notice-snapshot"),
+        object: Arc::from("object"),
+        version_id: None,
+        kind: MrfKind::PartialWrite,
+        delete_marker_purge: None,
+        scope: Some(MrfScope {
+            pool_index: 0,
+            set_index: 0,
+        }),
+        lease: None,
+        enqueued_at_ms: 1,
+        attempts: 0,
+    };
+    assert_eq!(try_rearm_mrf_replay_intent(&mut intent), MrfIngressResult::Enqueued);
+    let anchor = rustfs_common::mrf_channel::MrfDurableRepairAnchor::from_intent(&intent, Uuid::new_v4())
+        .expect("complete durable identity");
+    let target = MrfRepairNoticeTarget {
+        bucket: intent.bucket.clone(),
+        object: intent.object.clone(),
+        version_id: intent.version_id,
+        kind: intent.kind,
+        scope: intent.scope,
+        delete_marker_purge: None,
+        lease: intent.lease,
+        durable_anchor: Some(anchor.clone()),
+    };
+    let manager = HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None);
+    let mut request = HealRequest::new(
+        HealType::Object {
+            bucket: intent.bucket.to_string(),
+            object: intent.object.to_string(),
+            version_id: None,
+        },
+        HealOptions::default(),
+        HealPriority::Normal,
+    );
+    request.source = HealRequestSource::Mrf;
+    request.expected_mrf_bucket_incarnation_id = Some(anchor.bucket_incarnation_id);
+    let queued = manager
+        .submit_mrf_heal_request_with_receipt_and_identity(request, target)
+        .await
+        .expect("queued owner");
+    assert_eq!(queued.result, HealAdmissionResult::Accepted);
+    assert_eq!(
+        manager.try_in_flight_durable_mrf_anchors().expect("stable view"),
+        HashSet::from([anchor.clone()])
+    );
+    let mut moved_request = manager
+        .heal_queue
+        .lock()
+        .await
+        .remove_request_id(&queued.task_id)
+        .expect("queued request");
+    moved_request.id = "retry-merged-active".into();
+    let retry_request = moved_request.clone();
+    manager.active_heals.lock().await.insert(
+        moved_request.id.clone(),
+        Arc::new(HealTask::from_request(moved_request, Arc::new(MockStorage))),
+    );
+    {
+        let mut registry = lock_mrf_repair_notice_targets(&manager.mrf_repair_notice_targets);
+        let notices = registry.remove(&queued.task_id).expect("queued notices");
+        registry.insert("retry-merged-active".into(), notices);
+    }
+    let held = manager.try_in_flight_durable_mrf_anchors().expect("active ownership view");
+    assert!(held.contains(&anchor));
+    let mut wrong_incarnation = anchor.clone();
+    wrong_incarnation.bucket_incarnation_id = Uuid::new_v4();
+    assert!(!held.contains(&wrong_incarnation));
+    let mut wrong_scope = anchor.clone();
+    wrong_scope.scope = Some(MrfScope {
+        pool_index: 1,
+        set_index: 0,
+    });
+    assert!(!held.contains(&wrong_scope));
+    let mut another = MrfIntent {
+        object: Arc::from("other-object"),
+        lease: None,
+        ..intent.clone()
+    };
+    assert_eq!(try_rearm_mrf_replay_intent(&mut another), MrfIngressResult::Enqueued);
+    let mut wrong_lease = anchor.clone();
+    wrong_lease.lease = another.lease.expect("another ingress generation");
+    assert!(!held.contains(&wrong_lease));
+    let gate = manager.active_heals.lock().await;
+    assert!(manager.try_in_flight_durable_mrf_anchors().is_none(), "contention cannot mean completed");
+    drop(gate);
+    manager.active_heals.lock().await.remove("retry-merged-active");
+    manager.retrying_heals.lock().await.insert(
+        "retry-merged-active".into(),
+        RetryingHeal {
+            request: retry_request,
+            error: "retry pending".into(),
+            cancel_token: CancellationToken::new(),
+        },
+    );
+    assert!(
+        manager
+            .try_in_flight_durable_mrf_anchors()
+            .expect("retrying view")
+            .contains(&anchor)
+    );
+    manager.retrying_heals.lock().await.remove("retry-merged-active");
+    assert!(lock_mrf_repair_notice_targets(&manager.mrf_repair_notice_targets).contains_key("retry-merged-active"));
+    assert!(
+        manager
+            .try_in_flight_durable_mrf_anchors()
+            .expect("stable ownerless view")
+            .is_empty(),
+        "a late notice transfer into a finished task must not suppress durable retry"
+    );
 }
 
 #[test]
@@ -2634,6 +2759,177 @@ async fn contended_healing_marker_cas_retains_bounded_task_retries() {
 }
 
 #[tokio::test]
+async fn automatic_replacement_grace_waits_preserve_request_retry_budget() {
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("test clock should follow the epoch")
+        .as_secs();
+    let retry_not_before = now + 3600;
+    let result = Err(Error::DanglingDeleteDeferred { retry_not_before });
+    let mut request = HealRequest::new(
+        HealType::ErasureSet {
+            buckets: vec!["bucket".to_string()],
+            set_disk_id: "pool_0_set_0".to_string(),
+        },
+        HealOptions::default(),
+        HealPriority::Low,
+    );
+    request.source = HealRequestSource::AutoHeal;
+    request.heal_endpoints = vec!["replacement-a".to_string()];
+    request.retry_attempts = 1;
+    let original = request.clone();
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+
+    for _ in 0..MAX_RECOVERABLE_HEAL_RETRIES * 3 {
+        let task = HealTask::from_request(request, storage.clone());
+        let (retry, delay, _) = retry_request_for_result_with_budget(&task, &result)
+            .await
+            .expect("legal grace waiting must survive more passes than the failure retry limit");
+        assert_eq!(retry.retry_attempts, original.retry_attempts);
+        assert_eq!(retry.id, original.id);
+        assert_eq!(retry.heal_type, original.heal_type);
+        assert_eq!(retry.source, original.source);
+        assert_eq!(retry.heal_endpoints, original.heal_endpoints);
+        assert!(
+            delay > MAX_RECOVERABLE_HEAL_RETRY_DELAY,
+            "grace waiting must respect the storage deadline"
+        );
+        assert!(delay <= Duration::from_secs(3600));
+        request = retry;
+    }
+
+    let ordinary_failure = Err(Error::transient_skip("replacement quorum is unavailable"));
+    for attempt in original.retry_attempts + 1..=MAX_RECOVERABLE_HEAL_RETRIES {
+        let task = HealTask::from_request(request, storage.clone());
+        let (retry, _, _) = retry_request_for_result_with_budget(&task, &ordinary_failure)
+            .await
+            .expect("a genuine failure should still consume the remaining retry budget");
+        assert_eq!(retry.retry_attempts, attempt);
+        request = retry;
+    }
+    let task = HealTask::from_request(request, storage);
+    assert!(retry_request_for_result_with_budget(&task, &ordinary_failure).await.is_none());
+}
+
+#[test]
+fn automatic_replacement_grace_uses_absolute_deadline_and_keeps_task_scope() {
+    let mut request = HealRequest::new(
+        HealType::ErasureSet {
+            buckets: vec!["bucket".to_string()],
+            set_disk_id: "pool_0_set_0".to_string(),
+        },
+        HealOptions::default(),
+        HealPriority::Low,
+    );
+    request.source = HealRequestSource::AutoHeal;
+    request.heal_endpoints = vec!["replacement-a".to_string()];
+    request.retry_attempts = MAX_RECOVERABLE_HEAL_RETRIES;
+    let expired = Err(Error::DanglingDeleteDeferred { retry_not_before: 1 });
+    let task = HealTask::from_request(request.clone(), Arc::new(MockStorage));
+    let (retry, delay, _) = retry_request_for_result(&task, &expired)
+        .expect("an elapsed storage deadline can requeue the typed in-budget generation immediately");
+    assert_eq!(delay, Duration::ZERO);
+    assert_eq!(retry.retry_attempts, request.retry_attempts);
+
+    let unrepresentable = Err(Error::DanglingDeleteDeferred {
+        retry_not_before: u64::MAX,
+    });
+    assert!(
+        retry_request_for_result(&task, &unrepresentable).is_none(),
+        "an unrepresentable persisted deadline must never reach the scheduler timer"
+    );
+
+    request.heal_endpoints.clear();
+    let task = HealTask::from_request(request.clone(), Arc::new(MockStorage));
+    assert!(
+        retry_request_for_result(&task, &expired).is_none(),
+        "ordinary set healing must retain its retry cap"
+    );
+    request.heal_endpoints = vec!["replacement-a".to_string()];
+    request.source = HealRequestSource::Admin;
+    let task = HealTask::from_request(request, Arc::new(MockStorage));
+    assert!(
+        retry_request_for_result(&task, &expired).is_none(),
+        "admin healing must retain its retry cap"
+    );
+}
+
+#[tokio::test]
+async fn automatic_replacement_grace_wait_excludes_execution_timeout_budget() {
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("test clock should follow the epoch")
+        .as_secs();
+    let result = Err(Error::DanglingDeleteDeferred {
+        retry_not_before: now + 3600,
+    });
+    let mut request = HealRequest::new(
+        HealType::ErasureSet {
+            buckets: vec!["bucket".to_string()],
+            set_disk_id: "pool_0_set_0".to_string(),
+        },
+        HealOptions {
+            timeout: Some(Duration::from_secs(rustfs_config::DEFAULT_HEAL_TASK_TIMEOUT_SECS)),
+            ..HealOptions::default()
+        },
+        HealPriority::Low,
+    );
+    request.source = HealRequestSource::AutoHeal;
+    request.heal_endpoints = vec!["replacement-a".to_string()];
+    let task = HealTask::from_request(request, Arc::new(MockStorage));
+    task.set_execution_elapsed_for_test(Duration::from_secs(30)).await;
+
+    let (retry, delay, _) = retry_request_for_result_with_budget(&task, &result)
+        .await
+        .expect("a grace wait longer than the execution timeout must remain schedulable");
+    let remaining = retry.options.timeout.expect("execution timeout must remain configured");
+    assert!(remaining > Duration::from_secs(269));
+    assert!(remaining <= Duration::from_secs(270));
+    assert!(delay > remaining, "the storage wait must not be deducted from the execution budget");
+
+    let waiting_task = HealTask::from_request(retry, Arc::new(MockStorage));
+    let (next_retry, _, _) = retry_request_for_result_with_budget(&waiting_task, &result)
+        .await
+        .expect("an unstarted retry must retain its unused execution timeout");
+    assert_eq!(next_retry.options.timeout, Some(remaining));
+    assert_eq!(next_retry.retry_attempts, 0);
+}
+
+#[test]
+fn automatic_replacement_grace_admission_rechecks_deadline_after_queue_pressure() {
+    let original_grace_delay = Duration::from_secs(3600);
+    let queue_backoff = recoverable_heal_retry_delay(0);
+    assert_eq!(
+        retry_admission_delay(Some(3700), original_grace_delay, Duration::ZERO, 100),
+        Some(original_grace_delay),
+        "the first admission must wait until the storage deadline"
+    );
+    assert_eq!(
+        retry_admission_delay(Some(3700), original_grace_delay, Duration::ZERO, 3700),
+        Some(Duration::ZERO),
+        "the first admission may proceed as soon as the deadline expires"
+    );
+    for now in [3700, 3800, 7200] {
+        assert_eq!(
+            retry_admission_delay(Some(3700), original_grace_delay, queue_backoff, now),
+            Some(queue_backoff),
+            "a full or dropped queue admission must not repeat the hour-long grace wait"
+        );
+    }
+    assert_eq!(
+        retry_admission_delay(Some(3700), original_grace_delay, queue_backoff, 3690),
+        Some(Duration::from_secs(10)),
+        "a clock rollback must restore the wait for the absolute storage deadline"
+    );
+    assert_eq!(
+        retry_admission_delay(None, Duration::from_secs(8), queue_backoff, 7200),
+        Some(Duration::from_secs(8)),
+        "ordinary failure retries must retain their original admission backoff"
+    );
+    assert!(retry_admission_delay(Some(u64::MAX), original_grace_delay, queue_backoff, 100).is_none());
+}
+
+#[tokio::test]
 async fn retry_request_for_result_preserves_remaining_timeout_budget() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
     let mut request = HealRequest::object("retry-transition".to_string(), "object".to_string(), None);
@@ -2774,6 +3070,60 @@ fn durable_replacement_recovery_re_admits_only_the_matching_generation() {
         !durable_replacement_recovery_is_due(&state, task_id),
         "a task must not adopt another generation's terminal cleanup"
     );
+}
+
+#[test]
+fn durable_replacement_grace_waiting_preserves_reservation_until_deadline() {
+    let task_id = "grace-generation";
+    let mut state = ResumeState::new(
+        task_id.to_string(),
+        "erasure_set".to_string(),
+        "pool_0_set_0".to_string(),
+        vec!["bucket".to_string()],
+    );
+    state.replacement_generation = Some(task_id.to_string());
+    state.replacement_phase = ReplacementPhase::Rebuilding;
+    state.replacement_targets = vec!["replacement-a".to_string()];
+    state.dangling_delete_retry_not_before = Some(200);
+
+    for now in [100, 150, 199] {
+        assert!(
+            durable_replacement_recovery_is_waiting_for_grace(&state, task_id, now),
+            "scan and startup replay must defer this original generation before the deadline"
+        );
+        assert!(
+            durable_replacement_reserves_targets(&state),
+            "waiting must prevent competing replacement admission"
+        );
+        assert!(
+            durable_replacement_recovery_is_due(&state, task_id),
+            "legal waiting must remain eligible rather than blocked"
+        );
+    }
+    for now in [200, 201] {
+        assert!(!durable_replacement_recovery_is_waiting_for_grace(&state, task_id, now));
+        assert!(
+            durable_replacement_recovery_is_due(&state, task_id),
+            "the same generation must resume when its deadline expires"
+        );
+    }
+
+    state.retry_count = state.max_retries;
+    assert!(durable_replacement_reserves_targets(&state));
+    assert!(
+        !durable_replacement_recovery_is_waiting_for_grace(&state, task_id, 100),
+        "a stale deadline must not hide a genuinely exhausted generation"
+    );
+    assert!(!durable_replacement_recovery_is_due(&state, task_id));
+
+    state.completed = true;
+    state.replacement_phase = ReplacementPhase::CleanupPending;
+    assert!(durable_replacement_recovery_is_due(&state, task_id));
+    assert!(
+        !durable_replacement_recovery_is_waiting_for_grace(&state, task_id, 100),
+        "verified marker cleanup must not be postponed by a stale storage deadline"
+    );
+    assert!(!durable_replacement_recovery_is_waiting_for_grace(&state, "other-generation", 100));
 }
 
 #[test]
@@ -5321,7 +5671,7 @@ async fn configured_task_timeout_applies_only_when_request_timeout_is_absent() {
     process_manager_queue_once(&manager).await;
     let explicit_status = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
-            if let Ok(status @ HealTaskStatus::Failed { .. }) = manager.get_task_status(&explicit_id).await {
+            if let Ok(status @ HealTaskStatus::Completed) = manager.get_task_status(&explicit_id).await {
                 break status;
             }
             tokio::task::yield_now().await;
@@ -5329,7 +5679,8 @@ async fn configured_task_timeout_applies_only_when_request_timeout_is_absent() {
     })
     .await
     .expect("explicit timeout request should finish without using the zero default");
-    assert!(matches!(explicit_status, HealTaskStatus::Failed { .. }));
+    // Generation-bound admin tasks reach the successful mock heal without a namespace preflight.
+    assert_eq!(explicit_status, HealTaskStatus::Completed);
 }
 
 #[tokio::test]
@@ -5558,5 +5909,27 @@ fn test_heal_config_respects_feature_flags() {
             assert!(!config.set_bulkhead_enable);
             assert!(!config.page_parallel_enable);
         },
+    );
+}
+
+#[test]
+fn admin_bucket_discovery_retries_keep_the_existing_budget() {
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+    let mut request = HealRequest::new(HealType::Cluster, HealOptions::default(), HealPriority::Normal);
+    request.source = HealRequestSource::Admin;
+    let id = request.id.clone();
+    let error = Err(Error::BucketDiscoveryIncomplete);
+    for attempt in 1..=MAX_RECOVERABLE_HEAL_RETRIES {
+        let task = HealTask::from_request(request, storage.clone());
+        let (retry, delay, _) = retry_request_for_result(&task, &error).expect("discovery can recover within budget");
+        assert_eq!(retry.id, id);
+        assert_eq!(retry.retry_attempts, attempt);
+        assert!(delay > Duration::ZERO);
+        request = retry;
+    }
+    let task = HealTask::from_request(request, storage);
+    assert!(
+        retry_request_for_result(&task, &error).is_none(),
+        "persistent incompleteness must terminate"
     );
 }

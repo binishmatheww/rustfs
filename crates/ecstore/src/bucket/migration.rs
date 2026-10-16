@@ -273,6 +273,30 @@ where
 
     let buckets: Vec<String> = buckets_list.into_iter().map(|b| b.name).collect();
 
+    try_migrate_bucket_metadata_for_buckets(store, &buckets).await
+}
+
+/// Migrate the already discovered startup candidates without repeating a
+/// majority-only namespace listing. Every migration write retains its quorum.
+pub async fn try_migrate_bucket_metadata_for_buckets<S>(store: Arc<S>, buckets: &[String]) -> Result<()>
+where
+    S: ObjectIO<
+            Error = Error,
+            RangeSpec = HTTPRangeSpec,
+            HeaderMap = HeaderMap,
+            ObjectOptions = ObjectOptions,
+            ObjectInfo = ObjectInfo,
+            GetObjectReader = GetObjectReader,
+            PutObjectReader = PutObjReader,
+        > + ObjectOperations<
+            Error = Error,
+            ObjectInfo = ObjectInfo,
+            ObjectOptions = ObjectOptions,
+            FileInfo = FileInfo,
+            ObjectToDelete = ObjectToDelete,
+            DeletedObject = DeletedObject,
+        >,
+{
     if buckets.is_empty() {
         debug!("No migrating bucket metadata found");
         return Ok(());
@@ -280,11 +304,11 @@ where
 
     debug!("Found {} migrating bucket metadata, migrating...", buckets.len());
 
-    let opts = ObjectOptions {
+    let mut opts = ObjectOptions {
         max_parity: true,
-        no_lock: true,
         ..Default::default()
     };
+    opts.use_offline_recovery_write();
     let h = HeaderMap::new();
 
     for bucket in buckets {
@@ -397,11 +421,11 @@ where
         return Ok(());
     }
 
-    let opts = ObjectOptions {
+    let mut opts = ObjectOptions {
         max_parity: true,
-        no_lock: true,
         ..Default::default()
     };
+    opts.use_offline_recovery_write();
     let h = HeaderMap::new();
     let prefix = format!("{IAM_CONFIG_PREFIX}/");
     let mut continuation: Option<String> = None;

@@ -16,9 +16,9 @@
 //!
 //! A `Resource` describes the entity producing telemetry data.  The resource
 //! built here includes the service name, service version, deployment
-//! environment, the stable RustFS node identity, and the local machine IP
-//! address so that data can be correlated across services in a distributed
-//! system.
+//! environment, the stable RustFS node identity, the process ID, and the local
+//! machine IP address so telemetry series can be correlated across service
+//! restarts and nodes.
 
 use crate::config::OtelConfig;
 use crate::node_identity::{RUSTFS_NODE_ATTRIBUTE, local_node_identity};
@@ -27,11 +27,11 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_semantic_conventions::{
     SCHEMA_URL,
     attribute::{
-        DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, SERVICE_INSTANCE_ID as OTEL_SERVICE_INSTANCE_ID,
+        DEPLOYMENT_ENVIRONMENT_NAME, NETWORK_LOCAL_ADDRESS, PROCESS_PID, SERVICE_INSTANCE_ID as OTEL_SERVICE_INSTANCE_ID,
         SERVICE_VERSION as OTEL_SERVICE_VERSION,
     },
 };
-use rustfs_config::{APP_NAME, ENVIRONMENT, SERVICE_VERSION};
+use rustfs_config::{APP_NAME, ENVIRONMENT, VERSION};
 use rustfs_utils::get_local_ip_with_default;
 use std::borrow::Cow;
 
@@ -40,7 +40,7 @@ use std::borrow::Cow;
 /// The resource carries the following attributes:
 /// - `service.name` — from `config.service_name`, defaulting to [`APP_NAME`].
 /// - `service.version` — from `config.service_version`, defaulting to
-///   [`SERVICE_VERSION`].
+///   [`VERSION`].
 /// - `deployment.environment` — from `config.environment`, defaulting to
 ///   [`ENVIRONMENT`].
 /// - `rustfs.node` / `service.instance.id` — the stable RustFS local node name
@@ -48,6 +48,8 @@ use std::borrow::Cow;
 /// - `network.local.address` — the primary local IP of the current host,
 ///   useful as an operational fallback when the stable node name is not yet
 ///   initialized.
+/// - `process.pid` — distinguishes telemetry emitted by different processes
+///   running on the same node.
 ///
 /// All attributes are attached to the resource using the semantic conventions
 /// schema URL to ensure compatibility with standard OTLP backends.
@@ -61,7 +63,7 @@ pub(super) fn build_resource(config: &OtelConfig) -> Resource {
             [
                 KeyValue::new(
                     OTEL_SERVICE_VERSION,
-                    Cow::Borrowed(config.service_version.as_deref().unwrap_or(SERVICE_VERSION)).to_string(),
+                    Cow::Borrowed(config.service_version.as_deref().unwrap_or(VERSION)).to_string(),
                 ),
                 KeyValue::new(
                     DEPLOYMENT_ENVIRONMENT_NAME,
@@ -70,6 +72,7 @@ pub(super) fn build_resource(config: &OtelConfig) -> Resource {
                 KeyValue::new(RUSTFS_NODE_ATTRIBUTE, node_identity.clone()),
                 KeyValue::new(OTEL_SERVICE_INSTANCE_ID, node_identity),
                 KeyValue::new(NETWORK_LOCAL_ADDRESS, local_ip),
+                KeyValue::new(PROCESS_PID, i64::from(std::process::id())),
             ],
             SCHEMA_URL,
         )
@@ -80,6 +83,22 @@ pub(super) fn build_resource(config: &OtelConfig) -> Resource {
 mod tests {
     use super::*;
     use opentelemetry::Key;
+
+    #[test]
+    fn build_resource_uses_configured_service_version() {
+        let config = OtelConfig {
+            service_version: Some("@a1b2c3d".to_string()),
+            ..OtelConfig::default()
+        };
+        let resource = build_resource(&config);
+
+        assert_eq!(
+            resource
+                .get(&Key::from_static_str(OTEL_SERVICE_VERSION))
+                .map(|value| value.to_string()),
+            Some("@a1b2c3d".to_string())
+        );
+    }
 
     #[tokio::test]
     async fn build_resource_uses_stable_local_node_identity() {
@@ -100,6 +119,12 @@ mod tests {
                 .get(&Key::from_static_str(OTEL_SERVICE_INSTANCE_ID))
                 .map(|value| value.to_string()),
             Some("node1:9000".to_string())
+        );
+        assert_eq!(
+            resource
+                .get(&Key::from_static_str(PROCESS_PID))
+                .map(|value| value.to_string()),
+            Some(std::process::id().to_string())
         );
 
         rustfs_common::set_global_local_node_name(&previous).await;

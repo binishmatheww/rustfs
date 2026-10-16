@@ -36,7 +36,7 @@ use rustfs_obs::init_obs;
 #[tokio::main]
 async fn main() {
     // Build config from environment variables, then initialise all backends.
-    let _guard = init_obs(None).await.expect("failed to initialise observability");
+    let _guard = init_obs(None, None).await.expect("failed to initialise observability");
 
     tracing::info!("RustFS started");
 
@@ -56,7 +56,7 @@ async fn main() {
 ```rust
 use rustfs_obs::init_obs;
 
-let _guard = init_obs(Some("http://otel-collector:4318".to_string()))
+let _guard = init_obs(Some("http://otel-collector:4318".to_string()), None)
 .await
 .expect("observability init failed");
 ```
@@ -127,7 +127,9 @@ All configuration is read from environment variables at startup.
 
 `RUSTFS_OBS_TLS_CA_FILE` is read only while OTLP exporters are initialized. Its PEM certificates are added to, not substituted for, the platform trust roots, and TLS chain, expiry, and hostname checks remain enabled. Restart RustFS after rotating the bundle. A missing, unreadable, non-absolute, empty, or invalid bundle fails OTLP initialization.
 
-The export interval is separate from application metric collection. Without interval overrides, node/disk metrics refresh every 60 seconds (`RUSTFS_METRICS_NODE_INTERVAL_SEC`), cluster metrics every 60 seconds (`RUSTFS_METRICS_CLUSTER_INTERVAL_SEC`), and per-bucket metrics every 300 seconds (`RUSTFS_METRICS_BUCKET_INTERVAL_SEC`). See the [collection defaults](src/metrics/config.rs) and [interval configuration](src/metrics/scheduler.rs) for collector-specific and global overrides.
+The export interval is separate from application metric collection. Without interval overrides, node/disk metrics refresh every 60 seconds (`RUSTFS_METRICS_NODE_INTERVAL_SEC`), cluster metrics including scanner bucket usage every 60 seconds (`RUSTFS_METRICS_CLUSTER_INTERVAL_SEC`), and the separate bucket collector every 300 seconds (`RUSTFS_METRICS_BUCKET_INTERVAL_SEC`). See the [collection defaults](src/metrics/config.rs) and [interval configuration](src/metrics/scheduler.rs) for collector-specific and global overrides.
+
+For bucket size and object-count metric names, all-bucket PromQL queries, accounting semantics, and scanner freshness, see [Bucket usage metrics](../../docs/operations/bucket-usage-metrics.md).
 
 With OTLP → Collector → Prometheus, the time from a failure to an alert also includes underlying health detection, collection and export work, transport and Collector batching, Prometheus `scrape_interval` and `evaluation_interval`, and any alert rule `for` duration. A shorter scrape interval cannot refresh a value that RustFS has not yet collected and exported. These periodic intervals do not guarantee a fixed detection or alert latency; see the [Prometheus alert rule documentation](https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/) for the role of `for`.
 
@@ -136,7 +138,7 @@ With OTLP → Collector → Prometheus, the time from a failure to an alert also
 | Variable                     | Default           | Description                                             |
 |------------------------------|-------------------|---------------------------------------------------------|
 | `RUSTFS_OBS_SERVICE_NAME`    | `rustfs`          | OTel `service.name`                                     |
-| `RUSTFS_OBS_SERVICE_VERSION` | _(crate version)_ | OTel `service.version`                                  |
+| `RUSTFS_OBS_SERVICE_VERSION` | RustFS build version | OTel `service.version`; the explicit environment value overrides the version passed by the RustFS binary |
 | `RUSTFS_OBS_ENVIRONMENT`     | `development`     | Deployment environment (`production`, `development`, …) |
 
 ### Local logging

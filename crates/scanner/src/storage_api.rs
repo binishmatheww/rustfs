@@ -21,6 +21,8 @@ use rustfs_lock::NamespaceLockWrapper;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
+pub(crate) use rustfs_ecstore::with_background_disk_io as ecstore_with_background_disk_io;
+
 pub(crate) use s3s::dto::{
     BucketLifecycleConfiguration as EcstoreBucketLifecycleConfiguration, LifecycleRuleFilter as EcstoreLifecycleRuleFilter,
     ObjectLockConfiguration as EcstoreObjectLockConfiguration, VersioningConfiguration as EcstoreVersioningConfiguration,
@@ -99,6 +101,7 @@ pub(crate) use rustfs_ecstore::api::event::{EventArgs as EcstoreEventArgs, send_
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::layout::{
     EndpointServerPools as EcstoreEndpointServerPools, Endpoints as EcstoreEndpoints, PoolEndpoints as EcstorePoolEndpoints,
+    SetupType as EcstoreSetupType,
 };
 pub(crate) use rustfs_ecstore::api::notification::NotificationSys as EcstoreNotificationSys;
 pub(crate) use rustfs_ecstore::api::notification::scanner_peer_transport_error_message_is_retryable;
@@ -138,10 +141,21 @@ pub(crate) use rustfs_lifecycle::{
 };
 use rustfs_storage_api as storage_contracts;
 
+#[cfg(feature = "diagnostic-read-version-caller")]
+pub(crate) mod ecstore_diagnostic {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::diagnostic::current_read_version_entry_source;
+    pub(crate) use rustfs_ecstore::api::diagnostic::{
+        ReadVersionContextBoundary, ReadVersionEntrySource, observe_read_version_context_boundary, with_read_version_entry,
+    };
+}
+
 #[cfg(test)]
 pub(crate) type EcstoreHealResultItem = <EcstoreStore as storage_contracts::HealOperations>::HealResultItem;
 
 pub(crate) mod owner {
+    #[cfg(test)]
+    pub(crate) use super::storage_contracts::DiskSetSelector;
     pub(crate) use super::{
         MAX_SCANNER_PAUSE_BACKLOG_BYTES, ScannerPauseBacklogRetirementError, ScannerPauseBacklogRetirementPlan,
         ScannerPauseBacklogRetirementReplica, register_scanner_pause_backlog_retirement_planner,
@@ -149,6 +163,8 @@ pub(crate) mod owner {
     #[cfg(test)]
     pub(crate) use super::{NativeScannerPauseBacklogWriteFault, SourceCleanupDeleteBarrier};
 
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::object::{WriteCommitGuard, WriteCompletion};
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::set_disk::get_lock_acquire_timeout as ecstore_get_lock_acquire_timeout;
     #[cfg(test)]
@@ -346,6 +362,18 @@ pub(crate) mod scanner_io {
     pub(crate) use super::storage_contracts::{BucketInfo, BucketOptions};
     #[cfg(test)]
     pub(crate) use super::storage_contracts::{HTTPRangeSpec, ObjectIO};
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::{
+        bucket::{
+            lifecycle::bucket_lifecycle_ops::init_background_expiry, metadata::BUCKET_LIFECYCLE_CONFIG,
+            metadata_sys::update as update_bucket_metadata,
+        },
+        data_usage::{
+            apply_bucket_usage_memory_overlay, get_bucket_usage_memory, load_admin_data_usage_from_backend_cached,
+            load_data_usage_from_backend, record_bucket_object_delete_memory, record_bucket_object_write_memory,
+            replace_bucket_usage_memory_from_info, store_data_usage_in_backend as seed_persisted_usage,
+        },
+    };
 }
 
 pub(crate) type ScannerBucketListing = EcstoreScannerBucketListing;
@@ -363,6 +391,7 @@ pub(crate) trait ScannerStorage:
     fn scanner_namespace_mutation_generation(&self) -> u64;
     async fn scanner_data_movement_activity(&self) -> (bool, bool, u64);
     async fn scanner_data_usage_publication_blocked(&self) -> bool;
+    async fn scanner_data_movement_publication_blocked(&self) -> bool;
     async fn scanner_data_movement_pause_status(&self) -> ScannerDataMovementPauseStatus;
     fn scanner_data_movement_generation(&self) -> u64;
     fn scanner_data_movement_changed(&self) -> Arc<Notify>;
@@ -400,6 +429,10 @@ impl ScannerStorage for EcstoreStore {
 
     async fn scanner_data_usage_publication_blocked(&self) -> bool {
         EcstoreStore::scanner_data_usage_publication_blocked(self).await
+    }
+
+    async fn scanner_data_movement_publication_blocked(&self) -> bool {
+        EcstoreStore::scanner_data_movement_activity(self).await.1
     }
 
     async fn scanner_data_movement_pause_status(&self) -> ScannerDataMovementPauseStatus {
@@ -568,6 +601,10 @@ mod tests {
         }
 
         async fn scanner_data_usage_publication_blocked(&self) -> bool {
+            false
+        }
+
+        async fn scanner_data_movement_publication_blocked(&self) -> bool {
             false
         }
 

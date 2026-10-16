@@ -23,13 +23,14 @@ use crate::scanner_folder::ScannerItem;
 use crate::storage_api::EcstoreScannerPeerDirtyUsageSnapshot;
 use crate::storage_api::owner::{
     EcstorePoolDecommissionInfo, EcstoreRebalStatus, EcstoreRebalanceInfo, EcstoreRebalanceMeta, EcstoreRebalanceStats,
-    ecstore_hold_namespace_commit,
+    WriteCommitGuard, WriteCompletion, ecstore_hold_namespace_commit,
 };
 use crate::storage_api::scan::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions, ObjectIO as _};
 use crate::{
-    DiskOption, ECStore, Endpoint, EndpointServerPools, Endpoints, InstanceContext, PoolEndpoints, ScannerObjectOptions,
-    ScannerPutObjReader, UNKNOWN_TIER, init_bucket_metadata_sys_for_scanner_tests, init_ecstore_config_for_scanner_tests,
-    init_local_disks_with_instance_ctx, new_disk, path2_bucket_object_with_base_path,
+    DATA_USAGE_BLOOM_NAME_PATH, DiskOption, ECStore, Endpoint, EndpointServerPools, Endpoints, InstanceContext, PoolEndpoints,
+    ScannerObjectOptions, ScannerPutObjReader, UNKNOWN_TIER, init_bucket_metadata_sys_for_scanner_tests,
+    init_ecstore_config_for_scanner_tests, init_local_disks_with_instance_ctx, new_disk, path2_bucket_object_with_base_path,
+    save_config,
 };
 use rustfs_concurrency::{
     AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadAdmissionSnapshotProvider,
@@ -45,6 +46,7 @@ use uuid::Uuid;
 
 mod scoped_entry_fallback;
 mod service_cohort;
+mod usage_expiration;
 
 #[derive(Clone)]
 struct FixedWorkloadProvider {
@@ -521,12 +523,16 @@ fn complete_set_cache_with_segment_proof(
 }
 
 async fn setup_two_pool_scanner_store() -> (tempfile::TempDir, Arc<ECStore>) {
+    setup_local_scanner_store(2, 4).await
+}
+
+async fn setup_local_scanner_store(pool_count: usize, drives_per_set: usize) -> (tempfile::TempDir, Arc<ECStore>) {
     init_ecstore_config_for_scanner_tests();
     let temp_dir = tempfile::tempdir().expect("multi-pool scanner test directory should be created");
     let mut pools = Vec::new();
-    for pool_index in 0..2 {
+    for pool_index in 0..pool_count {
         let mut endpoints = Vec::new();
-        for disk_index in 0..4 {
+        for disk_index in 0..drives_per_set {
             let disk_path = temp_dir.path().join(format!("pool{pool_index}-disk{disk_index}"));
             tokio::fs::create_dir_all(&disk_path)
                 .await
@@ -541,7 +547,7 @@ async fn setup_two_pool_scanner_store() -> (tempfile::TempDir, Arc<ECStore>) {
         pools.push(PoolEndpoints {
             legacy: false,
             set_count: 1,
-            drives_per_set: 4,
+            drives_per_set,
             endpoints: Endpoints::from(endpoints),
             cmd_line: format!("scanner-cycle-pool-{pool_index}"),
             platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
@@ -564,6 +570,472 @@ async fn setup_two_pool_scanner_store() -> (tempfile::TempDir, Arc<ECStore>) {
     init_bucket_metadata_sys_for_scanner_tests(store.clone()).await;
 
     (temp_dir, store)
+}
+
+#[tokio::test]
+#[serial]
+async fn checkpoint_uses_global_cycle_fence_with_set_scoped_cache_revisions() {
+    let (_temp_dir, store) = setup_two_pool_scanner_store().await;
+    let cycle = 41341;
+    let leader_epoch = 17;
+    save_config(
+        store.clone(),
+        DATA_USAGE_BLOOM_NAME_PATH.as_str(),
+        crate::scanner::encode_scanner_cycle_fence_for_test(cycle, leader_epoch),
+    )
+    .await
+    .expect("persist cycle fence through global scanner store");
+    crate::remote_scanner::validate_remote_scanner_request_fence_with_store(cycle, leader_epoch, store.clone())
+        .await
+        .expect("global scanner store must read the fence");
+    let ctx = CancellationToken::new();
+    let cache_name = "checkpoint-bucket/.usage-cache.bin";
+    let mut checkpoint = DataUsageCache::default();
+    checkpoint.info.name = "checkpoint-bucket".to_string();
+    checkpoint.info.next_cycle = cycle;
+    checkpoint.info.leader_epoch = leader_epoch;
+    let mut mismatched_sets = 0;
+    for (pool_index, pool) in store.pools.iter().enumerate() {
+        for (set_index, set) in pool.disk_set.iter().enumerate() {
+            let publication_epoch = scanner_publication_epoch(set.clone())
+                .await
+                .expect("set publication admission");
+            DataUsageCache::default()
+                .save(set.clone(), cache_name)
+                .await
+                .expect("seed set-scoped cache");
+            let mut revisions = DataUsageCache::read_revisions(set.clone(), cache_name)
+                .await
+                .expect("initial set-scoped revisions");
+            let initial_revisions = revisions.clone();
+            let make_context = || ScannerCheckpointPersistContext {
+                ctx: &ctx,
+                expected_publication_epoch: publication_epoch,
+                cycle,
+                leader_epoch,
+            };
+            if crate::remote_scanner::validate_remote_scanner_request_fence_with_store(cycle, leader_epoch, set.clone())
+                .await
+                .is_err()
+            {
+                mismatched_sets += 1;
+                assert!(
+                    matches!(
+                        persist_scanner_checkpoint(
+                            set.clone(),
+                            set.clone(),
+                            make_context(),
+                            cache_name,
+                            &checkpoint,
+                            &mut revisions,
+                        )
+                        .await,
+                        ScannerCheckpointPersistResult::FenceChanged
+                    ),
+                    "set-scoped cycle lookup must reproduce the original failure for pool={pool_index}, set={set_index}"
+                );
+            }
+            assert_eq!(revisions, initial_revisions, "rejected checkpoint must not update revisions");
+            for skip_healing in [false, true] {
+                checkpoint.info.skip_healing = skip_healing;
+                let before_save = revisions.clone();
+                assert!(
+                    matches!(
+                        persist_scanner_checkpoint(
+                            set.clone(),
+                            store.clone(),
+                            make_context(),
+                            cache_name,
+                            &checkpoint,
+                            &mut revisions,
+                        )
+                        .await,
+                        ScannerCheckpointPersistResult::Saved
+                    ),
+                    "checkpoint helper must use the global cycle fence"
+                );
+                assert_ne!(revisions, before_save, "new checkpoint content must advance cache revisions");
+            }
+            let saved_revisions = revisions.clone();
+            for rejected_context in [
+                ScannerCheckpointPersistContext {
+                    cycle: cycle - 1,
+                    ..make_context()
+                },
+                ScannerCheckpointPersistContext {
+                    leader_epoch: leader_epoch - 1,
+                    ..make_context()
+                },
+                ScannerCheckpointPersistContext {
+                    expected_publication_epoch: publication_epoch + 1,
+                    ..make_context()
+                },
+            ] {
+                assert!(
+                    matches!(
+                        persist_scanner_checkpoint(
+                            set.clone(),
+                            store.clone(),
+                            rejected_context,
+                            cache_name,
+                            &checkpoint,
+                            &mut revisions,
+                        )
+                        .await,
+                        ScannerCheckpointPersistResult::FenceChanged
+                    ),
+                    "stale cycle, leader or publication epoch must reject checkpoint persistence"
+                );
+                assert_eq!(revisions, saved_revisions, "rejected writer must not refresh revisions");
+                assert_eq!(
+                    DataUsageCache::read_revisions(set.clone(), cache_name)
+                        .await
+                        .expect("read rejected checkpoint"),
+                    saved_revisions,
+                    "rejected writer must not mutate persisted caches"
+                );
+            }
+
+            let mut newer = checkpoint.clone();
+            newer.info.next_cycle = cycle + 1;
+            newer
+                .save(set.clone(), cache_name)
+                .await
+                .expect("simulate a newer cache writer");
+            let newer_revisions = DataUsageCache::read_revisions(set.clone(), cache_name)
+                .await
+                .expect("capture newer cache revisions");
+            assert_ne!(newer_revisions, saved_revisions);
+            assert!(
+                matches!(
+                    persist_scanner_checkpoint(
+                        set.clone(),
+                        store.clone(),
+                        make_context(),
+                        cache_name,
+                        &checkpoint,
+                        &mut revisions,
+                    )
+                    .await,
+                    ScannerCheckpointPersistResult::RetryBucket(StorageError::PreconditionFailed)
+                ),
+                "matching global fence must not authorize stale cache CAS revisions"
+            );
+            assert_eq!(revisions, saved_revisions, "CAS failure must not refresh the stale writer");
+            assert_eq!(
+                DataUsageCache::read_revisions(set.clone(), cache_name)
+                    .await
+                    .expect("read cache after CAS failure"),
+                newer_revisions,
+                "CAS failure must preserve the newer persisted caches"
+            );
+        }
+    }
+    assert!(mismatched_sets > 0, "multi-pool fixture must expose a set-scoped cycle fence mismatch");
+}
+
+#[derive(Debug)]
+struct CheckpointFaultStore {
+    set: Arc<SetDisks>,
+    fail_put: AtomicBool,
+    fail_revision_read: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl crate::storage_api::owner::ObjectIO for CheckpointFaultStore {
+    type Error = crate::EcstoreError;
+    type RangeSpec = crate::storage_api::owner::HTTPRangeSpec;
+    type HeaderMap = http::HeaderMap;
+    type ObjectOptions = crate::ScannerObjectOptions;
+    type ObjectInfo = crate::ScannerObjectInfo;
+    type GetObjectReader = crate::ScannerGetObjectReader;
+    type PutObjectReader = crate::ScannerPutObjReader;
+
+    async fn get_object_reader(
+        &self,
+        bucket: &str,
+        object: &str,
+        range: Option<Self::RangeSpec>,
+        headers: Self::HeaderMap,
+        opts: &Self::ObjectOptions,
+    ) -> crate::EcstoreResult<Self::GetObjectReader> {
+        if self.fail_revision_read.swap(false, Ordering::SeqCst) {
+            return Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "injected revision read failure",
+            )));
+        }
+        self.set.get_object_reader(bucket, object, range, headers, opts).await
+    }
+
+    async fn put_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut Self::PutObjectReader,
+        opts: &Self::ObjectOptions,
+    ) -> crate::EcstoreResult<Self::ObjectInfo> {
+        if self.fail_put.swap(false, Ordering::SeqCst) {
+            return Err(StorageError::Lock(LockError::Timeout {
+                resource: object.to_string(),
+                timeout: Duration::from_secs(5),
+            }));
+        }
+        self.set.put_object(bucket, object, data, opts).await
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::ScannerConfigObjectDelete for CheckpointFaultStore {
+    async fn delete_config_object(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: ScannerObjectOptions,
+    ) -> crate::EcstoreResult<crate::ScannerObjectInfo> {
+        crate::ScannerConfigObjectDelete::delete_config_object(self.set.as_ref(), bucket, object, opts).await
+    }
+
+    async fn scanner_data_usage_publication_admission(&self) -> Option<crate::ScannerDataUsagePublicationAdmission> {
+        crate::ScannerConfigObjectDelete::scanner_data_usage_publication_admission(self.set.as_ref()).await
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn checkpoint_retries_next_snapshot_after_lock_failure_and_reloads_after_revision_failure() {
+    let (_temp_dir, fence_store) = setup_local_scanner_store(1, 4).await;
+    let cycle = 8457;
+    let leader_epoch = 19;
+    save_config(
+        fence_store.clone(),
+        DATA_USAGE_BLOOM_NAME_PATH.as_str(),
+        crate::scanner::encode_scanner_cycle_fence_for_test(cycle, leader_epoch),
+    )
+    .await
+    .expect("seed global cycle fence");
+    let set = fence_store.pools[0].disk_set[0].clone();
+    let publication_epoch = scanner_publication_epoch(set.clone()).await.expect("read publication epoch");
+    let cache_name = "checkpoint-recovery/.usage-cache.bin";
+    DataUsageCache::default()
+        .save(set.clone(), cache_name)
+        .await
+        .expect("seed cache");
+    let mut revisions = DataUsageCache::read_revisions(set.clone(), cache_name)
+        .await
+        .expect("read initial revisions");
+    let initial_revisions = revisions.clone();
+    let store = Arc::new(CheckpointFaultStore {
+        set: set.clone(),
+        fail_put: AtomicBool::new(true),
+        fail_revision_read: AtomicBool::new(false),
+    });
+    let ctx = CancellationToken::new();
+    let context = || ScannerCheckpointPersistContext {
+        ctx: &ctx,
+        expected_publication_epoch: publication_epoch,
+        cycle,
+        leader_epoch,
+    };
+    let mut checkpoint = DataUsageCache::default();
+    checkpoint.info.name = "checkpoint-recovery".to_string();
+    checkpoint.info.source = Some(DataUsageCacheSource::new(0, 0));
+    checkpoint.info.scan_checkpoint = Some(crate::DataUsageScanCheckpoint::new(
+        "checkpoint-recovery/first".to_string(),
+        crate::DataUsageScanCheckpointReason::Objects,
+    ));
+    assert!(matches!(
+        persist_scanner_checkpoint(store.clone(), fence_store.clone(), context(), cache_name, &checkpoint, &mut revisions).await,
+        ScannerCheckpointPersistResult::Skipped
+    ));
+    assert_eq!(revisions, initial_revisions);
+    assert_eq!(
+        DataUsageCache::read_revisions(set.clone(), cache_name)
+            .await
+            .expect("read after failed save"),
+        initial_revisions
+    );
+
+    checkpoint
+        .info
+        .scan_checkpoint
+        .as_mut()
+        .expect("checkpoint cursor")
+        .resume_after = "checkpoint-recovery/second".to_string();
+    assert!(matches!(
+        persist_scanner_checkpoint(store.clone(), fence_store.clone(), context(), cache_name, &checkpoint, &mut revisions).await,
+        ScannerCheckpointPersistResult::Saved
+    ));
+    assert_ne!(revisions, initial_revisions);
+    let mut loaded = DataUsageCache::default();
+    loaded.load(set.clone(), cache_name).await.expect("load recovered checkpoint");
+    assert_eq!(
+        loaded.info.scan_checkpoint, checkpoint.info.scan_checkpoint,
+        "next snapshot must become durable"
+    );
+
+    let saved_revisions = revisions.clone();
+    checkpoint
+        .info
+        .scan_checkpoint
+        .as_mut()
+        .expect("checkpoint cursor")
+        .resume_after = "checkpoint-recovery/third".to_string();
+    store.fail_revision_read.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        persist_scanner_checkpoint(store, fence_store, context(), cache_name, &checkpoint, &mut revisions).await,
+        ScannerCheckpointPersistResult::RetryBucket(StorageError::Io(_))
+    ));
+    assert_eq!(revisions, saved_revisions, "indeterminate revision refresh must not rebase the writer");
+    loaded
+        .load(set.clone(), cache_name)
+        .await
+        .expect("load committed checkpoint after refresh failure");
+    assert_eq!(
+        loaded.info.scan_checkpoint, checkpoint.info.scan_checkpoint,
+        "PUT completed before revision refresh failed"
+    );
+    assert_ne!(
+        DataUsageCache::read_revisions(set, cache_name)
+            .await
+            .expect("read committed revisions"),
+        saved_revisions
+    );
+}
+
+#[derive(Debug)]
+struct CheckpointFenceStore {
+    before: Vec<u8>,
+    after: Vec<u8>,
+    fail_on_read: Option<usize>,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl crate::storage_api::owner::ObjectIO for CheckpointFenceStore {
+    type Error = crate::EcstoreError;
+    type RangeSpec = crate::storage_api::owner::HTTPRangeSpec;
+    type HeaderMap = http::HeaderMap;
+    type ObjectOptions = crate::ScannerObjectOptions;
+    type ObjectInfo = crate::ScannerObjectInfo;
+    type GetObjectReader = crate::ScannerGetObjectReader;
+    type PutObjectReader = crate::ScannerPutObjReader;
+
+    async fn get_object_reader(
+        &self,
+        bucket: &str,
+        object: &str,
+        _range: Option<Self::RangeSpec>,
+        _headers: Self::HeaderMap,
+        _opts: &Self::ObjectOptions,
+    ) -> crate::EcstoreResult<Self::GetObjectReader> {
+        assert_eq!(bucket, RUSTFS_META_BUCKET);
+        assert_eq!(object, DATA_USAGE_BLOOM_NAME_PATH.as_str(), "global store must only read the cycle fence");
+        let read = self.reads.fetch_add(1, Ordering::SeqCst);
+        if self.fail_on_read == Some(read) {
+            return Err(crate::EcstoreError::other("injected global fence read failure"));
+        }
+        let state = if read == 0 { &self.before } else { &self.after };
+        Ok(crate::ScannerGetObjectReader {
+            stream: Box::new(std::io::Cursor::new(state.clone())),
+            object_info: crate::ScannerObjectInfo::default(),
+            buffered_body: None,
+            body_source: Default::default(),
+        })
+    }
+
+    async fn put_object(
+        &self,
+        _bucket: &str,
+        _object: &str,
+        _data: &mut Self::PutObjectReader,
+        _opts: &Self::ObjectOptions,
+    ) -> crate::EcstoreResult<Self::ObjectInfo> {
+        panic!("checkpoint persistence must never write through the global fence store");
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn checkpoint_rejects_unreadable_or_changed_global_fence() {
+    let (_temp_dir, store) = setup_two_pool_scanner_store().await;
+    let set = &store.pools[1].disk_set[0];
+    let publication_epoch = scanner_publication_epoch(set.clone()).await.expect("idle set admission");
+    let cycle = 41341;
+    let leader_epoch = 17;
+    let valid = crate::scanner::encode_scanner_cycle_fence_for_test(cycle, leader_epoch);
+    let ctx = CancellationToken::new();
+    let mut checkpoint = DataUsageCache::default();
+    checkpoint.info.name = "checkpoint-bucket".to_string();
+    checkpoint.info.next_cycle = cycle;
+    checkpoint.info.leader_epoch = leader_epoch;
+
+    for (case, before, after, fail_on_read, expected_reads) in [
+        (
+            "cycle_changed",
+            valid.clone(),
+            crate::scanner::encode_scanner_cycle_fence_for_test(cycle + 1, leader_epoch),
+            None,
+            2,
+        ),
+        (
+            "leader_changed",
+            valid.clone(),
+            crate::scanner::encode_scanner_cycle_fence_for_test(cycle, leader_epoch + 1),
+            None,
+            2,
+        ),
+        ("post_save_corrupt", valid.clone(), vec![0; 7], None, 2),
+        ("post_save_read_failure", valid.clone(), valid.clone(), Some(1), 2),
+        ("pre_save_corrupt", vec![0; 7], valid.clone(), None, 1),
+        ("pre_save_read_failure", valid.clone(), valid.clone(), Some(0), 1),
+    ] {
+        let cache_name = format!("checkpoint-bucket/{case}/.usage-cache.bin");
+        DataUsageCache::default()
+            .save(set.clone(), &cache_name)
+            .await
+            .expect("seed checkpoint cache");
+        let mut revisions = DataUsageCache::read_revisions(set.clone(), &cache_name)
+            .await
+            .expect("read seeded revisions");
+        let initial = revisions.clone();
+        let fence_store = Arc::new(CheckpointFenceStore {
+            before,
+            after,
+            fail_on_read,
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        assert!(
+            matches!(
+                persist_scanner_checkpoint(
+                    set.clone(),
+                    fence_store.clone(),
+                    ScannerCheckpointPersistContext {
+                        ctx: &ctx,
+                        expected_publication_epoch: publication_epoch,
+                        cycle,
+                        leader_epoch
+                    },
+                    &cache_name,
+                    &checkpoint,
+                    &mut revisions,
+                )
+                .await,
+                ScannerCheckpointPersistResult::FenceChanged
+            ),
+            "unreadable or changed global fence must reject checkpoint success: {case}"
+        );
+        assert_eq!(fence_store.reads.load(Ordering::SeqCst), expected_reads, "global fence checks: {case}");
+        assert_eq!(revisions, initial, "rejected checkpoint must not refresh caller revisions: {case}");
+        let persisted = DataUsageCache::read_revisions(set.clone(), &cache_name)
+            .await
+            .expect("read persisted checkpoint");
+        if expected_reads == 1 {
+            assert_eq!(persisted, initial, "pre-save rejection must not mutate persisted caches: {case}");
+        } else {
+            assert_ne!(persisted, initial, "post-save fence check must run after a real cache write: {case}");
+        }
+    }
 }
 
 async fn wait_for_namespace_commit_tails(store: &ECStore) {
@@ -1121,16 +1593,17 @@ async fn pending_put_commit_keeps_scanner_walk_live_without_authoritative_usage(
         .enumerate()
     {
         let mut reader = ScannerPutObjReader::from_vec(body.to_vec());
-        store.pools[pool_index].disk_set[0]
-            .put_object(
-                &bucket,
-                object,
-                &mut reader,
-                &ScannerObjectOptions {
-                    no_lock: true,
-                    ..Default::default()
-                },
-            )
+        let set = &store.pools[pool_index].disk_set[0];
+        let lock = set.new_ns_lock(&bucket, object).await.expect("fixture namespace lock");
+        let guard = WriteCommitGuard::acquire(&lock, Duration::from_secs(30))
+            .await
+            .expect("fixture write owner");
+        let mut opts = ScannerObjectOptions {
+            write_completion: WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+        opts.add_write_commit_guard(&guard);
+        set.put_object(&bucket, object, &mut reader, &opts)
             .await
             .expect("fixture objects must finish their rename fanouts before scanning");
     }
@@ -3486,39 +3959,63 @@ fn scanner_concurrency_limit_handles_no_available_work() {
 
 #[test]
 #[serial]
-fn scanner_concurrency_limit_yields_to_foreground_reads() {
+fn scanner_concurrency_limit_is_stable_across_foreground_read_transitions() {
     crate::reset_foreground_read_activity_for_test();
     crate::workload_admission::clear_scanner_workload_admission_snapshot_provider_for_test();
-    crate::set_foreground_read_activity(8);
-    assert_eq!(scanner_concurrency_limit(0, 4), 1);
-    assert_eq!(scanner_concurrency_limit(3, 4), 1);
+    for foreground_activity in [0, 1, 8, 0] {
+        crate::set_foreground_read_activity(foreground_activity);
+        assert_eq!(scanner_concurrency_limit(0, 4), 4);
+        assert_eq!(scanner_concurrency_limit(3, 4), 3);
+        assert_eq!(scanner_concurrency_limit(1, 4), 1);
+        assert_eq!(scanner_concurrency_limit(8, 0), 0);
+        assert_eq!(scanner_budgeted_concurrency_limit(scanner_concurrency_limit(3, 4), true), 1);
+        assert_eq!(scanner_budgeted_concurrency_limit(scanner_concurrency_limit(3, 4), false), 3);
+    }
     crate::reset_foreground_read_activity_for_test();
 }
 
 #[test]
 #[serial]
-fn scanner_concurrency_limit_yields_to_shared_foreground_pressure() {
+fn scanner_concurrency_limit_is_stable_across_shared_foreground_pressure() {
     crate::reset_foreground_read_activity_for_test();
     crate::workload_admission::clear_scanner_workload_admission_snapshot_provider_for_test();
-    install_scanner_workload_provider(WorkloadAdmissionRegistrySnapshot::new(vec![
-        WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundWrite, AdmissionState::Open).with_counts(Some(2), None, Some(16)),
-    ]));
-
-    assert_eq!(scanner_concurrency_limit(0, 4), 1);
-    assert_eq!(scanner_concurrency_limit(3, 4), 1);
-
+    for (state, active) in [
+        (AdmissionState::Open, Some(0)),
+        (AdmissionState::Open, Some(2)),
+        (AdmissionState::Saturated, None),
+        (AdmissionState::Open, Some(0)),
+    ] {
+        install_scanner_workload_provider(WorkloadAdmissionRegistrySnapshot::new(vec![
+            WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundWrite, state).with_counts(active, None, Some(16)),
+        ]));
+        assert_eq!(scanner_concurrency_limit(0, 4), 4);
+        assert_eq!(scanner_concurrency_limit(3, 4), 3);
+    }
     crate::workload_admission::clear_scanner_workload_admission_snapshot_provider_for_test();
 }
 
 #[test]
 #[serial]
-fn scanner_concurrency_limit_yields_to_streaming_reads() {
+fn scanner_dispatch_limits_preserve_configured_caps_during_streaming_reads() {
     crate::reset_foreground_read_activity_for_test();
     crate::workload_admission::clear_scanner_workload_admission_snapshot_provider_for_test();
-    let _guard = crate::ForegroundReadGuard::new();
-
-    assert_eq!(scanner_concurrency_limit(0, 4), 1);
-    assert_eq!(scanner_concurrency_limit(3, 4), 1);
+    temp_env::with_vars(
+        [
+            (ENV_SCANNER_MAX_CONCURRENT_SET_SCANS, Some("3")),
+            (ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, Some("2")),
+        ],
+        || {
+            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+            for streaming in [false, true, false] {
+                let _guard = streaming.then(crate::ForegroundReadGuard::new);
+                assert_eq!(scanner_max_concurrent_set_scans(4), 3);
+                assert_eq!(scanner_max_concurrent_disk_scans(4), 2);
+                assert_eq!(scanner_budgeted_concurrency_limit(scanner_max_concurrent_set_scans(4), true), 1);
+                assert_eq!(scanner_budgeted_concurrency_limit(scanner_max_concurrent_disk_scans(4), true), 1);
+            }
+        },
+    );
+    crate::runtime_config::refresh_scanner_runtime_config_for_tests();
 }
 
 #[test]
@@ -3976,4 +4473,351 @@ fn apply_bucket_result_to_cache_rejects_a_different_tier_generation() {
     assert!(!applied);
     assert_eq!(cache.find("bucket").map(|entry| entry.size), Some(3));
     assert!(cache.info.last_update.is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn replication_maintenance_refreshes_compacted_stats_across_cycles_and_retries() {
+    use crate::storage_api::owner::ObjectOperations as _;
+    for same_cycle in [false, true] {
+        let (_temp_dir, store) = setup_local_scanner_store(1, 1).await;
+        clear_dirty_usage_buckets_for_tests();
+        let bucket = "status-bucket";
+        let object = "cold/object";
+        let set = store.pools[0].disk_set[0].clone();
+        store
+            .make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create status bucket");
+        let mut reader = ScannerPutObjReader::from_vec(b"initial".to_vec());
+        set.put_object(
+            bucket,
+            object,
+            &mut reader,
+            &ScannerObjectOptions {
+                versioned: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("persist initial object");
+        wait_for_namespace_commit_tails(store.as_ref()).await;
+
+        let ctx = CancellationToken::new();
+        let (updates, mut receiver) = mpsc::channel(1);
+        let initial = nsscanner_with_storage_status_scoped(
+            store.as_ref(),
+            ScannerCycleRequest {
+                budget: ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default()),
+                ctx,
+                updates,
+                want_cycle: 1,
+                leader_epoch: 11,
+                scan_mode: HealScanMode::Normal,
+                scan_scope: ScannerBucketScanScope::default(),
+                persisted_usage_baseline: None,
+                observed_usage_candidate: None,
+                requires_full_scan: true,
+                service_cohort: None,
+                resolved_scope_observer: None,
+            },
+        )
+        .await
+        .expect("initial full usage scan");
+        assert_eq!(initial.status, ScannerCycleStatus::Complete);
+        let baseline = receiver.recv().await.expect("initial usage publication");
+        assert!(baseline.buckets_usage[bucket].replication_info.is_empty());
+
+        let cache_name = path_join_buf(&[bucket, DATA_USAGE_CACHE_NAME]);
+        let mut cache = DataUsageCache::default();
+        cache
+            .load(set.clone(), &cache_name)
+            .await
+            .expect("load complete bucket cache");
+        assert!(cache.info.snapshot_complete);
+        // Keep an accounting context with no remote work in this local fixture.
+        let replication: ReplicationConfiguration = serde_json::from_value(serde_json::json!({
+            "role": "",
+            "rules": [{
+                "destination": { "bucket": "arn:test" },
+                "id": "status",
+                "prefix": "",
+                "priority": 1,
+                "status": "Enabled"
+            }]
+        }))
+        .expect("decode the local replication accounting fixture");
+        cache.info.replication = Some(Arc::new(ReplicationConfig::new(
+            Some(replication),
+            Some(crate::storage_api::EcstoreBucketTargets::default()),
+        )));
+        // A complete compacted prefix is eligible for normal usage sampling.
+        let mut compacted = cache.checked_flatten(bucket).expect("complete cached usage");
+        compacted.children.clear();
+        compacted.compacted = true;
+        cache.cache.clear();
+        cache.replace(bucket, "", DataUsageEntry::default());
+        cache.replace("status-bucket/cold", bucket, compacted);
+        cache
+            .save(set.clone(), &cache_name)
+            .await
+            .expect("persist compacted prefix fixture");
+        let cycle = (2..18)
+            .find(|cycle| {
+                !rustfs_data_usage::hash_path("status-bucket/cold")
+                    .mod_(*cycle, crate::scanner_folder::data_usage_update_dir_cycles())
+            })
+            .expect("choose a cycle outside the compacted prefix sampling window");
+
+        let mut metadata = HashMap::new();
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut metadata,
+            rustfs_utils::http::metadata_compat::SUFFIX_REPLICATION_STATUS,
+            "arn:test=COMPLETED;".to_string(),
+        );
+        let updated = set
+            .put_object_metadata(
+                bucket,
+                object,
+                &ScannerObjectOptions {
+                    eval_metadata: Some(metadata),
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("persist replication-only metadata update");
+        assert_eq!(updated.replication_status.as_str(), "COMPLETED");
+        assert!(updated.version_id.is_some_and(|version| !version.is_nil()));
+        let persisted = set
+            .get_object_info(
+                bucket,
+                object,
+                &ScannerObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read back status writeback");
+        assert_eq!(persisted.replication_status.as_str(), "COMPLETED");
+        let namespace_generation = dirty_usage_generation();
+        record_status_class_mutation(
+            bucket,
+            object,
+            crate::segment_invalidation::SegmentInvalidationProducerIdentity::Replication,
+        );
+        assert_eq!(dirty_usage_generation(), namespace_generation);
+
+        let ctx = CancellationToken::new();
+        let (updates, mut receiver) = mpsc::channel(1);
+        let result = nsscanner_with_storage_status_scoped(
+            store.as_ref(),
+            ScannerCycleRequest {
+                budget: ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default()),
+                ctx,
+                updates,
+                want_cycle: if same_cycle { 1 } else { u64::from(cycle) },
+                leader_epoch: 11,
+                scan_mode: HealScanMode::Normal,
+                scan_scope: ScannerBucketScanScope::default(),
+                persisted_usage_baseline: None,
+                observed_usage_candidate: None,
+                requires_full_scan: true,
+                service_cohort: None,
+                resolved_scope_observer: None,
+            },
+        )
+        .await
+        .expect("normal scan must refresh the status bucket");
+        assert_eq!(result.status, ScannerCycleStatus::Complete);
+        let refreshed = receiver.recv().await.expect("refreshed usage publication");
+        assert_eq!(refreshed.buckets_usage[bucket].objects_count, 1);
+        assert_eq!(refreshed.buckets_usage[bucket].size, 7);
+        assert_eq!(
+            refreshed.buckets_usage[bucket]
+                .replication_info
+                .get("arn:test")
+                .map_or(0, |target| target.replicated_size),
+            7,
+            "a replication maintenance walk must refresh compacted statistics before publishing"
+        );
+        clear_dirty_usage_buckets_for_tests();
+    }
+}
+
+pub(super) struct CoordinatorBucketScanProbe {
+    active: AtomicUsize,
+    peak: AtomicUsize,
+    hold: Duration,
+}
+
+static COORDINATOR_BUCKET_SCAN_PROBE: std::sync::Mutex<Option<Arc<CoordinatorBucketScanProbe>>> = std::sync::Mutex::new(None);
+
+/// Called by the coordinator walker loop once a bucket scan is admitted on
+/// its disk. The hook is absent from non-test builds and a no-op until a test
+/// installs a probe; the probe then holds the walker so overlapping
+/// admissions become observable as a peak.
+pub(super) async fn observe_coordinator_bucket_scan_admitted(_bucket: &str) {
+    let probe = COORDINATOR_BUCKET_SCAN_PROBE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let Some(probe) = probe else { return };
+    let active = probe.active.fetch_add(1, Ordering::SeqCst) + 1;
+    probe.peak.fetch_max(active, Ordering::SeqCst);
+    tokio::time::sleep(probe.hold).await;
+    probe.active.fetch_sub(1, Ordering::SeqCst);
+}
+
+fn install_coordinator_bucket_scan_probe(hold: Duration) -> Arc<CoordinatorBucketScanProbe> {
+    let probe = Arc::new(CoordinatorBucketScanProbe {
+        active: AtomicUsize::new(0),
+        peak: AtomicUsize::new(0),
+        hold,
+    });
+    *COORDINATOR_BUCKET_SCAN_PROBE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(probe.clone());
+    probe
+}
+
+fn clear_coordinator_bucket_scan_probe() {
+    *COORDINATOR_BUCKET_SCAN_PROBE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+#[test]
+fn namespace_scanner_walkers_multiply_local_disks_and_share_their_admission() {
+    let server_epoch = Uuid::from_u128(7);
+    let workers = vec![
+        ("local-a", NamespaceScannerWorkerMode::Coordinator),
+        ("local-b", NamespaceScannerWorkerMode::Coordinator),
+        ("legacy-peer", NamespaceScannerWorkerMode::Coordinator),
+        ("v4-peer", NamespaceScannerWorkerMode::RemoteV4(server_epoch)),
+    ];
+    let is_local = |disk: &&str| disk.starts_with("local");
+
+    let walkers = namespace_scanner_walkers(workers.clone(), 3, is_local);
+    assert_eq!(walkers.len(), 2 * 3 + 2, "two local disks fan out, both remote disks keep one walker");
+    let local_a: Vec<_> = walkers.iter().filter(|walker| walker.disk == "local-a").collect();
+    assert_eq!(local_a.len(), 3);
+    let share = local_a[0]
+        .local_admission
+        .as_ref()
+        .expect("local walkers carry an admission share");
+    assert!(
+        local_a
+            .iter()
+            .all(|walker| walker.local_admission.as_ref().is_some_and(|other| Arc::ptr_eq(other, share))),
+        "walkers of one disk share one admission"
+    );
+    let local_b = walkers
+        .iter()
+        .find(|walker| walker.disk == "local-b")
+        .expect("local-b walker");
+    assert!(
+        !Arc::ptr_eq(local_b.local_admission.as_ref().expect("local-b share"), share),
+        "each disk owns its own admission share"
+    );
+    assert!(
+        walkers
+            .iter()
+            .filter(|walker| !is_local(&walker.disk))
+            .all(|walker| walker.local_admission.is_none()),
+        "remote disks admit through the peer, not a local share"
+    );
+    assert_eq!(
+        walkers
+            .iter()
+            .filter(|walker| walker.mode == NamespaceScannerWorkerMode::RemoteV4(server_epoch))
+            .count(),
+        1
+    );
+    // The walker count, not the disk count, is the available work the
+    // configured cap applies to; the disk count stays the floor.
+    assert_eq!(scanner_concurrency_limit(0, walkers.len()), 8);
+    assert_eq!(scanner_concurrency_limit(4, walkers.len()), 4);
+    for factor in [0, 1] {
+        let walkers = namespace_scanner_walkers(workers.clone(), factor, is_local);
+        assert_eq!(walkers.len(), workers.len(), "factor {factor} keeps one walker per disk");
+        assert_eq!(scanner_concurrency_limit(0, walkers.len()), workers.len());
+    }
+}
+
+async fn run_full_cycle(store: &Arc<ECStore>, cycle: u64) -> ScannerCycleStatus {
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
+    let (updates, _receiver) = mpsc::channel(8);
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        nsscanner_with_storage_status_scoped(
+            store.as_ref(),
+            ScannerCycleRequest {
+                ctx,
+                budget,
+                updates,
+                want_cycle: cycle,
+                leader_epoch: 11,
+                scan_mode: HealScanMode::Normal,
+                scan_scope: ScannerBucketScanScope::default(),
+                persisted_usage_baseline: None,
+                observed_usage_candidate: None,
+                requires_full_scan: true,
+                resolved_scope_observer: None,
+                service_cohort: None,
+            },
+        ),
+    )
+    .await
+    .expect("cycle should finish within the test deadline")
+    .expect("cycle should succeed")
+    .status
+}
+
+#[tokio::test]
+#[serial]
+async fn walkers_per_disk_lets_one_disk_walk_two_buckets_concurrently() {
+    let (_temp_dir, store) = setup_local_scanner_store(1, 1).await;
+    clear_dirty_usage_buckets_for_tests();
+    for bucket in ["walk-a", "walk-b"] {
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+        let mut reader = ScannerPutObjReader::from_vec(b"object".to_vec());
+        store
+            .put_object(bucket, "object", &mut reader, &ScannerObjectOptions::default())
+            .await
+            .expect("object should persist");
+    }
+    wait_for_namespace_commit_tails(store.as_ref()).await;
+
+    // The probe holds every admitted bucket scan long enough that two walkers
+    // on the one disk must overlap; a single walker cannot overlap with itself.
+    let hold = Duration::from_millis(750);
+    for (cycle, factor, expected_peak) in [(1, "1", 1), (2, "2", 2)] {
+        let probe = install_coordinator_bucket_scan_probe(hold);
+        let status = temp_env::async_with_vars([(ENV_SCANNER_WALKERS_PER_DISK, Some(factor))], async {
+            crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+            run_full_cycle(&store, cycle).await
+        })
+        .await;
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        clear_coordinator_bucket_scan_probe();
+        assert_eq!(status, ScannerCycleStatus::Complete, "walkers_per_disk={factor}");
+        assert_eq!(
+            probe.peak.load(Ordering::SeqCst),
+            expected_peak,
+            "walkers_per_disk={factor}: concurrent bucket scans admitted on the single disk"
+        );
+        assert_eq!(probe.active.load(Ordering::SeqCst), 0, "every admitted scan left the probe");
+    }
 }

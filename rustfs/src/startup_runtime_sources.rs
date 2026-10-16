@@ -17,6 +17,7 @@ use crate::runtime_sources::current_outbound_tls_generation as runtime_current_o
 use crate::storage_api::startup::runtime_sources::{InstanceContext, set_global_rustfs_port};
 use rustfs_kms::KmsServiceManager;
 use rustfs_obs::{GlobalError as ObservabilityError, OtelGuard};
+pub(crate) use rustfs_tls_runtime::load_global_outbound_tls_state as current_outbound_tls_state;
 use rustfs_tls_runtime::{OutboundTlsMaterial, TlsGeneration};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -71,7 +72,7 @@ pub(crate) fn set_buffer_profile_enabled(enabled: bool) {
 }
 
 pub(crate) async fn init_observability_guard(obs_endpoint: String) -> Result<OtelGuard, ObservabilityError> {
-    rustfs_obs::init_obs(Some(obs_endpoint)).await
+    rustfs_obs::init_obs(Some(obs_endpoint), Some(crate::version::DISPLAY_VERSION.to_owned())).await
 }
 
 pub(crate) fn set_observability_guard(guard: OtelGuard) -> Result<(), ObservabilityError> {
@@ -96,6 +97,14 @@ pub(crate) fn set_put_stage_metrics_enabled(enabled: bool) {
 
 pub(crate) fn set_get_stage_metrics_enabled(enabled: bool) {
     rustfs_io_metrics::set_get_stage_metrics_enabled(enabled);
+}
+
+pub(crate) fn set_get_stage_local_summary_enabled(enabled: bool) {
+    rustfs_io_metrics::set_get_stage_local_summary_enabled(enabled);
+}
+
+pub(crate) fn set_get_stage_local_summary_sample_rate(sample_rate: u64) {
+    rustfs_io_metrics::set_get_stage_local_summary_sample_rate(sample_rate);
 }
 
 pub(crate) fn set_metrics_enabled(enabled: bool) {

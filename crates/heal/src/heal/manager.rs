@@ -45,6 +45,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 use super::{DiskError, Endpoint, HealDiskExt as _, local_disk_map_read};
 
@@ -594,10 +595,36 @@ fn completed_status_is_retrying(status: &HealTaskStatus) -> bool {
     matches!(status, HealTaskStatus::Retrying { .. })
 }
 
+fn automatic_replacement_grace_deadline(task: &HealTask, result: &Result<()>) -> Option<u64> {
+    if task.source != HealRequestSource::AutoHeal
+        || !matches!(task.heal_type, HealType::ErasureSet { .. })
+        || task.heal_endpoints.is_empty()
+    {
+        return None;
+    }
+    match result {
+        Err(Error::DanglingDeleteDeferred { retry_not_before }) => Some(*retry_not_before),
+        _ => None,
+    }
+}
+
 fn retry_budget_for_result(task: &HealTask, result: &Result<()>, retryable_batch_failure: bool) -> Option<(Duration, String)> {
     let Err(err) = result else {
         return None;
     };
+    if let Some(retry_not_before) = automatic_replacement_grace_deadline(task, result) {
+        // This typed result is emitted only while the durable generation has
+        // retry budget. A storage grace period is waiting, not a failed attempt.
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let delay = Duration::from_secs(retry_not_before.saturating_sub(now));
+        // Persisted deadlines are untrusted. Reject a duration that Tokio's
+        // monotonic timer cannot represent instead of panicking in sleep.
+        tokio::time::Instant::now().checked_add(delay)?;
+        return Some((delay, err.to_string()));
+    }
     if task.retry_attempts >= MAX_RECOVERABLE_HEAL_RETRIES {
         return None;
     }
@@ -621,13 +648,17 @@ fn retry_budget_for_result(task: &HealTask, result: &Result<()>, retryable_batch
 #[cfg(test)]
 fn retry_request_for_result(task: &HealTask, result: &Result<()>) -> Option<(HealRequest, Duration, String)> {
     let (delay, error) = retry_budget_for_result(task, result, false)?;
-    Some((task.retry_request(), delay, error))
+    let mut request = task.retry_request();
+    if automatic_replacement_grace_deadline(task, result).is_some() {
+        request.retry_attempts = task.retry_attempts;
+    }
+    Some((request, delay, error))
 }
 
 async fn retry_request_for_result_with_budget(task: &HealTask, result: &Result<()>) -> Option<(HealRequest, Duration, String)> {
     let retryable_batch_failure = task.batch_failure_is_retryable().await;
     let (delay, error) = retry_budget_for_result(task, result, retryable_batch_failure)?;
-    let request = match task.retry_request_with_remaining_timeout().await {
+    let mut request = match task.retry_request_with_remaining_timeout().await {
         Ok(request) => request,
         Err(err) => {
             debug!(
@@ -643,6 +674,9 @@ async fn retry_request_for_result_with_budget(task: &HealTask, result: &Result<(
             return None;
         }
     };
+    if automatic_replacement_grace_deadline(task, result).is_some() {
+        request.retry_attempts = task.retry_attempts;
+    }
     Some((request, delay, error))
 }
 
@@ -1827,6 +1861,34 @@ impl HealManager {
             .await
     }
 
+    #[cfg(test)]
+    pub(super) async fn hold_mrf_admission_for_test(&self) -> impl Send + '_ {
+        self.active_heals.lock().await
+    }
+
+    pub(super) fn try_in_flight_durable_mrf_anchors(
+        &self,
+    ) -> Option<HashSet<rustfs_common::mrf_channel::MrfDurableRepairAnchor>> {
+        // Match admission's active -> queue -> retrying -> notice lock order.
+        // A contended transition is unknown, never evidence of completion.
+        let active = self.active_heals.try_lock().ok()?;
+        let queue = self.heal_queue.try_lock().ok()?;
+        let retrying = self.retrying_heals.try_lock().ok()?;
+        let live_ids: HashSet<&str> = active
+            .keys()
+            .map(String::as_str)
+            .chain(queue.requests().map(|request| request.id.as_str()))
+            .chain(retrying.keys().map(String::as_str))
+            .collect();
+        let anchors = lock_mrf_repair_notice_targets(&self.mrf_repair_notice_targets)
+            .iter()
+            .filter(|(task_id, _)| live_ids.contains(task_id.as_str()))
+            .flat_map(|(_, targets)| targets.iter())
+            .filter_map(|target| target.durable_anchor.clone())
+            .collect();
+        Some(anchors)
+    }
+
     pub(crate) async fn durable_mrf_repair_anchor(
         &self,
         intent: &rustfs_common::mrf_channel::MrfIntent,
@@ -1840,6 +1902,10 @@ impl HealManager {
             }
             Ok(None) | Err(_) => None,
         }
+    }
+
+    pub(crate) async fn mrf_bucket_incarnation_retired(&self, bucket: &str, expected: Uuid) -> Result<bool> {
+        self.storage.mrf_bucket_incarnation_retired(bucket, expected).await
     }
 
     async fn submit_heal_request_with_receipt_alias_and_mrf_notice(
